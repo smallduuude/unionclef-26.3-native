@@ -1,0 +1,106 @@
+package kaptainwutax.tungsten.path.specialMoves;
+
+import java.util.stream.Stream;
+
+import com.google.common.collect.Streams;
+
+import kaptainwutax.tungsten.TungstenMod;
+import kaptainwutax.tungsten.TungstenModDataContainer;
+import kaptainwutax.tungsten.agent.Agent;
+import kaptainwutax.tungsten.helpers.DirectionHelper;
+import kaptainwutax.tungsten.helpers.render.RenderHelper;
+import kaptainwutax.tungsten.path.Node;
+import kaptainwutax.tungsten.path.PathInput;
+import kaptainwutax.tungsten.path.blockSpaceSearchAssist.BlockNode;
+import kaptainwutax.tungsten.render.Color;
+import net.minecraft.core.Direction;
+import net.minecraft.world.level.LevelReader;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
+
+public class CornerJump {
+	
+	public static Node generateMove(Node parent, BlockNode nextBlockNode, boolean reverse) {
+		LevelReader world = TungstenModDataContainer.world;
+		Agent agent = parent.agent;
+
+		float desiredYaw = (float) DirectionHelper.calcYawFromVec3d(agent.getPos(), nextBlockNode.getPos(true));
+	    Node newNode = new Node(parent, world, new PathInput(false, false, false, false, false, false, false, agent.pitch, desiredYaw),
+	    				new Color(0, 255, 150), parent.cost + 5);
+
+	    // Go back
+//        for (int j = 0; j < 5; j++) {
+//            RenderHelper.renderNode(newNode);
+//            Box adjustedBox = newNode.agent.box.offset(0, -0.5, 0).expand(-0.45, 0, -0.45);
+//        	Stream<VoxelShape> blockCollisions = Streams.stream(agent.getBlockCollisions(TungstenMod.mc.world, adjustedBox));
+//        	if (blockCollisions.findAny().isEmpty()) break;
+//            newNode = new Node(newNode, world, new PathInput(false, true, false, false, false, false, false, agent.pitch, desiredYaw),
+//            		new Color(0, 255, 150), newNode.cost + 5);
+//        }
+        
+        // Go forward to edge and jump
+        boolean jump = false;
+        int limit = 0;
+        desiredYaw += reverse ? -90f : 90f;
+        while (limit < 18 && jump == false && newNode.agent.getPos().y > nextBlockNode.getBlockPos().getY()-2) {
+            AABB adjustedBox = newNode.agent.box.move(0, -0.5, 0).inflate(-0.04, 0, -0.04);
+        	limit++;
+        	Stream<VoxelShape> blockCollisions = Streams.stream(newNode.agent.getBlockCollisions(TungstenModDataContainer.world, adjustedBox));
+//        	RenderHelper.renderNode(newNode, TungstenMod.TEST);
+//            try {
+//				Thread.sleep(50);
+//			} catch (InterruptedException e) {
+//				// TODO Auto-generated catch block
+//				e.printStackTrace();
+//			}
+            if (blockCollisions.findAny().isEmpty() || newNode.agent.horizontalCollision || limit > 10) {
+        		desiredYaw = (float) DirectionHelper.calcYawFromVec3d(newNode.agent.getPos(), nextBlockNode.getPos(true));
+        		jump = true;
+        	}
+
+            newNode = new Node(newNode, world, new PathInput(true, false, false, false, jump, false, true, agent.pitch, desiredYaw),
+            		new Color(0, 255, 150), newNode.cost + 5);
+            if (jump) break;
+        }
+        
+
+        limit = 0;
+        if (nextBlockNode.previous == null) return null;
+        Direction dir = DirectionHelper.getHorizontalDirectionFromPos(nextBlockNode.previous.getPos(), nextBlockNode.getPos());
+        Vec3 offsetVec = new Vec3(0, 0, 0).relative(dir, 0.5);
+        while (limit < 40 && newNode.agent.getPos().y > nextBlockNode.getBlockPos().getY()-1) {
+            AABB adjustedBox = newNode.agent.box.move(offsetVec).inflate(-0.001, 0, -0.001);
+        	limit++;
+        	// ⛔ FIXED 2026-09-05: queried collisions via the STALE `agent` (= parent.agent, fixed
+        	// before this loop) instead of `newNode.agent` (the current simulated tick), matching
+        	// the bug class already found in SprintJumpMove/WalkToNode/RunToNode this session --
+        	// except here it has a concrete confirmed effect: Agent.getBlockCollisions() builds an
+        	// AgentShapeContext from the agent's OWN box.minY (used by isAbove()) and sneak state,
+        	// so every iteration after the first kept testing "is this shape above me" against the
+        	// move's STARTING Y, not the current one, even as the agent actually moved. The
+        	// adjustedBox itself was already correctly built from newNode.agent -- only the
+        	// collision query's context object was stale. The first while loop above (line ~49)
+        	// already does this correctly via newNode.agent.getBlockCollisions(...).
+        	Stream<VoxelShape> blockCollisions = Streams.stream(newNode.agent.getBlockCollisions(TungstenModDataContainer.world, adjustedBox));
+//        	RenderHelper.renderNode(newNode, TungstenMod.TEST);
+            if (blockCollisions.findAny().isEmpty()) {
+//                try {
+//    				Thread.sleep(50);
+//    			} catch (InterruptedException e) {
+//    				// TODO Auto-generated catch block
+//    				e.printStackTrace();
+//    			}
+                if (newNode.agent.onGround)
+        		desiredYaw = (float) DirectionHelper.calcYawFromVec3d(newNode.agent.getPos(), nextBlockNode.getPos(true));
+        	}
+            newNode = new Node(newNode, world, new PathInput(true, false, false, false, false, false, true, agent.pitch, desiredYaw),
+            		new Color(0, 255, 150), newNode.cost + 5);
+        	limit++;
+        	if (newNode.agent.getPos().closerThan(nextBlockNode.getPos(true), 0.7, 0.8)) break;
+        }
+            
+        return newNode;
+	}
+	
+}

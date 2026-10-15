@@ -1,0 +1,1181 @@
+package adris.altoclef.tasks.construction;
+
+import adris.altoclef.control.Nav;
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.tasks.movement.GetToBlockTask;
+import adris.altoclef.tasks.movement.RunAwayFromPositionTask;
+import adris.altoclef.tasks.movement.SafeRandomShimmyTask;
+import adris.altoclef.tasksystem.ITaskRequiresGrounded;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.helpers.ItemHelper;
+import adris.altoclef.util.helpers.LookHelper;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.helpers.WorldHelper;
+import adris.altoclef.util.progresscheck.MovementProgressChecker;
+import adris.altoclef.util.slots.Slot;
+import kaptainwutax.tungsten.path.movements.Rotation;
+import kaptainwutax.tungsten.path.movements.Input;
+import net.minecraft.world.level.block.*;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.monster.illager.Pillager;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.FenceBlock;
+import net.minecraft.world.level.block.FenceGateBlock;
+import net.minecraft.world.level.block.FlowerBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import adris.altoclef.multiversion.versionedfields.Blocks;
+import java.util.Optional;
+import net.minecraft.world.item.DyeColor;
+import net.minecraft.world.phys.Vec3;
+
+/**
+ * Destroy a block at a position.
+ */
+public class DestroyBlockTask extends Task implements ITaskRequiresGrounded {
+
+    /** Ticks, and each way this task gives up on its block; read over py4j in placeStats(). */
+    /** Ticks the body has not moved; the odometer that replaces "Nav says it is pathing". */
+    private int _ticksSinceMoved = 0;
+    private net.minecraft.world.phys.Vec3 _lastMoveTickPos = null;
+
+    /** How long the body may be still before a pathing claim stops counting as progress. */
+    private static final int STALL_MOVE_GRACE = 40;
+
+    /** Resets REFUSED because the body had not moved; reads 0 with the flag off. */
+    public static volatile int dbResetDenied;
+    /** Ticks the approach clock was held because the executor was digging/placing toward the
+     *  block or a pillar was going up (G32: a dig is progress, not a stall). */
+    public static volatile int dbBuildHeld;
+    /** A PLACE/PILLAR builder is progress only while it MOVES the body. Past this many ticks with
+     *  the body still, a place/pillar is treated as WEDGED, its shield is dropped and the give-up
+     *  below reroutes. Generous (10 s) so no legitimate bridge/pillar -- which advances or rises
+     *  the body within a few ticks -- ever trips it; only a cycling wedge does. See the 2026-09-18
+     *  day-locked freeze (200 s at 692,59,865: dbBuilderYield in the thousands, body never moved). */
+    private static final int BUILD_HELD_MAX = 200;
+    /** Ticks a wedged place/pillar was denied its shield because the body had not moved for
+     *  BUILD_HELD_MAX. Reads 0 in a healthy run; non-zero means the freeze watchdog fired. */
+    public static volatile int dbBuildHeldStuck;
+    /** G47: tool swaps this task made itself before swinging (a pickaxe in the hotbar was never
+     *  selected by the fix chain while navigation was live). Read dbToolEquipped. */
+    public static volatile int dbToolEquipped;
+    /** G50: ticks the swing was withheld because the live ray was not on the block yet. */
+    public static volatile int dbAimWait;
+
+    /** Put the best tool for {@code block} in hand before swinging at it; a no-op when it is
+     *  already there or the pack holds nothing suitable. */
+    private static void equipBestToolFor(AltoClef mod, BlockPos block) {
+        try {
+            if (mod.getFoodChain().isTryingToEat()) return;
+            // ⛔ DO NOT SKIP THE MINING TOOL EQUIP ON A NON-EMPTY PLACE QUEUE (G108, 2026-09-19).
+            // This used to `return` when {@code exec.isPlacingNow()} -- but that is queue-based
+            // ({@code placeQueue != null && !placeQueue.isEmpty()}, PathExecutor.java:332), so it is
+            // true whenever a STALE bridge/place segment lingers in the queue, not only during an
+            // active place. Every caller here is a BREAKING context that has just claimed the tick
+            // ({@code minerMineUntilMs}/{@code minerAimUntilMs} set immediately before the call), so
+            // the executor yields and will NOT place this tick -- yet the guard still fired and
+            // skipped the tool equip. Measured on the natural-terrain portal (nether-reach): after
+            // flooding, the route to the obsidian left a place segment queued, so isPlacingNow stayed
+            // true, equipBestToolFor was skipped every tick, the pickaxe was never equipped, the bot
+            // "mined" exposed obsidian with a WATER BUCKET in hand for 7+ minutes (obsidian stuck at
+            // 0), and because it could not break, the queue never drained -- a deadlock. Proven:
+            // manually selecting the pickaxe let it break, and the equip then worked. The miner owns
+            // the hand when it is breaking; equip its tool unconditionally.
+            BlockState state = mod.getWorld().getBlockState(block);
+            Optional<Slot> best = StorageHelper.getBestToolSlot(mod, state);
+            if (best.isEmpty()) return;
+            net.minecraft.world.item.Item bestItem = StorageHelper.getItemStackInSlot(best.get()).getItem();
+            if (StorageHelper.getItemStackInSlot(adris.altoclef.util.slots.PlayerSlot.getEquipSlot()).getItem() == bestItem) return;
+            if (mod.getSlotHandler().forceEquipItem(bestItem)) dbToolEquipped++;
+        } catch (Throwable ignored) {
+            // an equip failure must never stop the swing
+        }
+    }
+
+    public static volatile int dbTick, dbUnreachMove, dbUnreachWater, dbUnreachPillager,
+            dbUnreachNear, dbUnreachFar, dbUnreachDistSum,
+            dbNearTick, dbNearNoReach, dbNearAirborne, dbNearHungry, dbNearUnsafe, dbTargetAir, dbLeafCleared;
+    /** Closest we have been to this task's block, squared; the yardstick for real progress. */
+    private double _bestDistSq = Double.MAX_VALUE;
+
+    /**
+     * When the bot last got genuinely CLOSER to this block.
+     *
+     * <p>⛔ THE TASK ASKS TWO DIFFERENT QUESTIONS AND ONLY ONE OF THEM CAN FAIL. The reset below
+     * is on APPROACH -- distSq improving -- which is right. But the thing that can declare failure
+     * is {@code MovementProgressChecker.check}, and that asks whether the BODY MOVED (0.1 blocks
+     * in 6 s). A bot that walks in circles satisfies it for ever, so the approach-based reset never
+     * gets to matter.
+     *
+     * <p>Measured on the playthrough: DestroyBlockTask ticks 5791 times with dbNearTick=0 -- never
+     * once within four blocks of its target -- and dbUnreachMove=0, so the checker never once
+     * called it stuck. Thousands of ticks moving, no approach, and no failure declared, so the
+     * block is never given up on and the run ends inside this task. It is the same shape mine_coal
+     * showed this morning from the other side: 482 close-walk ticks, 286 with movement, THIRTEEN
+     * that closed any ground.
+     *
+     * <p>Generous on purpose -- three times the checker's own six-second window. This file already
+     * records what over-eager giving-up costs: 21 blacklistings in eight minutes, every target a
+     * real log within fifteen blocks, and the bot touring eighteen trees without felling one.
+     */
+    private long _lastApproachMs = 0;
+
+    /** Three times MovementProgressChecker's own distance window (6 s), in millis. */
+    private static final long APPROACH_STALL_MS = 18_000L;
+
+    /**
+     * CLOSEST the bot ever got to the block it is destroying, in TENTHS of a block.
+     *
+     * <p>⛔ THE ONE NUMBER THAT SPLITS TWO OPPOSITE FIXES, and it was not being recorded. Of the
+     * eighteen playthrough runs that reached ZERO rungs today, FIFTEEN ended sitting on
+     * {@code Destroy block} -- at full health (median min hp 20.0, one run of eighteen below 10) --
+     * so the run dies on its first tree with nothing else wrong. What is not known is whether the
+     * bot NEVER ARRIVES or arrives and CANNOT MINE, and those want opposite work.
+     *
+     * <p>The existing distance counters cannot answer it: dbUnreachNear/Far/DistSum only write when
+     * MovementProgressChecker declares a stall, and it never does (dbUnreachMove=0 across the
+     * captures), so they read zero on exactly the runs worth reading.
+     *
+     * <p>Unconditional, one number, cheapest possible: the minimum of _bestDistSq per run.
+     */
+    public static volatile int dbBestDistTenths = Integer.MAX_VALUE;
+
+    /**
+     * PER-TARGET arrival, which is what makes playthrough questions affordable at all.
+     *
+     * <p>⛔ MEASURED: a run is 350 s and 89% of it is the watch window (rcon 1 s, connect 22 s,
+     * reset 11 s, start 4 s, watch 313 s). There is no overhead to cut and halving the window was
+     * already tried and lost the signal, so a per-RUN sample costs six minutes and cannot be made
+     * cheaper. n=20 per arm is four hours for one question, which is why six flags were each judged
+     * on six runs and three of those verdicts later reversed.
+     *
+     * <p>A run does not attempt ONE block, it attempts dozens. Each target is its own sample of the
+     * question that actually separates PASS from FAIL -- did the bot get inside reach of it. Counted
+     * per target, one five-minute run yields tens of samples instead of one, and the arrival RATE
+     * is comparable between arms without waiting four hours.
+     *
+     * <p>Read as dbTargets=seen/reached. A target counts as reached the moment the bot is inside
+     * 4.5 blocks of it -- vanilla reach, the same line the verdict already turns on.
+     */
+    public static volatile int dbTargetsSeen, dbTargetsReached;
+
+    /** The target this task is currently accounting for, so each is counted exactly once. */
+    private net.minecraft.core.BlockPos _accountedTarget = null;
+    private boolean _accountedReached = false;
+
+    /** Times the approach was issued as a REACH goal instead of an occupy-the-cell goal. */
+    public static volatile int dbReachGoal;
+    public static volatile int dbBuilderYield;
+
+    /** Times a block was given up on for NO APPROACH while the body kept moving. */
+    public static volatile int dbApproachStalled;
+
+    /** The target the last FAR give-up was about, and how many in a row it has had. */
+    private BlockPos _farGiveUpTarget = null;
+    private int _farGiveUpCount = 0;
+    /** Three strikes: a stumble on the walk is forgiven, a block that keeps failing is not. */
+    private static final int FAR_GIVE_UPS_BEFORE_BLACKLIST = 3;
+    /** Far give-ups that bought a retry instead of a blacklisting, and ones that ran out of them. */
+    public static volatile int dbFarRetried, dbFarCondemned;
+    private final MovementProgressChecker stuckCheck = new MovementProgressChecker();
+    private final MovementProgressChecker _moveChecker = new MovementProgressChecker();
+    private final BlockPos pos;
+    Block[] annoyingBlocks = new Block[]{
+            Blocks.VINE,
+            Blocks.NETHER_SPROUTS,
+            Blocks.CAVE_VINES,
+            Blocks.CAVE_VINES_PLANT,
+            Blocks.TWISTING_VINES,
+            Blocks.TWISTING_VINES_PLANT,
+            Blocks.WEEPING_VINES_PLANT,
+            Blocks.LADDER,
+            Blocks.BIG_DRIPLEAF,
+            Blocks.BIG_DRIPLEAF_STEM,
+            Blocks.SMALL_DRIPLEAF,
+            Blocks.TALL_GRASS,
+            Blocks.SHORT_GRASS,
+            Blocks.SWEET_BERRY_BUSH
+    };
+    private Task unstuckTask = null;
+    private boolean isMining;
+
+    public DestroyBlockTask(BlockPos pos) {
+        this.pos = pos;
+    }
+
+    /**
+     * Generates an array of BlockPos objects representing the sides of a given BlockPos.
+     *
+     * @param pos The BlockPos object to generate the sides for.
+     * @return An array of BlockPos objects representing the sides of the given BlockPos.
+     */
+    private static BlockPos[] generateSides(BlockPos pos) {
+        int x = pos.getX();
+        int y = pos.getY();
+        int z = pos.getZ();
+
+        // Log the values of x, y, and z for debugging
+        Debug.logInternal("x = " + x);
+        Debug.logInternal("y = " + y);
+        Debug.logInternal("z = " + z);
+
+        return new BlockPos[]{
+                new BlockPos(x + 1, y, z),
+                new BlockPos(x - 1, y, z),
+                new BlockPos(x, y, z + 1),
+                new BlockPos(x, y, z - 1),
+                new BlockPos(x + 1, y, z - 1),
+                new BlockPos(x + 1, y, z + 1),
+                new BlockPos(x - 1, y, z - 1),
+                new BlockPos(x - 1, y, z + 1)
+        };
+    }
+
+    /**
+     * Checks if a block is annoying.
+     *
+     * @param mod The AltoClef mod instance.
+     * @param pos The position of the block.
+     * @return true if the block is annoying, false otherwise.
+     */
+    private boolean isAnnoying(AltoClef mod, BlockPos pos) {
+        if (!WorldHelper.intersectsPlayerCollision(mod, pos)) return false;
+        for (Block annoyingBlock : annoyingBlocks) {
+            // ⛔ A DOOR OR A GATE IS OPENED, NOT MINED. Doors and fence gates used to be "annoying"
+            // here, so the unstick broke them without ever consulting BreakRules (which refuses
+            // them) — that is the "it still tries to break a closed door" that survived the earlier
+            // fix. They are openable, so the unstick must not chew through them; the path's own door
+            // move opens them instead. Fences stay (not openable, a fair thing to break free of).
+            boolean isAnnoying = mod.getWorld().getBlockState(pos).getBlock() == annoyingBlock
+                    || mod.getWorld().getBlockState(pos).getBlock() instanceof FenceBlock
+                    || mod.getWorld().getBlockState(pos).getBlock() instanceof FlowerBlock;
+            if (isAnnoying) {
+                Debug.logInternal("Block at position " + pos + " is annoying.");
+                return true;
+            }
+        }
+        Debug.logInternal("Block at position " + pos + " is not annoying.");
+        return false;
+    }
+
+    /**
+     * Returns the position of the block where the player is stuck.
+     * If there are no annoying block positions, returns null.
+     *
+     * @param mod The instance of the AltoClef mod.
+     * @return The BlockPos of the stuck block, or null if none found.
+     */
+    private BlockPos stuckInBlock(AltoClef mod) {
+        BlockPos playerPos = mod.getPlayer().blockPosition();
+        BlockPos[] toCheck = generateSides(playerPos);
+        BlockPos[] toCheckHigh = generateSides(playerPos.above());
+
+        // Check if player position is annoying
+        if (isAnnoying(mod, playerPos)) {
+            Debug.logInternal("Player position is annoying: " + playerPos);
+            return playerPos;
+        }
+
+        // Check if player position (up) is annoying
+        if (isAnnoying(mod, playerPos.above())) {
+            Debug.logInternal("Player position (up) is annoying: " + playerPos.above());
+            return playerPos.above();
+        }
+
+        // Check each side block position
+        for (BlockPos check : toCheck) {
+            if (isAnnoying(mod, check)) {
+                Debug.logInternal("Block position is annoying: " + check);
+                return check;
+            }
+        }
+
+        // Check each high block position
+        for (BlockPos check : toCheckHigh) {
+            if (isAnnoying(mod, check)) {
+                Debug.logInternal("Block position (up) is annoying: " + check);
+                return check;
+            }
+        }
+
+        Debug.logInternal("No annoying block positions found.");
+        return null;
+    }
+
+    /**
+     * Retrieves a task to get the fence unstuck.
+     *
+     * @return The task to get the fence unstuck.
+     */
+    private Task getFenceUnstuckTask() {
+        // Log the start of the function
+        Debug.logInternal("Entering getFenceUnstuckTask");
+
+        // Create a safe random shimmy task
+        Task task = createSafeRandomShimmyTask();
+
+        // Log the end of the function
+        Debug.logInternal("Exiting getFenceUnstuckTask");
+
+        // Return the task
+        return task;
+    }
+
+    /**
+     * Creates a new instance of SafeRandomShimmyTask.
+     *
+     * @return The created SafeRandomShimmyTask.
+     */
+    private Task createSafeRandomShimmyTask() {
+        Task task = new SafeRandomShimmyTask();
+        Debug.logInternal("Created SafeRandomShimmyTask: " + task);
+        return task;
+    }
+
+    /**
+     * This method is called when the mod starts.
+     * It cancels any ongoing pathing behavior, resets move checker and stuck check.
+     * If the cursor stack is not empty, it tries to move it to a suitable slot in the player inventory.
+     * If the item can be thrown away, it drops it in an undefined slot or the garbage slot.
+     * If the cursor stack is empty, it closes the screen.
+     */
+    @Override
+    protected void onStart() {
+        AltoClef mod = AltoClef.getInstance();
+
+        // Cancel any ongoing pathing behavior.
+        Nav.cancel();
+
+        // Reset move checker and stuck check.
+        _moveChecker.reset();
+        stuckCheck.reset();
+
+        // Get the item stack in the cursor slot.
+        ItemStack cursorStack = StorageHelper.getItemStackInCursorSlot();
+        Debug.logInternal("Cursor stack: " + cursorStack);
+
+        // If the cursor stack is not empty, try to move it to a suitable slot in the player inventory.
+        if (!cursorStack.isEmpty()) {
+            Optional<Slot> moveTo = mod.getItemStorage().getSlotThatCanFitInPlayerInventory(cursorStack, false);
+            Debug.logInternal("Move to slot: " + moveTo);
+
+            // If there is a slot where the item can fit, click on that slot to move the item.
+            moveTo.ifPresent(slot -> {
+                mod.getSlotHandler().clickSlot(slot, 0, ContainerInput.PICKUP);
+                Debug.logInternal("Clicked slot: " + slot);
+            });
+
+            // If the item can be thrown away, click on an undefined slot to drop the item.
+            if (ItemHelper.canThrowAwayStack(mod, cursorStack)) {
+                mod.getSlotHandler().clickSlot(Slot.UNDEFINED, 0, ContainerInput.PICKUP);
+                Debug.logInternal("Clicked undefined slot");
+            }
+
+            // Get the garbage slot and click on it to move the item.
+            Optional<Slot> garbage = StorageHelper.getGarbageSlot(mod);
+            Debug.logInternal("Garbage slot: " + garbage);
+
+            garbage.ifPresent(slot -> {
+                mod.getSlotHandler().clickSlot(slot, 0, ContainerInput.PICKUP);
+                Debug.logInternal("Clicked slot: " + slot);
+            });
+
+            // Click on an undefined slot to drop the item.
+            mod.getSlotHandler().clickSlot(Slot.UNDEFINED, 0, ContainerInput.PICKUP);
+            Debug.logInternal("Clicked undefined slot");
+        } else {
+            // If the cursor stack is empty, close the screen.
+            StorageHelper.closeScreen();
+            Debug.logInternal("Closed screen");
+        }
+    }
+
+    /**
+     * This method is called periodically to perform various tasks.
+     *
+     * @return The next task to be executed.
+     */
+    /** Targets refused because breaking them would drop the body over an unsafe landing. */
+    public static volatile int underfootRefused = 0;
+
+    /** In the own column below the feet, and the landing after breaking it is not a safe one. */
+    private static boolean unsafeToMineUnderfoot(AltoClef mod, BlockPos target) {
+        BlockPos feet = mod.getPlayer().blockPosition();
+        // ⛔ THE FLOOR IS THE BLOCK THE BODY STANDS ON, NOT feet.down() (2026-09-24). On a block lower
+        // than a full cube -- soul sand is 0.875, the nether is full of it -- the body stands at y+0.875
+        // and getBlockPos() is the SOUL SAND ITSELF, so "below the feet" skipped the one block that was
+        // holding the body up. Measured: two nether deaths falling straight down from standing at
+        // heights 32.9 and 58.9 (soul sand tops), no movement driver, 30 blocks into lava, and this rule
+        // reading underfoot=0 in every stint. The support is floor(y - 0.2), vanilla's own stepping-pos
+        // offset: the soul sand at 58.875, the stone under a body standing at 59.0.
+        net.minecraft.world.phys.Vec3 bp = mod.getPlayer().position();
+        int supportY = net.minecraft.util.Mth.floor(bp.y - 0.2);
+        if (target.getX() != feet.getX() || target.getZ() != feet.getZ() || target.getY() > supportY) {
+            return false;
+        }
+        feet = new BlockPos(feet.getX(), supportY + 1, feet.getZ());   // fall height is measured from here
+        var w = mod.getWorld();
+        for (int y = target.getY() - 1; y >= target.getY() - 4; y--) {
+            BlockPos c = new BlockPos(target.getX(), y, target.getZ());
+            var st = w.getBlockState(c);
+            if (kaptainwutax.tungsten.path.RouteHazards.hazard(st)) return true;    // lava / magma below
+            if (!st.getCollisionShape(w, c).isEmpty()) {
+                return feet.getY() - (y + 1) > 3;                                    // fall height
+            }
+        }
+        return true;                                                                 // no floor within 4
+    }
+
+    /** A cardinal neighbour of the feet the body can stand on, from which the target is in reach. */
+    private static BlockPos sideStandReaching(AltoClef mod, BlockPos target) {
+        // stand level = one above the support block (see unsafeToMineUnderfoot: not getBlockPos(),
+        // which on soul sand is the soul sand itself)
+        BlockPos raw = mod.getPlayer().blockPosition();
+        BlockPos feet = new BlockPos(raw.getX(),
+                net.minecraft.util.Mth.floor(mod.getPlayer().position().y - 0.2) + 1, raw.getZ());
+        var w = mod.getWorld();
+        for (net.minecraft.core.Direction d : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+            BlockPos n = feet.relative(d);
+            if (!kaptainwutax.tungsten.combat.CombatPathfinder.isWalkable(n, w)) continue;
+            if (kaptainwutax.tungsten.path.RouteHazards.lethalColumn(w, n.getX(), n.getY(), n.getZ(),
+                    new BlockPos.MutableBlockPos())) continue;
+            if (net.minecraft.world.phys.Vec3.atCenterOf(n).add(0, 0.62, 0)
+                    .distanceToSqr(net.minecraft.world.phys.Vec3.atCenterOf(target)) > 4.5 * 4.5) continue;
+            return n;
+        }
+        return null;
+    }
+
+    @Override
+    protected Task onTick() {
+        dbTick++;
+        AltoClef mod = AltoClef.getInstance();
+        kaptainwutax.tungsten.render.RouteOverlay.noteTarget(pos);
+        // IS THE BLOCK STILL THERE? The reach ray was measured hitting NOTHING (MISS) 5142 times
+        // in one run, which is what aiming at an empty cell looks like. If the log has already
+        // been felled, every downstream symptom follows: no reach, no swing, no movement, the
+        // progress checker expires and a block that no longer exists gets blacklisted.
+        if (mod.getWorld() != null && mod.getWorld().getBlockState(pos).isAir()) dbTargetAir++;
+        // ⛔ AND THE ANSWER IS: IT IS NOT THE PROBLEM. Measured, and worth writing down because
+        // "the target is the wrong block" was the last untried reading of the self-floor stall:
+        // dbTargetAir reads 16 against dbTick=13508, and 8 against 13508 on the run before -- about
+        // a tenth of one per cent. isFinished() already returns true the moment the block is air,
+        // so those ticks are only the window between the break and the framework noticing.
+        // Whatever keeps the reach ray from landing, a ghost target is not it.
+
+        // Check if there is white wool at the specified position
+        if (mod.getWorld().getBlockState(pos).getBlock() == Blocks.WOOL.pick(DyeColor.WHITE)) {
+            // Iterate over all entities in the world
+            Iterable<Entity> entities = mod.getWorld().entitiesForRendering();
+            for (Entity entity : entities) {
+                // Check if the entity is a PillagerEntity and is within a distance of 144 blocks from the position
+                if (entity instanceof Pillager && pos.closerToCenterThan(entity.position(), 144)) {
+                    Debug.logMessage("Blacklisting pillager wool.");
+                    dbUnreachPillager++;
+                    // Request the block at the position to be marked as unreachable
+                    mod.getBlockScanner().requestBlockUnreachable(pos, 0);
+                }
+            }
+        }
+
+        // ⛔ PATHING IS NOT PROGRESS -- the same line disarms TimeoutWanderTask, and for the same
+        // reason: a stall IS the state where Nav claims to be pathing while the body stands still,
+        // so this reset wipes the detector exactly when it is needed. dbTick=7568 with
+        // dbUnreachMove=0 and every other branch at zero is what it looks like from outside.
+        if (mod.getPlayer() != null) {
+            if (_lastMoveTickPos != null
+                    && mod.getPlayer().position().distanceToSqr(_lastMoveTickPos) > 0.0004) {
+                _ticksSinceMoved = 0;
+                _lastMoveTickPos = mod.getPlayer().position();
+            } else {
+                _ticksSinceMoved++;
+                if (_lastMoveTickPos == null) _lastMoveTickPos = mod.getPlayer().position();
+            }
+        }
+        // BUILDING IS PROGRESS (G32, 2026-09-11). A bot digging its way DOWN to this block stands
+        // still by design: the executor mines a cell, the body drops, the next cell is mined. The
+        // movement grace below rightly refuses to call a motionless search "progress" -- but it
+        // also refused a motionless DIG, so the approach stalled its own timer, the far give-up
+        // condemned the block, the scanner picked the next stone and the dig never finished
+        // (dig bench: dbTargets=9/0, dbFar=6). The same rule FastNavigator's watchdog uses: while
+        // the executor holds a break/place queue or a pillar is being built, the clock is held.
+        var exD = kaptainwutax.tungsten.TungstenModDataContainer.EXECUTOR;
+        // A BREAK is progress even while the body is still (a dig-down mines a cell, the body drops,
+        // the next cell is mined; a hard block takes seconds in place) -- G32, and the executor's own
+        // break timeout bounds a stuck break, so keep shielding it unconditionally. A PLACE/PILLAR is
+        // different: it is progress only while it MOVES the body (a pillar rises, a bridge advances).
+        // A place/pillar that CYCLES without advancing -- plan, fail, re-plan the same, repeat --
+        // moves nothing, and shielding it unconditionally suppressed the give-up for 200 s at
+        // (692,59,865) day-locked. Shield it only while the body is moving; once wedged, drop the
+        // shield so the give-up below condemns the target and reroutes.
+        boolean breakingTowardIt = exD != null && exD.breakQueue != null;
+        boolean placingTowardIt = (exD != null && exD.placeQueue != null)
+                || kaptainwutax.tungsten.task.PillarTask.isActive();
+        if (breakingTowardIt) {
+            dbBuildHeld++;
+            _moveChecker.reset();
+            _lastApproachMs = System.currentTimeMillis();
+        } else if (placingTowardIt && _ticksSinceMoved < BUILD_HELD_MAX) {
+            dbBuildHeld++;
+            _moveChecker.reset();
+            _lastApproachMs = System.currentTimeMillis();
+        } else if (placingTowardIt) {
+            dbBuildHeldStuck++;   // wedged place/pillar: stop shielding, let the give-up fire
+        } else if (Nav.isPathing()) {
+            if (!kaptainwutax.tungsten.TungstenConfig.get().stallCheckNeedsMovement
+                    || _ticksSinceMoved < STALL_MOVE_GRACE) {
+                _moveChecker.reset();
+            } else {
+                dbResetDenied++;
+            }
+        }
+
+        // The approach may be building its own footing. Do not mine a newly
+        // reachable occluder mid-pillar: that steals its downward aim and block.
+        // Keep the same approach child alive until the placement step releases it.
+        // ⛔ BUT ONLY WHILE THE BUILD IS MOVING THE BODY. Yielding to builderOwnsInputs() every
+        // tick with no bound is the other half of the 200 s freeze: a wedged place/pillar/bridge
+        // keeps this task returning approachTask() for ever, so the give-up below never runs. A
+        // build that is actually advancing (pillar rising, bridge stepping) keeps _ticksSinceMoved
+        // low and is untouched; a wedged one crosses BUILD_HELD_MAX and we fall through to reroute.
+        if (kaptainwutax.tungsten.TungstenModDataContainer.builderOwnsInputs()
+                && _ticksSinceMoved < BUILD_HELD_MAX) {
+            dbBuilderYield++;
+            isMining = false;
+            mod.getInputControls().release(Input.CLICK_LEFT);
+            setDebugState("Waiting for the approach to finish placing");
+            return approachTask();
+        }
+
+        // Check if the player is in a Nether portal
+        if (WorldHelper.isInNetherPortal()) {
+            // TODOS.md, the same "a search is not progress" substitution already proven for the
+            // drowning guard (WorldSurvivalChain.handleDrowning), and the same shape as the
+            // "thief" fix a few lines below this one (Nav.isPathing() being true during a mere
+            // search, without asking whether anything is actually driving the body): a stalled
+            // search could suppress this manual walk-out-of-the-portal escape indefinitely, and
+            // prolonged portal contact eventually teleports the bot to the other dimension via
+            // plain vanilla mechanics. Nav.isExecutingRoute() asks the narrower, correct
+            // question: a genuinely executing route through the portal is untouched.
+            if (!Nav.isExecutingRoute()) {
+                setDebugState("Getting out from nether portal");
+                // Hold the sneak and move forward inputs to exit the Nether portal
+                mod.getInputControls().hold(Input.SNEAK);
+                mod.getInputControls().hold(Input.MOVE_FORWARD);
+                return null;
+            } else {
+                mod.getInputControls().release(Input.SNEAK);
+                mod.getInputControls().release(Input.MOVE_BACK);
+                mod.getInputControls().release(Input.MOVE_FORWARD);
+            }
+        } else if (Nav.isPathing()
+                && !(kaptainwutax.tungsten.TungstenConfig.get().wanderKeepsWalkerKeys
+                     && kaptainwutax.tungsten.task.BlockPathWalker.isRunning())) {
+            // SAME SHAPE AS THE WANDER TASK'S, AND THE SAME FIX.
+            // This releases the movement keys whenever the pathfinder is SEARCHING, without asking
+            // whether anything is currently driving the body. With TimeoutWanderTask's 1290 steals
+            // removed, the thief instrument names this line next: DestroyBlockTask:407 x220 in a
+            // ten-minute run, against single digits for every other caller. BlockPathWalker is
+            // holding MOVE_FORWARD toward its waypoint while this takes it away.
+            mod.getInputControls().release(Input.SNEAK);
+            mod.getInputControls().release(Input.MOVE_BACK);
+            mod.getInputControls().release(Input.MOVE_FORWARD);
+        }
+
+        // Check if there is an active unstuck task and the player is stuck in a block
+        if (unstuckTask != null && unstuckTask.isActive() && !unstuckTask.isFinished() && stuckInBlock(mod) != null) {
+            setDebugState("Getting unstuck from block.");
+            stuckCheck.reset();
+            // Release control of Baritone's custom goal process and explore process
+            Nav.clearGoal();
+            Nav.stopExploring();
+            return unstuckTask;
+        }
+
+        // Check if the move checker or the stuck check failed
+        if (!_moveChecker.check(mod) || !stuckCheck.check(mod)) {
+            BlockPos blockStuck = stuckInBlock(mod);
+            if (blockStuck != null) {
+                unstuckTask = getFenceUnstuckTask();
+                return unstuckTask;
+            }
+            stuckCheck.reset();
+        }
+
+        // Check if the move checker failed
+        // A BLOCK YOU ARE STILL WALKING TOWARDS IS NOT UNREACHABLE.
+        // Measured: 21 blacklistings in eight minutes, every target a real dark oak log within
+        // fifteen blocks, and the counters say all 21 came from here (dbUnreachWater and
+        // dbUnreachPillager were 0). The parent then picks the next log, so the bot toured
+        // eighteen perfectly good trees and felled none. The generic move checker times out on
+        // things that are not failure — a detour, a climb, a fight — and its verdict was being
+        // spent on a permanent judgement about the block.
+        // Progress is progress TOWARDS THIS BLOCK, so that is what is measured, and the checker
+        // only gets to condemn a block the bot has genuinely stopped closing on.
+        double distSqNow = mod.getPlayer().position().distanceToSqr(
+                pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+        long nowMs = System.currentTimeMillis();
+        if (_lastApproachMs == 0) {
+            _lastApproachMs = nowMs;
+        }
+        // One sample per TARGET: opened when the target changes, closed by getting inside reach.
+        if (!pos.equals(_accountedTarget)) {
+            _accountedTarget = pos;
+            _accountedReached = false;
+            dbTargetsSeen++;
+        }
+        if (!_accountedReached && distSqNow <= 4.5 * 4.5) {
+            _accountedReached = true;
+            dbTargetsReached++;
+        }
+        int tenths = (int) Math.round(Math.sqrt(distSqNow) * 10.0);
+        if (tenths < dbBestDistTenths) {
+            dbBestDistTenths = tenths;
+        }
+        if (distSqNow < _bestDistSq - 0.5) {
+            _bestDistSq = distSqNow;
+            _moveChecker.reset();
+            _lastApproachMs = nowMs;
+        }
+        // MOVING IS NOT APPROACHING, AND ONLY ONE OF THEM IS THE JOB.
+        boolean approachStalled =
+                kaptainwutax.tungsten.TungstenConfig.get().breakNeedsApproach
+                        && nowMs - _lastApproachMs > APPROACH_STALL_MS;
+        if (approachStalled) {
+            dbApproachStalled++;
+            _lastApproachMs = nowMs;      // one verdict per window, not one per tick
+        }
+        if (!_moveChecker.check(mod) || approachStalled) {
+            dbUnreachMove++;
+            // FAR OR NEAR? Those need opposite fixes. Far means the bot never got there at all;
+            // near means it arrived and something stops it finishing. One number tells them apart.
+            int d = (int) Math.round(Math.sqrt(distSqNow));
+            dbUnreachDistSum += d;
+            if (d <= 4) dbUnreachNear++; else dbUnreachFar++;
+            _moveChecker.reset();
+            // ⛔ "I NEVER GOT THERE" IS NOT "IT CANNOT BE REACHED", AND BOTH USED TO BLACKLIST.
+            //
+            // The split above was added to tell the two apart and then both fell into the same
+            // call. Measured on the playthrough, and it is not close: dbFar=18 against dbNear=0,
+            // with the give-ups landing at a MEAN DISTANCE OF 46 BLOCKS. The bot loses its
+            // progress check somewhere out on the walk -- a detour round an obstacle is enough,
+            // since the checker wants the distance to keep shrinking -- and condemns a perfectly
+            // good tree it has never stood next to.
+            //
+            // That is a cascade, not one lost tree. The scanner then hands back the next-nearest
+            // log, which is further, so the walk is longer and the checker is likelier to trip
+            // again. One run burned through TWENTY-SIX targets and reached NONE of them
+            // (dbTargets=26/0), ending up aimed at a log fifty-eight blocks away while standing in
+            // a forest with a hundred and fifty within forty.
+            //
+            // So a far give-up buys a RETRY, not a verdict. A block is only condemned when the bot
+            // keeps failing on the SAME one -- which is what a genuinely unreachable block looks
+            // like -- so a real dead end still gets dropped, just not on the first stumble.
+            boolean farAway = d > 4;
+            if (farAway && kaptainwutax.tungsten.TungstenConfig.get().farGiveUpRetriesFirst) {
+                if (!pos.equals(_farGiveUpTarget)) {
+                    _farGiveUpTarget = pos;
+                    _farGiveUpCount = 0;
+                }
+                if (++_farGiveUpCount < FAR_GIVE_UPS_BEFORE_BLACKLIST) {
+                    dbFarRetried++;
+                    return null;
+                }
+                dbFarCondemned++;
+            }
+            // Request the block at the position to be marked as unreachable
+            mod.getBlockScanner().requestBlockUnreachable(pos);
+        }
+
+        // Check if the block above the position is not solid, the player is above the position,
+        // and the player is within a distance of 0.89 blocks from the position
+        if (!WorldHelper.isSolidBlock(pos.above()) && mod.getPlayer().position().y > pos.getY() && pos.closerToCenterThan(mod.getPlayer().onGround() ? mod.getPlayer().position() : mod.getPlayer().position().add(0, -1, 0), 0.89)) {
+            if (WorldHelper.dangerousToBreakIfRightAbove(pos)) {
+                setDebugState("It's dangerous to break as we're right above it, moving away and trying again.");
+                return new RunAwayFromPositionTask(3, pos.getY(), pos);
+            }
+        }
+
+        Optional<Rotation> reach = LookHelper.getReach(pos);
+        // WHY DOES A BOT STANDING NEXT TO A TREE KEEP WALKING? Measured: the give-ups are
+        // overwhelmingly NEAR -- eight of eight and three of three at a mean 2.5 blocks. Something
+        // in this condition sends an arrived bot back to "Getting to block...", and there are six
+        // clauses that could. Count them apart instead of picking one.
+        if (distSqNow <= 16.0) {
+            dbNearTick++;
+            if (!reach.isPresent()) dbNearNoReach++;
+            else if (!(mod.getPlayer().isInWater() || mod.getPlayer().onGround())) dbNearAirborne++;
+            else if (mod.getFoodChain().needsToEat()) dbNearHungry++;
+            else if (!Nav.isSafeToCancel()) dbNearUnsafe++;
+        }
+        // FELL WHAT IS IN THE WAY, DO NOT WALK AWAY FROM IT.
+        // Measured: while the bot stands within four blocks of its target log, the reach ray is
+        // stopped by LEAVES on 91-100% of the ticks it fails -- the same tree's own canopy. The
+        // old answer was to keep walking, which the progress checker then read as being stuck,
+        // so a perfectly good log was blacklisted and the bot toured trees without felling one.
+        // Leaves are due to come down anyway, so the obstruction is simply the first block of
+        // this job rather than a reason to abandon it.
+        //
+        // AND IT IS NOT ONLY LEAVES. A stall capture at a dark oak: rayOther=502 to rayLeaves=10,
+        // blockedBy=minecraft:dark_oak_log -- the near side of the trunk hiding the far side, with
+        // dbTick=1525 and nothing broken. So clear whatever is genuinely in the way, subject to
+        // the three things that make clearing wrong rather than slow.
+        if (!reach.isPresent() && distSqNow <= 16.0) {
+            net.minecraft.core.BlockPos blocking =
+                    kaptainwutax.tungsten.path.movements.RotationHelper.blockedPos;
+            // ⛔ WHY THE CLEAR NEVER FIRES -- SPLIT IT, DO NOT GUESS. A stall capture reads
+            // rayOther=3091 with blockedBy=minecraft:grass_block and leafCleared=0: the ray to the
+            // target is stopped three thousand times and nothing is ever cleared. Three different
+            // refusals can produce that and they want different fixes, so each is counted:
+            //   self-floor  the obstruction IS the block under our own feet, which canClear
+            //               rightly refuses -- digging it drops us. The answer there is to MOVE so
+            //               the line opens, not to dig.
+            //   unclearable canClear said no for another reason (bedrock, fluid, air).
+            //   noReach     it is clearable but we cannot even look at IT.
+            if (blocking != null && !blocking.equals(pos)) {
+                if (blocking.equals(mod.getPlayer().blockPosition().below())) {
+                    dbBlockedSelfFloor++;
+                } else if (!canClear(mod, blocking)) {
+                    dbBlockedUnclearable++;
+                }
+            }
+            // ⛔ A TARGET UNDER A LID IS A LID TO TAKE OFF FIRST (G59, 2026-09-12).
+            //
+            // With the target one down and to the side, the ray leaves the eyes, grazes the cell
+            // under our own feet and stops there: canClear rightly refuses to dig our floor, the
+            // clear branch below never fires, and the 19:57 recording spent 1:05-2:40 at
+            // (81,124,-44) reading dbBlocked=69/0/0 with stone in reach beside its feet.
+            //
+            // The block that is genuinely in the way of the JOB is not our floor -- it is the one
+            // sitting ON the target, because with that gone the look is from above and the floor
+            // is behind the eyes. Baritone's GoalGetToBlock says the same thing from the planner's
+            // side: the cell you want to stand in is the one over the block. So take the lid off,
+            // when there is one and it can be taken.
+            if (blocking != null && blocking.equals(mod.getPlayer().blockPosition().below())
+                    && kaptainwutax.tungsten.TungstenConfig.get().digTheLidOffTheTarget) {
+                net.minecraft.core.BlockPos lid = pos.above();
+                if (!lid.equals(mod.getPlayer().blockPosition()) && WorldHelper.isSolidBlock(lid)
+                        && canClear(mod, lid)) {
+                    Optional<Rotation> lidReach = LookHelper.getReach(lid);
+                    if (lidReach.isPresent()) {
+                        dbLidDug++;
+                        _moveChecker.reset();          // taking the lid off IS progress
+                        LookHelper.lookAt(lidReach.get());
+                        equipBestToolFor(mod, lid);
+                        if (LookHelper.isLookingAtVanilla(lid)) {
+                            mod.getInputControls().hold(Input.CLICK_LEFT);
+                        } else {
+                            dbAimWait++;
+                            mod.getInputControls().release(Input.CLICK_LEFT);
+                        }
+                        setDebugState("Taking the lid off the target");
+                        return null;
+                    }
+                    dbLidNoReach++;
+                }
+            }
+            if (blocking != null && !blocking.equals(pos) && shouldClearRatherThanStepCloser(distSqNow)
+                    && canClear(mod, blocking)) {
+                Optional<Rotation> clearReach = LookHelper.getReach(blocking);
+                if (!clearReach.isPresent()) {
+                    dbBlockedNoReach++;
+                }
+                if (clearReach.isPresent()) {
+                    dbLeafCleared++;
+                    _moveChecker.reset();   // clearing a path IS progress
+                    LookHelper.lookAt(clearReach.get());
+                    equipBestToolFor(mod, blocking);
+                    if (LookHelper.isLookingAtVanilla(blocking)) {
+                        mod.getInputControls().hold(Input.CLICK_LEFT);
+                    } else {
+                        dbAimWait++;
+                        mod.getInputControls().release(Input.CLICK_LEFT);
+                    }
+                    return null;
+                }
+            }
+        }
+        if (reach.isPresent() && (mod.getPlayer().isInWater() || mod.getPlayer().onGround()) && !mod.getFoodChain().needsToEat() && !WorldHelper.isInNetherPortal() && Nav.isSafeToCancel()) {
+            // ⛔ NEVER DIG THE FLOOR OUT FROM UNDER YOURSELF OVER A DROP (G108 nether, 2026-09-24).
+            // Baritone's MineProcess, digging in the player's own column, only ever breaks blocks at
+            // or ABOVE the feet (`pos.getY() >= ctx.playerFeet().getY()`, MineProcess.java:126);
+            // anything below is reached by a MOVEMENT whose cost checks where the body lands
+            // (MovementDownward / MovementDescend, max unprotected fall 3). This task had no such
+            // rule: a target under the feet was mined like any other. Measured by the death snapshot
+            // on the nether stage: takeoff at (151.5,90.9,238.7), wasOnGround TRUE, velocity
+            // (0,-0.155,0) -- straight down from standing -- with no movement driver at all, and a
+            // death 23 blocks lower, "fell from a high place". The ground went, not the body. Now a
+            // target in the own column below the feet is mined from here only if the landing under
+            // it is solid, hazard-free and at most three blocks down; otherwise the bot steps to a
+            // neighbouring stand that still reaches it, or gives the block up.
+            if (unsafeToMineUnderfoot(mod, pos)) {
+                underfootRefused++;
+                BlockPos side = sideStandReaching(mod, pos);
+                if (side != null) {
+                    setDebugState("Target is my floor over a drop -- stepping aside to mine it");
+                    return new adris.altoclef.tasks.movement.GetToBlockTask(side, false);
+                }
+                setDebugState("Target is my floor over a drop, no side stand -- giving it up");
+                mod.getBlockScanner().requestBlockUnreachable(pos);
+                return null;
+            }
+            setDebugState("Block in range, mining...");
+            stuckCheck.reset();
+            isMining = true;
+            // G52: a route still running under a miner that holds the body is nobody's.
+            adris.altoclef.tasks.movement.CustomBaritoneGoalTask.stopOrphanRoute();
+            // CLAIM THE AIM AND THE KEYS FOR THIS TICK, the way the placer already does.
+            // Without this the walker steers the camera at its own waypoint in the same tick that
+            // this task aims at the block, and a viewer sees the crosshair pointing one way while
+            // a block breaks somewhere else. Stamped rather than latched: it lapses on its own if
+            // this task stops running, so an interrupted mine cannot freeze the walker.
+            kaptainwutax.tungsten.TungstenModDataContainer.minerAimUntilMs =
+                    System.currentTimeMillis() + 300;
+            // AND THE MINING CLAIM, which only this branch may make: the executor's own dig
+            // yields to a miner that is breaking a block, not to one that is backing off below
+            // (see TungstenModDataContainer.minerMineUntilMs for the 110-second stand).
+            kaptainwutax.tungsten.TungstenModDataContainer.minerMineUntilMs =
+                    System.currentTimeMillis() + 300;
+            mod.getInputControls().release(Input.SNEAK);
+            mod.getInputControls().release(Input.MOVE_BACK);
+            mod.getInputControls().release(Input.MOVE_FORWARD);
+            Nav.clearGoal();
+            if (!LookHelper.isLookingAt(mod, reach.get())) {
+                LookHelper.lookAt(reach.get());
+            }
+            // ⛔ THE MINER EQUIPS ITS OWN TOOL (G47, 2026-09-11). This line used to read "Tool
+            // equip is handled in PlayerInteractionFixChain. Oof." -- and that chain refuses to
+            // touch a tool INSIDE THE HOTBAR while navigation is live ("Baritone will take care of
+            // tools inside the hotbar"), an engine that no longer exists. Navigation is live on
+            // nearly every mining tick of the drive, so a pickaxe sitting in the hotbar was never
+            // selected and the bot punched stone bare-handed with the pick one slot over --
+            // the operator saw it on the 14:00 recording. The executor's own break queue already
+            // asks altoclef for the best tool every tick (equipToolHook); this is the same ask.
+            equipBestToolFor(mod, pos);
+            // ⛔ NO SWING UNTIL THE LIVE RAY IS ON THE BLOCK (G50, 2026-09-11). This held
+            // CLICK_LEFT in the same tick it asked the camera to turn, and the camera travels
+            // through the mouse pipeline: with the target diagonally below, the crosshair sat on
+            // the bot's OWN FLOOR while it turned, the swing landed there, the floor broke, the
+            // bot dropped one, the target was re-chosen -- seven minutes for six cobblestone on
+            // the 17:00 recording (dbBlockedSelfFloor=130, y falling one block a minute). The
+            // executor learned this in G31; the miner swings only when the ray says it will hit.
+            if (LookHelper.isLookingAtVanilla(pos)) {
+                mod.getInputControls().hold(Input.CLICK_LEFT);
+            } else {
+                dbAimWait++;
+                mod.getInputControls().release(Input.CLICK_LEFT);
+            }
+        } else {
+            setDebugState("Getting to block...");
+            if (isMining && mod.getPlayer().isInWater()) {
+                setDebugState("We are in water... holding break button");
+                isMining = false;
+                dbUnreachWater++;
+                mod.getBlockScanner().requestBlockUnreachable(pos);
+                mod.getInputControls().hold(Input.CLICK_LEFT);
+            } else {
+                isMining = false;
+            }
+            // ⛔ BACKING AWAY FROM A TARGET BELOW YOU KEEPS YOUR OWN FLOOR IN THE WAY.
+            //
+            // The self-floor branch above counts the case where the reach ray is stopped by the
+            // block under the bot's own feet -- canClear rightly refuses to dig it, and the note
+            // there says the answer is to MOVE so the line opens. Nothing moved. Worse, this line
+            // then holds MOVE_BACK whenever the target is within two blocks, which for a target
+            // BELOW the bot is exactly the wrong direction: retreating keeps the floor between the
+            // eyes and the block.
+            //
+            // It is not a rare corner. One twenty-minute run reads dbBlocked=617/0/0 -- six hundred
+            // and seventeen self-floor refusals -- alongside noReach=1357.
+            //
+            // So do not retreat while the floor is what is blocking us. Standing still lets the aim
+            // clear as soon as the body shifts for any other reason, and the mining branch above
+            // takes over the moment the ray lands.
+            boolean floorIsInTheWay =
+                    kaptainwutax.tungsten.TungstenConfig.get().noRetreatWhenOwnFloorBlocks
+                    && pos.getY() < mod.getPlayer().blockPosition().getY()
+                    && kaptainwutax.tungsten.path.movements.RotationHelper.blockedPos != null
+                    && kaptainwutax.tungsten.path.movements.RotationHelper.blockedPos
+                            .equals(mod.getPlayer().blockPosition().below());
+            if (floorIsInTheWay) {
+                dbNoRetreat++;
+                // ⛔ AND "DO NOT RETREAT" IS ONLY HALF OF IT -- THE NOTE SAYS *MOVE*.
+                //
+                // Releasing MOVE_BACK fires 666 times in a twelve-minute run and buys nothing
+                // (mine_coal 2/3 against 2/3, mine_diamond 2/3 against 3/3). That is not a mystery:
+                // standing still leaves the floor exactly where it was. The block under the bot is
+                // between its eyes and a target BELOW it, and the way to take it off the sight line
+                // is to stand OVER the target, from where the look is straight down and the floor
+                // is behind.
+                //
+                // So step toward it. Aiming and holding forward for the tick is what the
+                // self-floor note has been asking for since it was written, and the mining branch
+                // above takes over the instant the ray lands.
+                if (kaptainwutax.tungsten.TungstenConfig.get().stepOverWhenOwnFloorBlocks) {
+                    dbStepOver++;
+                    LookHelper.lookAt(mod, net.minecraft.world.phys.Vec3.atCenterOf(pos));
+                    mod.getInputControls().hold(Input.MOVE_FORWARD);
+                }
+                mod.getInputControls().release(Input.MOVE_BACK);
+            }
+            boolean isCloseToMoveBack = pos.closerToCenterThan(mod.getPlayer().position(), 2);
+            if (isCloseToMoveBack) {
+                if (!Nav.isPathing() && !mod.getPlayer().isInWater() &&
+                        !mod.getFoodChain().needsToEat()) {
+                    // BACKING OFF IS A CLAIM ON THE BODY TOO. The walker pushes MOVE_FORWARD at
+                    // its waypoint in the same tick this pushes MOVE_BACK, and the bot shuffles on
+                    // the spot -- which is exactly what the recording shows.
+                    kaptainwutax.tungsten.TungstenModDataContainer.minerAimUntilMs =
+                            System.currentTimeMillis() + 300;
+                    if (!floorIsInTheWay) mod.getInputControls().hold(Input.MOVE_BACK);
+                    mod.getInputControls().hold(Input.SNEAK);
+                } else {
+                    mod.getInputControls().release(Input.MOVE_BACK);
+                    mod.getInputControls().release(Input.SNEAK);
+                }
+            }
+            // WALK THERE WITH THE MOD'S OWN DRIVER, NOT WITH SHREDDER.
+            // This called getCustomGoalProcess().setGoalAndPath() directly, which is the old
+            // pathfinder — tungsten never saw the request. And this task is the LEAF of the whole
+            // playthrough: "beat the game" descends through pickaxe -> planks -> Mine And Collect
+            // -> Destroy block at (-177,67,331), and that last step is how the bot walks to every
+            // log, every ore, every block it ever breaks. Measured on the playthrough course: the
+            // task chain sat on exactly this leaf while EVERY tungsten counter read zero
+            // (mqStarted=0, called=0, staleRoot=0) and the bot did not move for ten minutes.
+            // GetToBlockTask extends CustomBaritoneGoalTask, so returning it here puts the walk on
+            // the tungsten-primary driver like the rest of navigation.
+            // ⛔⛔ THE GOAL WAS TO STAND INSIDE THE BLOCK IT IS TRYING TO BREAK.
+            //
+            // GetToBlockTask goals to AltoGoal.block(pos), whose arrival test is
+            //     at.getX() == pos.getX() && at.getY() == pos.getY() && at.getZ() == pos.getZ()
+            // -- the bot has arrived when it OCCUPIES the cell. While the block is still solid that
+            // is impossible, so navigation can never report arrival, the route is planned into an
+            // occupied cell, and the bot circles it for the rest of the run.
+            //
+            // That is exactly the measured failure. Of eighteen playthrough runs that reached ZERO
+            // rungs, fifteen ended on this leaf at FULL HEALTH, and closest approach splits the
+            // outcome 6/6 with no overlap: every passing run got inside 1.3 blocks, no failing run
+            // ever got inside 4.4 -- i.e. never inside the 4.5 reach. dbTick=5791 with
+            // dbNearTick=0 says the same from the other side.
+            //
+            // Breaking a block needs REACH, not occupancy, and the task for that already exists.
+            // Range 3 keeps the bot inside the 4.5 reach with room for the body, and it is the
+            // same distance this file's own near-accounting has always used (distSq <= 16).
+            // THE BLOCK IS A REACH GOAL, PLANNED BY THE ENGINE THAT CAN DIG (G25, 2026-09-11).
+            // GetToBlockTask asks to occupy a solid cell; the drive snaps that to the surface
+            // above it and asks for the same one-cell route for the rest of the run. Measured on
+            // the recorded playthrough: seven stone targets 5 blocks under the feet, every one
+            // "unreachable" after a minute of "Time taken to execute" spam, and the descent that
+            // finally happened was six random shimmy digs. GetAdjacentToBlockTask hands the BLOCK
+            // to FastNavigator with baritone's GoalGetToBlock test, so the planner completes on a
+            // neighbouring cell and breaks its way there when the block is underground.
+            return approachTask();
+        }
+        return null;
+    }
+
+    private Task approachTask() {
+        if (kaptainwutax.tungsten.TungstenConfig.get().mineGoalIsAdjacent) {
+            dbReachGoal++;
+            return new adris.altoclef.tasks.movement.GetAdjacentToBlockTask(pos);
+        }
+        if (kaptainwutax.tungsten.TungstenConfig.get().breakGoalIsReach) {
+            dbReachGoal++;
+            // Arrival is decided by REACH, not by distance: standing three blocks away
+            // behind an obstruction satisfies a range goal and still cannot break
+            // anything, which is what widened the ladder's spread to 0-6 when the plain
+            // range task was tried. See GetWithinReachOfBlockTask.
+            return new adris.altoclef.tasks.movement.GetWithinReachOfBlockTask(pos, 3);
+        }
+        return new GetToBlockTask(pos, false);
+    }
+
+    /**
+     * This method is called when the task is interrupted or stopped.
+     * It cancels Baritone pathing and releases certain input controls.
+     *
+     * @param interruptTask The task that interrupted the current task.
+     */
+    @Override
+    protected void onStop(Task interruptTask) {
+        AltoClef mod = AltoClef.getInstance();
+
+        // Cancel Baritone pathing
+        Nav.cancel();
+
+        // If not in game, return
+        if (!AltoClef.inGame()) {
+            return;
+        }
+
+        // Release input controls
+        mod.getInputControls().release(Input.CLICK_LEFT);
+        mod.getInputControls().release(Input.SNEAK);
+        mod.getInputControls().release(Input.MOVE_BACK);
+        mod.getInputControls().release(Input.MOVE_FORWARD);
+
+        // Logging statements for debugging
+        Debug.logInternal("onStop method called");
+        Debug.logInternal("Baritone pathing cancelled");
+        if (!AltoClef.inGame()) {
+            Debug.logInternal("Not in game");
+        }
+        Debug.logInternal("Left click input force state set to false");
+        Debug.logInternal("Released sneak input control");
+        Debug.logInternal("Released move back input control");
+        Debug.logInternal("Released move forward input control");
+    }
+
+    /**
+     * Checks if the block at the given position is air.
+     *
+     * @return true if the block is air, false otherwise
+     */
+    @Override
+    public boolean isFinished() {
+        BlockState blockState = AltoClef.getInstance().getWorld().getBlockState(pos);
+        boolean isAir = blockState.isAir();
+        Debug.logInternal("Block at position " + pos + " is air: " + isAir);
+        return isAir;
+    }
+
+    /**
+     * Checks if this task is equal to another task.
+     *
+     * @param other The other task to compare against.
+     * @return True if the tasks are equal, false otherwise.
+     */
+    @Override
+    protected boolean isEqual(Task other) {
+        boolean isSame = false;
+
+        // Check if the other task is an instance of DestroyBlockTask
+        if (other instanceof DestroyBlockTask destroyBlockTask) {
+
+            // Check if the positions of the tasks are equal
+            if (destroyBlockTask.pos.equals(pos)) {
+                isSame = true;
+            }
+        }
+
+        // Log the result of the equality check
+        Debug.logInternal("isEqual result: " + isSame);
+
+        // Return the result of the equality check
+        return isSame;
+    }
+
+    /**
+     * Generates a debug string representing the block destruction position.
+     *
+     * @return The debug string.
+     */
+    @Override
+    protected String toDebugString() {
+        return "Destroy block at " + pos.toShortString();
+    }
+
+    /**
+     * Is this obstruction one we may break to open a line to the target?
+     *
+     * <p>Three refusals, and no more than three -- an over-cautious rule here puts the bot back to
+     * standing in front of a trunk it will not touch:
+     * <ul>
+     *   <li>UNBREAKABLE (hardness below zero: bedrock, barriers) -- swinging at it is a loop;</li>
+     *   <li>FLUID -- you do not mine water, and the ray stopping at one is not an obstruction
+     *       this task can remove;</li>
+     *   <li>THE BLOCK UNDER OUR OWN FEET -- clearing that is how a bot digs itself into a hole
+     *       while trying to see a tree.</li>
+     * </ul>
+     */
+    /** Why the line-of-sight clear did not fire. Read as dbBlocked=selfFloor/unclearable/noReach. */
+    public static volatile int dbBlockedSelfFloor, dbBlockedUnclearable, dbBlockedNoReach;
+    /** G59: ticks spent digging the lid off a target the own floor was hiding, and ticks the lid
+     *  itself could not be looked at. Read as dbLid=dug/noReach. */
+    public static volatile int dbLidDug, dbLidNoReach;
+    /** Ticks the task declined to retreat because its own floor was blocking the aim. */
+    public static volatile int dbNoRetreat;
+    /** Ticks the task stepped TOWARD a below-target so its own floor left the sight line. */
+    public static volatile int dbStepOver;
+
+    /**
+     * May the obstruction be MINED, or should the bot STEP CLOSER to the target instead?
+     *
+     * <h2>The bug this exists for</h2>
+     *
+     * The clear branch fires whenever the ray to the target is blocked AND the bot is within four
+     * blocks, and it mines {@code RotationHelper.blockedPos} — <b>whatever the cursor happened to hit
+     * on the way</b>. From the wrong angle that is a block BESIDE the target: reported by the
+     * operator as "it will try to mine a cobblestone beside the bed as it's in the way of the cursor
+     * instead of just going closer and breaking it". Mining that cobblestone cannot possibly help,
+     * because it was never occluding the bed — the CURSOR was merely landing on it. The bot is
+     * simply standing too far away, at a bad angle, for the target's face to be visible.
+     *
+     * <p>Four blocks is also inside block reach (4.5), so the old radius guaranteed the bot was
+     * <i>able</i> to mine something — just not necessarily the right thing. That is the whole
+     * failure: a radius that only asks "can I mine at all".
+     *
+     * <h2>What it does instead</h2>
+     *
+     * Requires the bot to be genuinely close — inside {@link #CLEAR_ONLY_WHEN_CLOSE_SQ}, about two
+     * and a half blocks — before an obstruction may be mined. Farther out than that, the clear branch
+     * is skipped and the existing approach logic runs, so the bot walks closer and the line opens by
+     * itself. That is exactly what this task's own design note already says about the self-floor
+     * case: "the answer there is to MOVE so the line opens, not to dig".
+     *
+     * <p>At two and a half blocks, inside reach, a ray that STILL cannot reach the target is a real
+     * occluder — a tree's own canopy over its trunk, the near side of a log hiding the far side, a
+     * block sitting on top — and digging it is the correct, measured answer.
+     *
+     * <h2>And the escape hatch</h2>
+     *
+     * A bot that cannot move — pressed into a corner, or approaching a target whose stand it can
+     * never occupy — would otherwise spin here for ever, so {@link #CLEAR_PATIENCE_TICKS} of no
+     * movement licenses clearing anyway. Being wedged is exactly when digging out is right.
+     */
+    private boolean shouldClearRatherThanStepCloser(double distSqNow) {
+        if (distSqNow <= CLEAR_ONLY_WHEN_CLOSE_SQ) return true;
+        if (_ticksSinceMoved > CLEAR_PATIENCE_TICKS) return true;
+        dbClearDeferred++;
+        return false;
+    }
+
+    /** ~2.5 blocks: inside reach, and close enough that a blocked ray means real occlusion. */
+    private static final double CLEAR_ONLY_WHEN_CLOSE_SQ = 6.25;
+    /** Ticks without moving that license clearing anyway, so a wedged bot can still dig out. */
+    private static final int CLEAR_PATIENCE_TICKS = 40;
+    /** Times an obstruction was NOT mined because walking closer was the better answer.
+     *  Read as {@code dbClearDeferred}: the mechanism counter for the cobblestone-beside-the-bed fix. */
+    public static volatile int dbClearDeferred;
+
+    private boolean canClear(AltoClef mod, net.minecraft.core.BlockPos blocking) {
+        net.minecraft.world.level.block.state.BlockState st = mod.getWorld().getBlockState(blocking);
+        if (st.isAir() || !st.getFluidState().isEmpty()) {
+            return false;
+        }
+        if (st.getDestroySpeed(mod.getWorld(), blocking) < 0) {
+            return false;
+        }
+        // ⛔ AN OBSTRUCTION CLEAR MUST HONOR BREAK PROTECTION, NOT JUST THE INTENDED TARGET
+        // (G108, 2026-09-19). Clearing whatever the reach ray hits is a RAW CLICK_LEFT swing
+        // (InputControls.hold), which bypasses the planner/executor's canBreakHook -> BreakRules
+        // -> shouldAvoidBreaking chain entirely. Measured on the nether portal: while removing the
+        // front scaffold, an out-of-reach scaffold cell left the ray stopped by the top-row FRAME
+        // obsidian (the frame plane sits one block above the scaffold top, air in front), so this
+        // branch mined the protected frame cell for the full 9 s obsidian dig -- corrupting the
+        // finished frame, forcing a re-gather that drained the lava lake, and stranding the
+        // re-placement (the scaffold that was that cell's only stand is gone). The intended TARGET
+        // may be dug freely, but an OBSTRUCTION we only want out of the way must respect the same
+        // avoiders every other break path does; refuse to clear a protected block and let the task
+        // reposition for a clean line instead.
+        if (mod.getExtraBaritoneSettings().shouldAvoidBreaking(blocking)) {
+            return false;
+        }
+        return !blocking.equals(mod.getPlayer().blockPosition().below());
+    }
+
+}

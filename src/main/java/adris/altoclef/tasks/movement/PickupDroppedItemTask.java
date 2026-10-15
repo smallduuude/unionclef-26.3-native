@@ -1,0 +1,660 @@
+package adris.altoclef.tasks.movement;
+
+import adris.altoclef.control.BaritoneBridge;
+import adris.altoclef.control.Nav;
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.tasks.AbstractDoToClosestObjectTask;
+import adris.altoclef.tasks.resources.SatisfyMiningRequirementTask;
+import adris.altoclef.tasks.slot.EnsureFreeInventorySlotTask;
+import adris.altoclef.tasksystem.ITaskRequiresGrounded;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.ItemTarget;
+import adris.altoclef.util.MiningRequirement;
+import adris.altoclef.util.helpers.StlHelper;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.helpers.WorldHelper;
+import adris.altoclef.util.progresscheck.MovementProgressChecker;
+import net.minecraft.world.level.block.*;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.FenceBlock;
+import net.minecraft.world.level.block.FenceGateBlock;
+import net.minecraft.world.level.block.FlowerBlock;
+import net.minecraft.world.phys.Vec3;
+import adris.altoclef.multiversion.versionedfields.Blocks;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Optional;
+import java.util.Set;
+
+public class PickupDroppedItemTask extends AbstractDoToClosestObjectTask<ItemEntity> implements ITaskRequiresGrounded {
+
+    /** Times a pickup was handed to Baritone's follow process. Read as {@code baritonePickups}. */
+    public static volatile int baritonePickups;
+
+    /**
+     * Does this dropped stack match anything this task was asked for?
+     *
+     * <p>Used as Baritone's pickup filter, so it collects OUR drops and not the litter around them.
+     */
+    private boolean isWantedDrop(net.minecraft.world.item.ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return false;
+        for (ItemTarget t : itemTargets) {
+            if (t != null && t.matches(stack.getItem())) return true;
+        }
+        return false;
+    }
+    // ⛔ THE PICKAXE FETCHED FOR A DROP MUST NOT BE MADE FROM THAT DROP (G89, round 46,
+    // 2026-09-14). This asked for a STONE pickaxe, and a stone pickaxe is three cobblestone --
+    // the very item the pickup was after. The 16:24 recording: the bot's wooden pickaxe lay lost,
+    // its cobblestone in a pocket two blocks down behind dirt, and the chain closed on itself for
+    // seven minutes: "Pickup cobblestone x3 -> Collecting pickaxe first -> Satisfy Mining Req:
+    // STONE -> craft a stone pickaxe -> Collect cobblestone x3 -> Pickup Dropped Items -> Getting
+    // to drop cobblestone" -- the operator watching it stare at a dirt wall. A drop behind rock
+    // needs SOME pickaxe, and a wooden one (planks and sticks, which the pack held) digs stone;
+    // a player makes that one. WOOD is the requirement, and a drop that feeds the wooden
+    // pickaxe's own recipe (logs, planks, sticks) gets no diversion at all.
+    private static final Task getPickaxeFirstTask = new SatisfyMiningRequirementTask(MiningRequirement.WOOD);
+    /** G89: diversions into a wooden pickaxe, and diversions skipped because the drop would have fed the recipe. */
+    public static volatile int puWoodFirst, puFeedsSkipped;
+
+    /** G89: would fetching a wooden pickaxe need the very item this drop is? */
+    private static boolean dropFeedsThePickaxe(ItemEntity drop) {
+        if (drop == null || drop.getItem().isEmpty()) return false;
+        Item it = drop.getItem().getItem();
+        if (it == net.minecraft.world.item.Items.STICK) return true;
+        for (Item p : adris.altoclef.util.helpers.ItemHelper.PLANKS) if (p == it) return true;
+        for (Item l : adris.altoclef.util.helpers.ItemHelper.LOG) if (l == it) return true;
+        return false;
+    }
+    // Not clean practice, but it helps keep things self contained I think.
+    private static boolean isGettingPickaxeFirstFlag = false;
+    private final TimeoutWanderTask wanderTask = new TimeoutWanderTask(5, true);
+    private final MovementProgressChecker stuckCheck = new MovementProgressChecker();
+    private final MovementProgressChecker progressChecker = new MovementProgressChecker();
+    private final ItemTarget[] itemTargets;
+
+    // This happens all the time in mineshafts and swamps/jungles
+    private final Set<ItemEntity> _blacklist = new HashSet<>();
+    // Prevent soft lock when there are too many items on the ground
+    private static final int MAX_BLACKLIST_SIZE = 50;
+    private final boolean _freeInventoryIfFull;
+    Block[] annoyingBlocks = new Block[]{
+            Blocks.VINE,
+            Blocks.NETHER_SPROUTS,
+            Blocks.CAVE_VINES,
+            Blocks.CAVE_VINES_PLANT,
+            Blocks.TWISTING_VINES,
+            Blocks.TWISTING_VINES_PLANT,
+            Blocks.WEEPING_VINES_PLANT,
+            Blocks.LADDER,
+            Blocks.BIG_DRIPLEAF,
+            Blocks.BIG_DRIPLEAF_STEM,
+            Blocks.SMALL_DRIPLEAF,
+            Blocks.TALL_GRASS,
+            Blocks.SHORT_GRASS
+    };
+    private Task unstuckTask = null;
+    // Am starting to regret not making this a singleton
+    private AltoClef _mod;
+    private boolean _collectingPickaxeForThisResource = false;
+    private ItemEntity _currentDrop = null;
+    /** Which drop the current pursuit is about, and when it started -- see the budget above. */
+    // THE PURSUIT CLOCK BELONGS TO THE TARGET, NOT TO THE TASK INSTANCE.
+    // These were per-instance, and this task is REBUILT constantly -- the freeze dump of
+    // the slow opening shows 'Pickup Dropped Items' at two levels of one chain, the bot
+    // bouncing pickup -> wander -> pickup. Every rebuild restarted the clock at zero, so a
+    // pursuit could never spend its two-minute budget: dropBudget=0 across a ten-minute run
+    // whose first rung took 299 s, with TimeoutWanderTask:255x2032 and wanderMoved=0 while
+    // a wooden_pickaxe sat 2.3 blocks away and two blocks down.
+    // Static, so 'this drop has already cost two minutes' survives the rebuild and reaches
+    // requestEntityUnreachable, which is global anyway.
+    private static ItemEntity pursuitTarget = null;
+    private static long pursuitStartMs = 0L;
+    /** G23: best (smallest) distance^2 to the drop this pursuit, and when it last improved. A
+     *  pursuit that stops closing (distance not shrinking) is abandoned well before the flat
+     *  budget -- see TungstenConfig.dropAbandonWhenNotClosing. */
+    private static double pursuitBestDistSq = Double.MAX_VALUE;
+    private static long pursuitBestMs = 0L;
+    private static final long NOT_CLOSING_MS = 25_000L;
+    /** Drops abandoned early because the bot was not getting any closer to them. */
+    public static volatile int dropNotClosingAbandoned;
+    /** Clock restarts (target genuinely changed) and the longest pursuit seen, in seconds. */
+    public static volatile int pursuitRestarts, pursuitMaxSec;
+    /** Ceiling on chasing ONE drop. Was 120s, cut to 40s (G23): a run chased a wooden_pickaxe that
+     *  fell 84 blocks away and ~29 down a hillside for the full two minutes -- pointless for a
+     *  re-craftable item, and two minutes of a bot walking back and forth reads as broken. 40s is
+     *  still generous for a genuinely reachable drop (the pickup courses finish in seconds) but
+     *  caps the worst-case wander at a third of what it was. Works with dropAbandonWhenNotClosing,
+     *  which cuts a NON-closing pursuit even sooner (25s). */
+    private static final long PURSUIT_BUDGET_MS = 40_000L;
+    /** Drops abandoned because the pursuit ran past its budget. */
+    public static volatile int dropBudgetSpent;
+    /** G39: settled drops approached as a BLOCK goal (the build engine's road), ticks the
+     *  give-up clock was held because the navigator was digging / placing / pillaring toward the
+     *  drop, and failures that re-targeted instead of wandering. Read dropBlock=goal/held/retarget. */
+    public static volatile int dropBlockGoal, dropBuildHeld, dropFailRetargeted;
+
+    public PickupDroppedItemTask(ItemTarget[] itemTargets, boolean freeInventoryIfFull) {
+        this.itemTargets = itemTargets;
+        _freeInventoryIfFull = freeInventoryIfFull;
+    }
+
+    public PickupDroppedItemTask(ItemTarget target, boolean freeInventoryIfFull) {
+        this(new ItemTarget[]{target}, freeInventoryIfFull);
+    }
+
+    public PickupDroppedItemTask(Item item, int targetCount, boolean freeInventoryIfFull) {
+        this(new ItemTarget(item, targetCount), freeInventoryIfFull);
+    }
+
+    public PickupDroppedItemTask(Item item, int targetCount) {
+        this(item, targetCount, true);
+    }
+
+    private static BlockPos[] generateSides(BlockPos pos) {
+        return new BlockPos[]{
+                pos.offset(1,0,0),
+                pos.offset(-1,0,0),
+                pos.offset(0,0,1),
+                pos.offset(0,0,-1),
+                pos.offset(1,0,-1),
+                pos.offset(1,0,1),
+                pos.offset(-1,0,-1),
+                pos.offset(-1,0,1)
+        };
+    }
+
+    public static boolean isIsGettingPickaxeFirst(AltoClef mod) {
+        return isGettingPickaxeFirstFlag && mod.getModSettings().shouldCollectPickaxeFirst();
+    }
+
+    private boolean isAnnoying(AltoClef mod, BlockPos pos) {
+        if (!WorldHelper.intersectsPlayerCollision(mod, pos)) return false;
+        // ⛔ FIXED 2026-09-05: same copy-paste bug found and fixed in the sibling
+        // GetToEntityTask.isAnnoying() in this same package -- the loop returned
+        // unconditionally on its FIRST iteration regardless of match, so only
+        // annoyingBlocks[0] was ever actually compared and the other entries (nether
+        // sprouts, cave/twisting/weeping vines, ladder, dripleaf, tall/short grass, sweet
+        // berry bush) were silently never checked. CustomBaritoneGoalTask.isAnnoying() in
+        // this same package has the correct loop shape this was ported from.
+        Block block = mod.getWorld().getBlockState(pos).getBlock();
+        if (annoyingBlocks != null) {
+            for (Block annoyingBlock : annoyingBlocks) {
+                if (block == annoyingBlock) return true;
+            }
+        }
+        return block instanceof DoorBlock ||
+                block instanceof FenceBlock ||
+                block instanceof FenceGateBlock ||
+                block instanceof FlowerBlock;
+    }
+
+    private BlockPos stuckInBlock(AltoClef mod) {
+        BlockPos p = mod.getPlayer().blockPosition();
+        if (isAnnoying(mod, p)) return p;
+        if (isAnnoying(mod, p.above())) return p.above();
+        BlockPos[] toCheck = generateSides(p);
+        for (BlockPos check : toCheck) {
+            if (isAnnoying(mod, check)) {
+                return check;
+            }
+        }
+        BlockPos[] toCheckHigh = generateSides(p.above());
+        for (BlockPos check : toCheckHigh) {
+            if (isAnnoying(mod, check)) {
+                return check;
+            }
+        }
+        return null;
+    }
+
+    private Task getFenceUnstuckTask() {
+        return new SafeRandomShimmyTask();
+    }
+
+    public boolean isCollectingPickaxeForThis() {
+        return _collectingPickaxeForThisResource;
+    }
+
+    @Override
+    protected void onStart() {
+        wanderTask.reset();
+        progressChecker.reset();
+        stuckCheck.reset();
+    }
+
+    @Override
+    protected void onStop(Task interruptTask) {
+
+    }
+
+    /** Traced pickup decisions; see the note at the branch. */
+    private static volatile int puTrace = 0;
+
+    @Override
+    protected Task onTick() {
+        // Prevent soft lock: if we've blacklisted too many items, there are too many drops.
+        // Clear the blacklist and wander to let the area settle / items despawn.
+        if (_blacklist.size() > MAX_BLACKLIST_SIZE) {
+            Debug.logMessage("Too many blocked items (" + _blacklist.size() + "), clearing blacklist and wandering.");
+            _blacklist.clear();
+            wanderTask.reset();
+            setDebugState("Too many items, wandering.");
+            return wanderTask;
+        }
+
+        if (wanderTask.isActive() && !wanderTask.isFinished()) {
+            setDebugState("Wandering.");
+            return wanderTask;
+        }
+        AltoClef mod = AltoClef.getInstance();
+
+        // ── ENGINE: LET BARITONE DO THE PICKING UP ────────────────────────────────────────────
+        // Reported by the operator: "@get still uses tungsten for picking up, which can't open
+        // doors, which can have you never getting your goal complete". Exactly right, and it is a
+        // deadlock rather than a slowdown: the gather finishes, the item drops, altoclef drives the
+        // body to it itself -- and a door between the bot and the drop means it never arrives, so
+        // the task never completes and the command hangs.
+        //
+        // `IFollowProcess.pickup` is Baritone's own "go and get that dropped item". It paths to the
+        // drop with the SAME movement as everything else, so it opens doors on the way, and it
+        // re-plans if the drop moves or the world changes. One owner per job, again.
+        //
+        // Asked only when Baritone is not already collecting: re-issuing every tick would restart
+        // the process, which is the replan-thrash this project keeps paying for.
+        if (BaritoneBridge.selected()) {
+            if (!BaritoneBridge.isPickingUp() && BaritoneBridge.pickupItems(this::isWantedDrop)) {
+                baritonePickups++;
+            }
+            setDebugState("Baritone collecting " + itemTargets.length + " drop kind(s)");
+            return null;
+        }
+
+        // A SEARCH IS NOT PROGRESS. isPathing() is true while the pathfinder is merely LOOKING, and
+        // a search that fails and restarts keeps it true for ever -- so this line reset the very
+        // checker that the give-up path below depends on, and that path could never run. Measured:
+        // the bot stands on one spot for 50-90 s of a 120-second run with "Approach entity item --
+        // Tungsten pathfinding (29s left)" restarting, never blacklisting the drop, never
+        // wandering, never mining again. See Nav.isExecutingRoute.
+        if (kaptainwutax.tungsten.TungstenConfig.get().progressCheckIgnoresSearch
+                ? Nav.isExecutingRoute() : Nav.isPathing()) {
+            progressChecker.reset();
+        }
+        if (unstuckTask != null && unstuckTask.isActive() && !unstuckTask.isFinished() && stuckInBlock(mod) != null) {
+            setDebugState("Getting unstuck from block.");
+            stuckCheck.reset();
+            // Stop other tasks, we are JUST shimmying
+            Nav.clearGoal();
+            Nav.stopExploring();
+            return unstuckTask;
+        }
+        if (!progressChecker.check(mod) || !stuckCheck.check(mod)) {
+            BlockPos blockStuck = stuckInBlock(mod);
+            if (blockStuck != null) {
+                unstuckTask = getFenceUnstuckTask();
+                return unstuckTask;
+            }
+            stuckCheck.reset();
+        }
+        _mod = mod;
+
+        // If we're getting a pickaxe for THIS resource...
+        // WHY IS THE PICKUP NOT PICKING UP? The mine_stone course breaks blocks, the drops lie on the
+        // floor (rcon: three item entities) and the pack stays empty. This branch can divert the
+        // pickup into fetching a better pickaxe, and it asks for a STONE one -- which needs the very
+        // cobblestone that is not being collected. Print its three inputs rather than assume.
+        if (puTrace < 6) {
+            puTrace++;
+            Debug.logMessage("PICKUPDEC gettingPickaxeFirst=" + isIsGettingPickaxeFirst(mod)
+                    + " forThisResource=" + _collectingPickaxeForThisResource
+                    + " woodMet=" + StorageHelper.miningRequirementMetInventory(MiningRequirement.WOOD));
+        }
+        if (isIsGettingPickaxeFirst(mod) && _collectingPickaxeForThisResource && !StorageHelper.miningRequirementMetInventory(MiningRequirement.WOOD)) {
+            progressChecker.reset();
+            setDebugState("Collecting a wooden pickaxe first");
+            return getPickaxeFirstTask;
+        } else {
+            if (StorageHelper.miningRequirementMetInventory(MiningRequirement.WOOD)) {
+                isGettingPickaxeFirstFlag = false;
+            }
+            _collectingPickaxeForThisResource = false;
+        }
+
+        // ⛔ GIVING UP ON "NO PROGRESS" CANNOT CATCH A PURSUIT THAT IS PROGRESSING.
+        //
+        // Everything below fires when the progress checker trips. A bot walking steadily toward a
+        // drop forty blocks away is making progress the whole time, so it never trips -- and a
+        // twenty-minute run was spent exactly that way, following its own wooden pickaxe into a
+        // cave: lock=wooden_pickaxe:41.6>41.6, h34.0, dy-24.0, ending with dirt and a mushroom and
+        // no rungs at all.
+        //
+        // The instrument settled what this is NOT: deep picks read 15324 on that run and 0 on the
+        // two after it, and every sampled choice had one candidate (of=1, of=1, of=2), taking the
+        // cheaper one when there were two. So the ranking is fine and the descent price is fine --
+        // it is ONE target, chosen once, pursued for fifteen thousand ticks because nothing puts a
+        // ceiling on what a single drop may cost.
+        //
+        // A budget is that ceiling, and it is deliberately generous: a drop worth a minute of
+        // walking is worth having, and one that has taken two is not.
+        if (kaptainwutax.tungsten.TungstenConfig.get().dropPursuitHasBudget
+                && _currentDrop != null && _currentDrop.isAlive()) {
+            if (kaptainwutax.tungsten.TungstenConfig.get().dropBudgetSurvivesTaskRebuild
+                    ? !sameDrop(_currentDrop, pursuitTarget)
+                    : _currentDrop != pursuitTarget) {
+                pursuitRestarts++;
+                pursuitTarget = _currentDrop;
+                pursuitStartMs = System.currentTimeMillis();
+                pursuitBestDistSq = Double.MAX_VALUE;          // G23: new pursuit, reset the closing tracker
+                pursuitBestMs = System.currentTimeMillis();
+            } else if (System.currentTimeMillis() - pursuitStartMs > PURSUIT_BUDGET_MS) {
+                Debug.logMessage("Drop has cost more than its budget — marking it unreachable.");
+                dropBudgetSpent++;
+                pursuitMaxSec = Math.max(pursuitMaxSec,
+                        (int) ((System.currentTimeMillis() - pursuitStartMs) / 1000L));
+                _blacklist.add(_currentDrop);
+                mod.getEntityTracker().requestEntityUnreachable(_currentDrop);
+                _currentDrop = null;
+                pursuitTarget = null;
+                progressChecker.reset();
+                return null;
+            }
+            // G23: abandon a pursuit that is NOT CLOSING, long before the 2-minute budget. Track
+            // the smallest distance seen; if it has not improved by half a block in NOT_CLOSING_MS,
+            // the drop is unreachable-from-here (fell down a hill / across a lake), so blacklist it
+            // and let the task re-plan (re-craft, closer source) instead of walking the map. Best-
+            // distance is monotonic, so ordinary wander/oscillation never trips this.
+            if (kaptainwutax.tungsten.TungstenConfig.get().dropAbandonWhenNotClosing) {
+                double dsq = _currentDrop.distanceToSqr(mod.getPlayer());
+                if (dsq < pursuitBestDistSq - 0.25) {
+                    pursuitBestDistSq = dsq;
+                    pursuitBestMs = System.currentTimeMillis();
+                } else if (System.currentTimeMillis() - pursuitBestMs > NOT_CLOSING_MS) {
+                    Debug.logMessage("Drop not getting closer for " + (NOT_CLOSING_MS / 1000)
+                            + "s — marking it unreachable.");
+                    dropNotClosingAbandoned++;
+                    _blacklist.add(_currentDrop);
+                    mod.getEntityTracker().requestEntityUnreachable(_currentDrop);
+                    _currentDrop = null;
+                    pursuitTarget = null;
+                    progressChecker.reset();
+                    return null;
+                }
+            }
+        }
+        // A DIG IS PROGRESS TOO (G32/G39, 2026-09-11): while the navigator is mining, placing or
+        // pillaring its way to the drop the body stands still on purpose. The same hold
+        // MineAndCollectTask and DestroyBlockTask already have; without it the verdict below
+        // condemned a drop two blocks up a ledge while the pillar under it was going up.
+        if (kaptainwutax.tungsten.TungstenConfig.get().settledDropIsABlockGoal
+                && kaptainwutax.tungsten.task.FastNavigator.isActive()) {
+            var exP = kaptainwutax.tungsten.TungstenModDataContainer.EXECUTOR;
+            if ((exP != null && (exP.breakQueue != null || exP.placeQueue != null))
+                    || kaptainwutax.tungsten.task.PillarTask.isActive()) {
+                dropBuildHeld++;
+                progressChecker.reset();
+            }
+        }
+        if (!progressChecker.check(mod)) {
+            Nav.cancel();
+            // ⛔ WHAT ACTUALLY LOSES mine_diamond, MEASURED — AND IT IS NOT ANY OF THE THREE BUGS
+            // FIXED IN THIS FILE. The bot mines all three ores (drops at 4.88, 6.78, 8.82 against
+            // ore at x=4,6,8) and fails to collect every one. The closest it EVER comes to them,
+            // horizontally, across a whole 300 s run:
+            //     drop (4.88, 0.88)   1.35 blocks, at t=5 s
+            //     drop (6.78, 0.35)   2.45 blocks, at t=20 s
+            //     drop (8.82, 0.13)   3.57 blocks, at t=20 s
+            // It stops short and never closes, and both best approaches are in the first twenty
+            // seconds -- everything after that is leaving.
+            //
+            // A previous version of this note explained it as vanilla's pickup box: an item in the
+            // one-deep hole sits at y=-61, its box expanded by 0.5 reaches -60.25, and a player on
+            // the rim has its feet at -60.0, so they miss by a quarter block. The arithmetic is
+            // right and IRRELEVANT -- the bot never gets over the hole for it to matter. Kept as a
+            // correction because it was committed as the cause and it is not.
+            //
+            // AND THE ARRIVAL DISTANCE IS NOT IT EITHER -- TRIED, MEASURED, REVERTED.
+            // GetToEntityTask decides "close enough" with player.closerThan(entity, 1), which is a
+            // centre-to-centre test; a player's position is its feet and an item in a one-deep hole
+            // is a full block below, so the vertical separation ALONE is exactly 1.0 and the test
+            // asks for strictly less. Unsatisfiable even standing on top of the drop. That
+            // arithmetic is right, and raising the distance to 1.75 changed nothing: diamonds=0
+            // again, still four "unreachable" lines.
+            //
+            // Because that branch does not FINISH anything. All it does is
+            //     if (isInRange) { _progress.reset(); TungstenHelper.stop(); }
+            // -- reset the checker and stop pathing. Completion is the item being COLLECTED, which
+            // is a physical collision. So a bigger radius only makes the bot stop FURTHER OUT and
+            // never touch the drop, which is worse. Reverted rather than shipped.
+            //
+            // What is left, and it is now the only candidate standing: nothing in this chain makes
+            // the bot ENTER the hole, and a collision is the only thing that ends the task. The
+            // goal is the item's own position, the navigator walks to the rim, and there it stays.
+            // Read what the navigator does with a goal one cell below the surface before touching
+            // anything -- four fixes in this file tonight, three of them real bugs, none the cause.
+            //
+            // ⛔ A DISCARDED ITEM ENTITY STILL HAS ITS STACK, SO THIS TEST NEVER ENDS.
+            // The condition below asks "is there a drop and does it still hold something", and a
+            // removed=DISCARDED entity answers yes to both forever -- getStack() is untouched by
+            // removal. So once the target vanished (picked up, despawned, merged) the task kept
+            // failing against a ghost: blacklist, wander, come back, blacklist again.
+            //
+            // Measured on mine_diamond, which is where this was found: the bot mined its diamond,
+            // the drop was discarded, and the log reads
+            //     Blacklist: class_1542['Diamond'/3634, ..., removed=DISCARDED]: Try 4144 / 3
+            // four thousand times against a limit of three, while the timeline shows the bot at
+            // EXACTLY (-10.7, -60.0, -7.479) from t=28 s to t=284 s of a 300 s course. Not slow
+            // mining -- a hard stall on an item that no longer exists.
+            //
+            // The tracker's own filter has always had this right (`obj.isAlive() && !blacklisted`,
+            // line ~310); only this branch, which runs off the CACHED _currentDrop, did not ask.
+            // Clearing the reference is what lets the task pick another target instead of a ghost.
+            if (_currentDrop != null && !_currentDrop.isAlive()) {
+                Debug.logMessage("Drop vanished before we reached it — dropping the reference.");
+                _currentDrop = null;
+                progressChecker.reset();
+                return null;
+            }
+            if (_currentDrop != null && !_currentDrop.getItem().isEmpty()) {
+                // We might want to get a pickaxe first.
+                if (!isGettingPickaxeFirstFlag && mod.getModSettings().shouldCollectPickaxeFirst()
+                        && !StorageHelper.miningRequirementMetInventory(MiningRequirement.WOOD)) {
+                    if (dropFeedsThePickaxe(_currentDrop)) {
+                        // G89: a wooden pickaxe is made of this very drop -- no diversion, the drop
+                        // stays the target and is judged on its own (unreachable below).
+                        puFeedsSkipped++;
+                    } else {
+                        Debug.logMessage("Failed to pick up drop, will try to collect a wooden pickaxe first and try again!");
+                        puWoodFirst++;
+                        _collectingPickaxeForThisResource = true;
+                        isGettingPickaxeFirstFlag = true;
+                        return getPickaxeFirstTask;
+                    }
+                }
+                Debug.logMessage(StlHelper.toString(_blacklist, element -> element == null ? "(null)" : element.getItem().getItem().getDescriptionId()));
+                Debug.logMessage("Failed to pick up drop, suggesting it's unreachable.");
+                _blacklist.add(_currentDrop);
+                mod.getEntityTracker().requestEntityUnreachable(_currentDrop);
+                // ⛔ AND LET GO OF IT. We have just declared this drop unreachable; keeping it as
+                // the current target means the next failure blacklists the SAME entity again,
+                // without ever asking the tracker for another. The tracker's selector honours the
+                // blacklist correctly (EntityTracker:139) -- it simply was never consulted again.
+                //
+                // That is the rest of mine_diamond's stall, and it is visible in the counter: a
+                // LIVE diamond (no removed=DISCARDED this time) logged "Try 1920 / 3", i.e. 1920
+                // failures against a limit of three, on one entity. A limit of three that a single
+                // target can exceed six hundred times over is not a limit; it is a target that was
+                // never re-selected.
+                _currentDrop = null;
+                // A FAILED PICKUP RE-TARGETS; IT DOES NOT WANDER (G39, 2026-09-11). The drop is
+                // blacklisted on the line above, so the next tick the selector offers the next
+                // drop, or the parent mines the ore instead -- a plan, where the wander was a
+                // random walk that printed "Failed exploring" twelve times on the recorded run
+                // and moved the body nowhere. The parent keeps its own wander for the case where
+                // there is genuinely nothing left to go for.
+                if (kaptainwutax.tungsten.TungstenConfig.get().pickupFailureRetargets) {
+                    dropFailRetargeted++;
+                    progressChecker.reset();
+                    return null;
+                }
+                return wanderTask;
+            }
+        }
+
+        return super.onTick();
+    }
+
+
+    @Override
+    protected boolean isEqual(Task other) {
+        // Same target items
+        if (other instanceof PickupDroppedItemTask task) {
+            return Arrays.equals(task.itemTargets, itemTargets) && task._freeInventoryIfFull == _freeInventoryIfFull;
+        }
+        return false;
+    }
+
+    @Override
+    protected String toDebugString() {
+        StringBuilder result = new StringBuilder();
+        result.append("Pickup Dropped Items: [");
+        int c = 0;
+        for (ItemTarget target : itemTargets) {
+            result.append(target.toString());
+            if (++c != itemTargets.length) {
+                result.append(", ");
+            }
+        }
+        result.append("]");
+        return result.toString();
+    }
+
+    @Override
+    protected Vec3 getPos(AltoClef mod, ItemEntity obj) {
+        if (!obj.onGround() && !obj.isInWater()) {
+            // Assume we'll land down one or two blocks from here. We could do this more advanced but whatever.
+            BlockPos p = obj.blockPosition();
+            if (!WorldHelper.isSolidBlock(p.below(3))) {
+                return obj.position().subtract(0, 2, 0);
+            }
+            return obj.position().subtract(0, 1, 0);
+        }
+        return obj.position();
+    }
+
+    @Override
+    protected Optional<ItemEntity> getClosestTo(AltoClef mod, Vec3 pos) {
+        return mod.getEntityTracker().getClosestItemDrop(
+                pos,
+                itemTargets);
+    }
+
+    @Override
+    protected Vec3 getOriginPos(AltoClef mod) {
+        return mod.getPlayer().position();
+    }
+
+    @Override
+    protected Task getGoalTask(ItemEntity itemEntity) {
+        if (!itemEntity.equals(_currentDrop)) {
+            _currentDrop = itemEntity;
+            progressChecker.reset();
+            // ⛔ A NEW TARGET SPENDS THE LAST FAILURE'S ESCALATION. WITHOUT THIS IT COMPOUNDS.
+            //
+            // This task holds ONE TimeoutWanderTask(5, true) for its whole life, and `true` is
+            // increaseRange: every completed wander adds another 5 blocks to the distance the next
+            // one must cover. Nothing resets it -- onStart calls Task.reset(), which is not
+            // resetWander() -- so across a run the radius goes 5, 10, 15, 20, 25 without bound.
+            //
+            // The escalation is right for being stuck on ONE item: push further each time. It is
+            // wrong across items, and mine_diamond is what that costs. Three ores sit 4, 6 and 8
+            // blocks from spawn; the timeline shows the bot walking to -10.3 and sitting there
+            // from t=58 s to t=210 s of a 300 s course, and in another run stepping out 8.1 ->
+            // 11.7 -> 14.7 -> 17.1. It is not lost. It is satisfying a wander radius that grew
+            // every time a pickup failed.
+            //
+            // So: finding something new to go for is progress, and progress spends the escalation.
+            // A bot that is stuck on one drop still gets the bigger jumps, because _currentDrop
+            // does not change in that case and this branch does not run.
+            wanderTask.resetWander();
+            if (isGettingPickaxeFirstFlag && _collectingPickaxeForThisResource) {
+                Debug.logMessage("New goal, no longer collecting a pickaxe.");
+                _collectingPickaxeForThisResource = false;
+                isGettingPickaxeFirstFlag = false;
+            }
+        }
+        // Ensure our inventory is free if we're close
+        boolean touching = _mod.getEntityTracker().isCollidingWithPlayer(itemEntity);
+        if (touching) {
+            if (_freeInventoryIfFull) {
+                if (_mod.getItemStorage().getSlotsThatCanFitInPlayerInventory(itemEntity.getItem(), false).isEmpty()) {
+                    return new EnsureFreeInventorySlotTask();
+                }
+            }
+        }
+        // ⛔ A DROP IS COLLECTED BY TOUCHING IT, SO "CLOSE ENOUGH" MUST NOT BE ONE BLOCK.
+        //
+        // GetToEntityTask stops driving the moment isInRange(entity, closeEnough) is true, and the
+        // default is 1.0. Collection is a physical collision, so stopping at one block GUARANTEES
+        // the collision never happens: the bot parks on the rim and waits for something that can
+        // only occur if it keeps walking.
+        //
+        // Traced on mine_coal, the new course for the rung the playthrough dies on. The ore was at
+        // (14,-61,4); the bot froze at (14.79,-60.00,5.03) -- about 1.17 blocks from the drop lying
+        // in the hole it had just mined -- from t=78s to the end of the run, with coal=0 and the
+        // tracker reporting the drop 2393 times (drop=2438/2393). No ban, no barren lock,
+        // cb=0/0/0/0. It could see the coal the whole time and had stopped being driven toward it.
+        //
+        // The file already records the OTHER direction being tried: raising this to 1.75 changed
+        // nothing and the note concluded "a bigger radius only makes the bot stop FURTHER OUT and
+        // never touch the drop". Tighter is the untried direction and the one the physics argues
+        // for -- vanilla picks an item up on box overlap, roughly a third of a block, not one.
+        //
+        // Behind a flag because it changes every pickup approach in the mod. Gate: mine_coal, which
+        // is red 1 run in 3 today, and mine_diamond, whose recorded failure is this same shape
+        // ("closest approach 1.35, 2.45 and 3.57 blocks, never collected, three ores of three").
+        // ⛔ A DROP THAT HAS COME TO REST IS A PLACE, AND A PLACE IS REACHED BY THE BUILD ENGINE
+        // (G39, 2026-09-11). GetToEntityTask asks the physics engine (tryPathToEntity), which can
+        // neither place nor break; when the drop lies two blocks up a ledge that engine refuses,
+        // the task holds forward against the ledge, wanders, and the drop is abandoned at its
+        // budget -- 200 s on the recorded run, with FastPlanner never asked once. A settled drop
+        // takes the same road the blocks take: a block goal on its cell through the drive, whose
+        // escalation hands an unwalkable goal to FastNavigator (pillar / stair / dig). A drop that
+        // is still moving keeps the entity chase, which is what that chase is for.
+        if (kaptainwutax.tungsten.TungstenConfig.get().settledDropIsABlockGoal
+                && GetToDropTask.settled(itemEntity)) {
+            dropBlockGoal++;
+            return new GetToDropTask(itemEntity);
+        }
+        return kaptainwutax.tungsten.TungstenConfig.get().pickupClosesToContact
+                ? new GetToEntityTask(itemEntity, 0.1)
+                : new GetToEntityTask(itemEntity);
+    }
+
+    @Override
+    protected boolean isValid(AltoClef mod, ItemEntity obj) {
+        return obj.isAlive() && !_blacklist.contains(obj);
+    }
+
+
+    /**
+     * Is this the same pursuit as the one the clock is running for?
+     *
+     * <p>Identity alone is not enough: the tracker can hand back a DIFFERENT ItemEntity object
+     * for the same physical drop after a rescan, and under the old reference test that counted
+     * as a new target and reset the budget. Same item type within half a block is the same
+     * pursuit.
+     */
+    private static boolean sameDrop(ItemEntity a, ItemEntity b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        if (!a.getItem().getItem().equals(b.getItem().getItem())) return false;
+        // A drop DRIFTS -- half a block was too tight and the budget never accrued
+        // (pursuit=15/0s with dropBudget=0 at a measured stall, where the target moved 82 cm).
+        return a.position().distanceToSqr(b.position()) <= 4.0D;
+    }
+}

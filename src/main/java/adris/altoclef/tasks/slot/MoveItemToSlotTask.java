@@ -1,0 +1,177 @@
+package adris.altoclef.tasks.slot;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.ItemTarget;
+import adris.altoclef.util.helpers.StlHelper;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.slots.Slot;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+import java.util.function.Function;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+
+public class MoveItemToSlotTask extends Task {
+
+    private final ItemTarget toMove;
+    private final Slot destination;
+    private final Function<AltoClef, List<Slot>> getMovableSlots;
+    /** One mismatch line per task instance; see the note at its site. */
+    private boolean loggedMismatch = false;
+
+    public MoveItemToSlotTask(ItemTarget toMove, Slot destination, Function<AltoClef, List<Slot>> getMovableSlots) {
+        this.toMove = toMove;
+        this.destination = destination;
+        this.getMovableSlots = getMovableSlots;
+    }
+
+    @Override
+    protected void onStart() {
+
+    }
+
+    /**
+     * WHERE THE DELIVERY GOES. CraftGenericManuallyTask recorded that it asks correctly and
+     * this task does not deliver -- mc=1051/0/0/0/0 then, mc=3226/0/0/1/0 on the run that
+     * stalled at two rungs, every tick in the fill branch with nothing landing in the grid.
+     * The whole body sits under canDoSlotAction(), so 'throttled forever' and 'acting but not
+     * landing' look identical from outside. These separate them.
+     */
+    public static volatile int mvTicks, mvBlocked, mvPickup, mvPlace, mvNoSource;
+
+    @Override
+    protected Task onTick() {
+        AltoClef mod = AltoClef.getInstance();
+
+        mvTicks++;
+        if (!mod.getSlotHandler().canDoSlotAction()) mvBlocked++;
+        if (mod.getSlotHandler().canDoSlotAction()) {
+            // Rough plan
+            // - If empty slot or wrong item
+            //      Find best matching item (smallest count over target, or largest count if none over)
+            //      Click on it (one turn)
+            // - If held slot has < items than target count
+            //      Left click on destination slot (one turn)
+            // - If held slot has > items than target count
+            //      Right click on destination slot (one turn)
+            ItemStack currentHeld = StorageHelper.getItemStackInCursorSlot();
+            ItemStack atTarget = StorageHelper.getItemStackInSlot(destination);
+
+            // Items that CAN be moved to that slot.
+            Item[] validItems = toMove.getMatches();//Arrays.stream(_toMove.getMatches()).filter(item -> mod.getItemStorage().getItemCount(item) >= _toMove.getTargetCount()).toArray(Item[]::new);
+
+            // We need to deal with our cursor stack OR put an item there (to move).
+            boolean wrongItemHeld = !Arrays.asList(validItems).contains(currentHeld.getItem());
+            // THE LAST PLACE LEFT TO GUESS. The craft loop ends here: the mover picks a log up and
+            // puts it straight back, which means the held item is not in this slot's accepted set.
+            // Print both, once per task, and there is nothing left to infer.
+            if (!loggedMismatch && wrongItemHeld && !currentHeld.isEmpty()) {
+                loggedMismatch = true;
+                StringBuilder want = new StringBuilder();
+                for (Item it : validItems) {
+                    want.append(want.length() == 0 ? "" : ",").append(it);
+                }
+                Debug.logMessage("MOVEMISMATCH holding=" + currentHeld.getItem()
+                        + " want=[" + want + "] dest=" + destination);
+            }
+            if (currentHeld.isEmpty() || wrongItemHeld) {
+                Optional<Slot> toPlace;
+                if (currentHeld.isEmpty()) {
+                    // Just pick up
+                    toPlace = getBestSlotToPickUp(mod, validItems);
+                } else {
+                    // Try to fit the currently held item first.
+                    toPlace = mod.getItemStorage().getSlotThatCanFitInPlayerInventory(currentHeld, true);
+                    if (toPlace.isEmpty()) {
+                        // If all else fails, just swap it.
+                        toPlace = getBestSlotToPickUp(mod, validItems);
+                    }
+                }
+                if (toPlace.isEmpty()) {
+                    Debug.logWarning("Called MoveItemToSlotTask when item/not enough item is available! valid items: " + StlHelper.toString(validItems, Item::getDescriptionId));
+                    mvNoSource++;
+                    this.stop();
+                    return null;
+                }
+                mvPickup++;
+                mod.getSlotHandler().clickSlot(toPlace.get(), 0, ContainerInput.PICKUP);
+                return null;
+            }
+
+            mvPlace++;
+            int currentlyPlaced = Arrays.asList(validItems).contains(atTarget.getItem()) ? atTarget.getCount() : 0;
+            if (currentHeld.getCount() + currentlyPlaced <= toMove.getTargetCount()) {
+                // Just place all of 'em
+                mod.getSlotHandler().clickSlot(destination, 0, ContainerInput.PICKUP);
+            } else {
+                // Place one at a time.
+                mod.getSlotHandler().clickSlot(destination, 1, ContainerInput.PICKUP);
+            }
+            return null;
+        }
+        return null;
+    }
+
+    @Override
+    protected void onStop(Task interruptTask) {
+
+    }
+
+    @Override
+    public boolean isFinished() {
+        ItemStack atDestination = StorageHelper.getItemStackInSlot(destination);
+        return (toMove.matches(atDestination.getItem()) && atDestination.getCount() >= toMove.getTargetCount());
+    }
+
+    @Override
+    protected boolean isEqual(Task obj) {
+        if (obj instanceof MoveItemToSlotTask task) {
+            return task.toMove.equals(toMove) && task.destination.equals(destination);
+        }
+        return false;
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "Moving " + toMove + " to " + destination;
+    }
+
+    private Optional<Slot> getBestSlotToPickUp(AltoClef mod, Item[] validItems) {
+        Slot bestMatch = null;
+        if (!getMovableSlots.apply(mod).isEmpty()) {
+            for (Slot slot : getMovableSlots.apply(mod)) {
+                if (Slot.isCursor(slot))
+                    continue;
+                if (!toMove.matches(StorageHelper.getItemStackInSlot(slot).getItem()))
+                    continue;
+                if (bestMatch == null) {
+                    bestMatch = slot;
+                    continue;
+                }
+                int countBest = StorageHelper.getItemStackInSlot(bestMatch).getCount();
+                int countCheck = StorageHelper.getItemStackInSlot(slot).getCount();
+                // ⛔ FIXED 2026-09-05: the second disjunct compared `countCheck > countBest`, i.e.
+                // it kept switching to the LARGER of two over-target stacks -- the opposite of the
+                // comment right below it ("go for smallest over the limit"). Traced by hand: target
+                // 5, candidates 10 then 6 in discovery order picks 10 (never replaced, since 6 is
+                // not > 10); candidates 6 then 10 picks 10 too (10 > 6 replaces the smaller,
+                // correct one). Either order ends up preferring the larger excess stack, which
+                // wastes more of it than necessary. `getBestSlotToPickUp` has no live callers
+                // anywhere in the tree right now (MoveItemToSlotTask's only construction sites are
+                // commented out in the three SmeltIn*Task files), so this has no current runtime
+                // effect -- fixed anyway so the class is correct if it's ever wired back up.
+                if ((countBest < toMove.getTargetCount() && countCheck > countBest)
+                        || (countBest >= toMove.getTargetCount() && countCheck >= toMove.getTargetCount() && countCheck < countBest)) {
+                    // If we don't have enough, go for largest
+                    // If we have too much, go for smallest over the limit.
+                    bestMatch = slot;
+                }
+            }
+        }
+        return Optional.ofNullable(bestMatch);
+    }
+}

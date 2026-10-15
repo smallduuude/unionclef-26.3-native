@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "altoclef",
+  "version": "${version}",
+  "name": "UnionClef",
+  "description": "Plays block game. Type @help in chat. Ships with Baritone; aim, combat and the GUI are built in.",
+  "authors": [
+    "TacoTechnica",
+    "James Green",
+    "Marvion Kirito",
+    "MiranCZ",
+    "3ndetz",
+    "smallduuude"
+  ],
+  "contact": {
+    "homepage": "https://github.com/smallduuude/unionclef-26.3-native",
+    "sources": "https://github.com/smallduuude/unionclef-26.3-native"
+  },
+  "license": "GPL-3.0-only",
+  "icon": "assets/altoclef/icon.png",
+  "environment": "*",
+  "depends": {
+    "fabricloader": ">=0.19.0",
+    "minecraft": ">=26.1",
+    "java": ">=25",
+    "cloth-config": ">=26.3",
+    "fabric-key-mapping-api-v1": "*",
+    "tungsten": "*",
+    "baritone": ">=1.20.0"
+  },
+  "entrypoints": {
+    "main": [
+      "adris.altoclef.AltoClef"
+    ],
+    "client": [
+      "adris.altoclef.client.AltoclefClient"
+    ],
+    "voicechat": [
+      "adris.altoclef.AltoclefVoicechat"
+    ]
+  },
+  "suggests": {
+    "voicechat": ">=2.5.0"
+  },
+  "mixins": [
+    "altoclef.mixins.json"
+  ]
+}

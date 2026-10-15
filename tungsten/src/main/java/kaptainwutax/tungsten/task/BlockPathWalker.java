@@ -1,0 +1,958 @@
+package kaptainwutax.tungsten.task;
+
+import kaptainwutax.tungsten.Debug;
+import kaptainwutax.tungsten.TungstenConfig;
+import kaptainwutax.tungsten.TungstenModDataContainer;
+import kaptainwutax.tungsten.combat.AttackTiming;
+import kaptainwutax.tungsten.combat.CombatPathfinder;
+import kaptainwutax.tungsten.combat.SafetySystem;
+import kaptainwutax.tungsten.util.WindMouseRotation;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.world.level.LevelReader;
+import net.minecraft.world.level.block.LadderBlock;
+import net.minecraft.world.phys.Vec3;
+import kaptainwutax.tungsten.helpers.DirectionHelper;
+import java.util.List;
+
+/**
+ * Immediate movement while physics A* computes.
+ *
+ * Priority chain:
+ *   1. DIRECT — LOS + distance shrinking + safe → sprint straight at target
+ *   2. BFS    — no LOS or danger detected → follow BFS waypoints
+ *   3. (stop) — executor ready or path exhausted → hand off to A*
+ *
+ * Auto-stops when PathExecutor takes over.
+ */
+public class BlockPathWalker {
+
+    private enum Mode { DIRECT, BFS }
+
+    private static List<BlockPos> path = null;
+    private static int waypointIdx = 0;
+    public static volatile int tickOff = 0, tickBfs = 0, tickDir = 0;
+    private static final net.minecraft.core.BlockPos.MutableBlockPos scratch2 =
+            new net.minecraft.core.BlockPos.MutableBlockPos();
+    private static boolean active = false;
+    private static Mode mode = Mode.DIRECT;
+
+    // progress tracking for direct-sprint
+    private static double lastDistToTarget = Double.MAX_VALUE;
+    private static int noProgressTicks = 0;
+    private static final int NO_PROGRESS_LIMIT = 15; // ~0.75s without getting closer → switch to BFS
+    private static final double MIN_APPROACH_SPEED = 0.03; // ~walk speed per tick
+
+    private static Vec3 directTarget = null;
+
+    // LIVE-STEER: continuously re-aim the DIRECT sprint at a MOVING target's CURRENT
+    // position (fed each tick by FollowEntityTask). In this mode the "distance to
+    // target must shrink" progress check is the WRONG signal — the target itself
+    // moves — so a stall is detected by the BOT's own displacement instead (pressed
+    // against a wall / not physically advancing).
+    private static boolean liveMode = false;
+    /** The caller asked to keep this walk even while the executor runs — see startBFS(path, true). */
+    private static boolean owningMovement = false;
+    /** Route provenance survives the navigator ending, until this walker is stopped/replaced. */
+    private static boolean navigatorLeg = false;
+    private static Vec3 liveStuckAnchor = null;
+    private static int liveStuckTicks = 0;
+    // true when the last DIRECT stop was a BAIL (no LOS / stall / danger) rather than a
+    // success (reached the target). FollowEntityTask reads this so its live-steer cooldown
+    // only fires on a real obstacle, not on close-success or an executor hand-off.
+    private static boolean stoppedByBail = false;
+    private static final int LIVE_STUCK_LIMIT = 20;    // ~1s of the bot not moving → BFS
+    private static final double LIVE_STUCK_MOVE = 0.5; // min displacement to count as moving
+    // Face-before-move gate (deg). Matches the movement gate so the stall detector's
+    // "trying to move" agrees with when the bot actually sprints. A wider gate was tried
+    // and reverted (the bot sprinted while mis-aimed and wandered off-course); the fast
+    // nav turn (WindMouseRotation.setTargetFast) is what keeps this gate open instead.
+    private static final double LIVE_MOVE_GATE = 45.0;
+    /** Below this horizontal distance (blocks), {@code TungstenConfig.walkerFacingBypassNearZeroDist}
+     *  lets movement proceed regardless of the computed bearing -- see that flag's own doc for why. */
+    private static final double NEAR_ZERO_DIST = 0.3;
+
+    // White-box climb instrumentation (off by default; toggled via py4j setWalkerDebug).
+    // Logs the walker's per-tick decisions so a FAILING climb can be understood mechanism-
+    // first instead of guessed from external position alone. Key signal: playerYaw vs the
+    // target yaw the walker set (tests whether WindMouse easing lags during a sprint).
+    public static volatile boolean DEBUG = false;
+
+    // Counters, not log lines: on the bounce course the physics search floods the chat and
+    // the client drops messages ("Chat overflow"), so a missing log line proves nothing.
+    // These are read over py4j and answer "did this code path run at all".
+    /**
+     * Ticks the BFS walk refused to press forward because the level run ahead crosses a hole.
+     * Zero means the gate never fired, and an A/B quoting it measured nothing.
+     */
+    public static volatile int walkerHoleHeld = 0;
+    /** G53: ticks the walker refused to call a waypoint BELOW the feet reached while the body
+     *  still stood on the ground above it, and kept walking to its centre instead. */
+    public static volatile int walkerHeldAboveWp = 0;
+    /** G65: ticks the walk toward a cell below was made precise (no sprint, tight bearing, no hop). */
+    public static volatile int walkerIntoHole = 0;
+
+    /** Ticks the walker shut itself down because the physics executor claimed the body. */
+    public static volatile int walkerYieldedToExecutor = 0;
+
+    /** Ticks the walk stood aside because a block-breaking task owned the aim and the keys. */
+    public static volatile int walkerYieldedToMiner = 0;
+
+    /**
+     * Ticks the DIRECT line was refused because a hazard (lava/fire/magma) lay along it. Counted
+     * whenever the condition HOLDS, so a control arm reads how often the old code would have
+     * sprinted into one (checklist rule 4u).
+     */
+    public static volatile int dirHazardAhead = 0;
+    /** Ticks the BFS walk stood (and did not jump) because a column ahead ends in lava. */
+    public static volatile int walkerLavaHeld = 0;
+
+    public static volatile int bfsTicks = 0;
+    public static volatile int slimeWpSeen = 0;
+    private static int dbgN = 0;
+
+    // ── public API ──────────────────────────────────────────────────────────
+
+    /**
+     * Start with direct-sprint toward target. BFS path is fallback.
+     * @param target      the actual target position
+     * @param blockPath   BFS path (fallback if direct fails), may be null
+     */
+    public static void start(Vec3 target, List<BlockPos> blockPath) {
+        if (kaptainwutax.tungsten.api.MovementDelegates.pathTo(target)) return;
+        stop();
+        directTarget = target;
+        path = blockPath;
+        waypointIdx = (blockPath != null && blockPath.size() > 1) ? 1 : 0;
+        lastDistToTarget = Double.MAX_VALUE;
+        noProgressTicks = 0;
+        liveMode = false;
+        owningMovement = false;
+        liveStuckAnchor = null;
+        liveStuckTicks = 0;
+        mode = Mode.DIRECT;
+        active = true;
+        Debug.logMessage("Walker: direct→target" +
+                (blockPath != null ? " (BFS fallback: " + blockPath.size() + " wp)" : ""));
+    }
+
+    /**
+     * Live DIRECT-steer at a MOVING target: re-aim the drift-immune sprint at the
+     * target's CURRENT position every tick, so the bot cuts across and CLOSES on a
+     * runner instead of tracing a stale path snapshot ~30 blocks behind. No BFS
+     * fallback stored here — if the straight line breaks (LOS / hole / ledge) or the
+     * bot stalls against a wall, the walker stops and the caller (FollowEntityTask)
+     * falls back to BFS + physics A*. Call every tick with the live target.
+     */
+    public static void steerLive(Vec3 target) {
+        if (target == null) return;
+        if (!active || mode != Mode.DIRECT) {
+            start(target, null);   // (re)start a DIRECT sprint (resets liveMode=false)
+        } else {
+            directTarget = target; // keep progress/mode, just re-aim
+        }
+        liveMode = true;
+    }
+
+    /** Start BFS-only (no direct sprint). */
+    public static void startBFS(List<BlockPos> blockPath) {
+        startBFS(blockPath, false);
+    }
+
+    /** A waypoint leg owned by FastNavigator, distinct from a chase or the altoclef drive. */
+    public static void startNavigatorLeg(List<BlockPos> blockPath) {
+        if (blockPath == null || blockPath.size() < 2) return;
+        startBFS(blockPath);
+        navigatorLeg = true;
+    }
+
+    /** Whether cancelling a navigator-owned positioning walk may release this walker. */
+    public static boolean isNavigatorLeg() { return active && navigatorLeg; }
+
+    /**
+     * @param ownsMovement the caller keeps this walk even while the executor runs.
+     *
+     * <p>The walker normally stops itself the moment the executor starts (tick():199), which is
+     * right for navigation: there the physics path REPLACES the walk. In a chase it is exactly
+     * wrong, and it is what the chase actually did — measured, "Walker: BFS 82" restarted EIGHTY
+     * times in one run. The sequence: the chase plans a block route and starts the walk, its own
+     * startFind launches the physics search, the search returns something, the executor starts,
+     * THE WALKER SWITCHES ITSELF OFF, the physics path does not reach the runner, everything goes
+     * idle, replan, repeat.
+     *
+     * <p>That is AC-2.1 inverted — the acceptance criterion says the block route comes FIRST and
+     * physics is the LAST resort, and here physics preempted the block route as soon as it had
+     * anything at all. {@code liveMode} already carries this exemption for live-steer ("the walker
+     * OWNS movement"); a chase's block walk needs the same guarantee, so it says so explicitly
+     * rather than inheriting navigation's assumption.
+     */
+    public static void startBFS(List<BlockPos> blockPath, boolean ownsMovement) {
+        if (blockPath == null || blockPath.size() < 2) return;
+        // The route's END is what the body is being sent to; the chosen engine plans its own way.
+        BlockPos end = blockPath.get(blockPath.size() - 1);
+        if (kaptainwutax.tungsten.api.MovementDelegates.pathExact(end)) return;
+        stop();
+        path = blockPath;
+        waypointIdx = 1;
+        mode = Mode.BFS;
+        active = true;
+        owningMovement = ownsMovement;
+        Debug.logMessage("Walker: BFS " + blockPath.size() + " wp"
+                + (ownsMovement ? " (owns movement)" : ""));
+    }
+
+    public static void stop() {
+        if (active) {
+            releaseKeys();
+            // An ARMED path is waiting for THIS walker to bring the bot to its root. Stopping
+            // without saying so leaves the executor pinned on a promise nobody will keep, and it
+            // cannot notice on its own — an armed path is excluded from isRunning(), so it is
+            // never ticked. See PathExecutor.onWalkerStopped for the measurement.
+            var ex = kaptainwutax.tungsten.TungstenModDataContainer.EXECUTOR;
+            if (ex != null) ex.onWalkerStopped();
+        }
+        active = false;
+        navigatorLeg = false;
+        path = null;
+        directTarget = null;
+        waypointIdx = 0;
+        noProgressTicks = 0;
+        lastDistToTarget = Double.MAX_VALUE;
+        liveMode = false;
+        owningMovement = false;
+        liveStuckAnchor = null;
+        liveStuckTicks = 0;
+    }
+
+    /**
+     * Instrument read-out for the lava-entry snapshot (WorldSurvivalChain): the walker's mode, and
+     * whether {@code cell} is ON the route it is following -- or how far the nearest waypoint is.
+     * "On the route" means the planner handed us lava; "off it" means the body cut a corner between
+     * two safe waypoints. Different defects, different layers, so the snapshot must say which.
+     */
+    public static String describeAgainstRoute(BlockPos cell) {
+        List<BlockPos> p = path;
+        if (!active) return "idle";
+        if (p == null || p.isEmpty()) return mode + " noRoute";
+        double best = Double.MAX_VALUE; int bestI = -1;
+        for (int i = 0; i < p.size(); i++) {
+            BlockPos w = p.get(i);
+            double dx = w.getX() - cell.getX(), dz = w.getZ() - cell.getZ(), dy = w.getY() - cell.getY();
+            double d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (d < best) { best = d; bestI = i; }
+        }
+        int maxHop = 0;
+        for (int i = 1; i < p.size(); i++) {
+            BlockPos a = p.get(i - 1), b = p.get(i);
+            maxHop = Math.max(maxHop, Math.max(Math.abs(a.getX() - b.getX()), Math.abs(a.getZ() - b.getZ())));
+        }
+        // The geometry, not just the distance: where the body was, and the three waypoints around the
+        // one it was heading for. "d1.4 from the nearest waypoint" cannot say whether the body cut a
+        // corner, overshot a turn or drifted sideways on a straight -- and those are different fixes.
+        int cur = Math.max(0, Math.min(waypointIdx, p.size() - 1));
+        StringBuilder g = new StringBuilder();
+        for (int k = Math.max(0, cur - 1); k <= Math.min(p.size() - 1, cur + 1); k++) {
+            BlockPos w = p.get(k);
+            g.append(k == cur ? " >" : " ").append(w.getX()).append(',').append(w.getY()).append(',').append(w.getZ());
+        }
+        return String.format("%s wp%d/%d nearest#%d d%.1f maxHop%d cell=%d,%d,%d route[%s ]", mode, waypointIdx, p.size(),
+                bestI, best, maxHop, cell.getX(), cell.getY(), cell.getZ(), g);
+    }
+
+    /**
+     * True while the walker follows a PLANNED route (BFS mode), as opposed to steering free-form at
+     * a point (DIRECT). A planned route may descend on purpose -- G53's hold walks the body off the
+     * lip of a drop the planner chose -- so a guard for free-form movement must not veto it.
+     */
+    public static boolean isFollowingRoute() {
+        return active && mode == Mode.BFS && path != null && !path.isEmpty();
+    }
+
+    /** The route being followed and the waypoint the body is heading for, for the overlay. Null when
+     *  idle. The list is the walker's own (never mutated in place), so reading it off-thread is safe. */
+    public static List<BlockPos> routeForOverlay() {
+        return active ? path : null;
+    }
+
+    public static int waypointForOverlay() {
+        return waypointIdx;
+    }
+
+    /** Ticks the free-form VoidGuard stood aside because the walker was following a planned route. */
+    public static volatile int guardYieldedToRoute = 0;
+
+    public static boolean isRunning() {
+        return kaptainwutax.tungsten.api.MovementDelegates.externalActive() || active;
+    }
+
+    /** G52: a LIVE walk (the entity chase steering the body itself) belongs to the chase, not to
+     *  any altoclef drive -- a drive ending must leave it alone. */
+    public static boolean isLive() {
+        return active && liveMode;
+    }
+
+    /** True if the last DIRECT stop was a bail (no LOS / stall / danger), not a success. */
+    public static boolean wasStoppedByBail() {
+        return stoppedByBail;
+    }
+
+    /** BFS endpoint for A* start position. */
+    /** The waypoint the walker is currently trying to reach (null if idle).
+     *  This is what a jam must blacklist — never the cell we are standing in. */
+    public static net.minecraft.core.BlockPos getCurrentWaypoint() {
+        if (path == null || path.isEmpty()) return null;
+        int i = Math.min(waypointIdx, path.size() - 1);
+        return path.get(i);
+    }
+
+    public static Vec3 getEndpoint() {
+        if (path == null || path.isEmpty()) return null;
+        return Vec3.atBottomCenterOf(path.get(path.size() - 1));
+    }
+
+    /** Ticks sprint was withheld because the cell one past the waypoint is dangerous. */
+    public static volatile int walkerNoSprintOvershoot = 0;
+
+    /**
+     * Is the cell one past {@code wp}, continuing the direction from the body to it, safe to be
+     * carried into? Not a hazard/lava column (RouteHazards) and not the lip of a drop deeper than 3.
+     */
+    private static boolean overshootSafe(LevelReader world, Vec3 body, BlockPos wp) {
+        double dx = wp.getX() + 0.5 - body.x, dz = wp.getZ() + 0.5 - body.z;
+        double h = Math.sqrt(dx * dx + dz * dz);
+        if (h < 0.3) return true;
+        int ix = wp.getX() + (int) Math.signum(Math.round(dx / h));
+        int iz = wp.getZ() + (int) Math.signum(Math.round(dz / h));
+        if (ix == wp.getX() && iz == wp.getZ()) return true;
+        BlockPos.MutableBlockPos s = new BlockPos.MutableBlockPos();
+        if (kaptainwutax.tungsten.path.RouteHazards.lethalColumn(world, ix, wp.getY(), iz, s)) return false;
+        int fall = kaptainwutax.tungsten.combat.VoidDetector.fallHeight(
+                new Vec3(ix + 0.5, wp.getY(), iz + 0.5), world);
+        return fall <= 3;
+    }
+
+    // ── tick ─────────────────────────────────────────────────────────────────
+
+    public static void tick(LocalPlayer player) {
+        // WHERE DOES THE CHASE ACTUALLY SPEND ITS TICKS? Three passes aimed a fix at tickBFS
+        // before noticing that BOTH of its diagnostics report zero on a failing chase — so the
+        // bot is not in that method. Count the modes instead of guessing which one it is in.
+        // Per game tick, printed once every 10 s: not the search's inner loop.
+        if (!active) tickOff++;
+        else if (mode == Mode.BFS) tickBfs++;
+        else tickDir++;
+        if (TungstenConfig.get().verboseDebugLogging && ((tickOff + tickBfs + tickDir) % 200 == 0)) {
+            Debug.logMessage(String.format("WALKMODE off=%d bfs=%d direct=%d",
+                    tickOff, tickBfs, tickDir));
+        }
+        if (!active) return;
+
+        // auto-stop when executor takes over (NON-live only). In live-steer the walker
+        // OWNS movement — FollowEntityTask has explicitly stopped the executor — so a
+        // 1-tick transient "executor still running" must not yank the walker off.
+        if (!liveMode && !owningMovement && TungstenModDataContainer.isExecutorRunning()) {
+            // COUNT THE YIELD. When the MovementQueue refuses a leg the navigator hands it here,
+            // so this is the component that is supposed to move the bot -- and on the repro it
+            // never does: pdEnter=861 with pdWalking=0, meaning isRunning() was false on every
+            // one of 861 driver ticks. If the walker is being started and then yanked off on its
+            // very next tick by a physics executor that is itself getting nowhere, that is the
+            // whole stall, and it is invisible without a number here.
+            walkerYieldedToExecutor++;
+            stop();
+            return;
+        }
+
+        // (Making the walker yield while a place/break queue exists was tried here and
+        // measured WORSE — clicks fell from 2 in 28 in-range ticks to 1 in 35. The camera
+        // contention is real but this is not the cure.)
+
+        if (mode == Mode.DIRECT) {
+            tickDirect(player);
+        } else {
+            tickBFS(player);
+        }
+    }
+
+    // ── DIRECT: sprint straight at target ────────────────────────────────────
+
+    private static void tickDirect(LocalPlayer player) {
+        if (directTarget == null) { switchToBFS(); return; }
+
+        Vec3 playerPos = player.position();
+        LevelReader world = player.level();
+        double dist = horizontalDist(playerPos, directTarget);
+
+        // check LOS to the target's BODY CENTRE, not its ground-snapped feet: a
+        // ray to the feet clips terrain lips/steps in front and false-negatives on
+        // any non-flat ground, so the live chase drops to BFS on rough terrain
+        // (RW-9). +1.0 lifts the feet point to roughly mid-body.
+        boolean hasLOS = FollowEntityTask.hasLineOfSight(player, directTarget.add(0, 1.0, 0));
+
+        // check progress. STATIC target: distance to it should shrink. LIVE (moving)
+        // target: distance-shrink is the wrong signal — the target moves — so detect a
+        // stall by the BOT's own displacement (pressed against a wall, not advancing).
+        double progress = lastDistToTarget - dist;
+        lastDistToTarget = dist;
+        boolean stalled;
+        if (liveMode) {
+            // Count a "stuck" tick ONLY when the bot is actually TRYING to move (facing
+            // the target / airborne) yet isn't displacing — i.e. pressed against a wall.
+            // While it merely PIVOTS to face a target that jumped (face-before-move gates
+            // forward), it is NOT stuck; counting that as stuck bails the chase to the 2s
+            // physics cooldown and halves the effective speed (bot fell behind a runner).
+            float yawNow = AttackTiming.yawTo(playerPos, directTarget);
+            boolean facingNow = Math.abs(WindMouseRotation.wrapDelta(yawNow - player.getYRot())) < LIVE_MOVE_GATE;
+            boolean tryingToMove = facingNow || !player.onGround();
+            if (!tryingToMove || liveStuckAnchor == null
+                    || playerPos.distanceTo(liveStuckAnchor) > LIVE_STUCK_MOVE) {
+                liveStuckAnchor = playerPos;
+                liveStuckTicks = 0;
+            } else {
+                liveStuckTicks++;
+            }
+            stalled = liveStuckTicks >= LIVE_STUCK_LIMIT;
+        } else {
+            if (progress < MIN_APPROACH_SPEED) noProgressTicks++; else noProgressTicks = 0;
+            stalled = noProgressTicks >= NO_PROGRESS_LIMIT;
+        }
+
+        // check safety. For a LIVE chase we only guard the IMMEDIATE ground ahead (a few
+        // blocks) — far hole/void avoidance is the BFS/physics job. Scanning the WHOLE line
+        // to a 20-block-away target made DIRECT bail "danger" on nearly every tick, so the
+        // drift-prone physics executor did all the moving (slow, never closed on a runner).
+        double toX = directTarget.x - playerPos.x, toZ = directTarget.z - playerPos.z;
+        double horiz = Math.sqrt(toX * toX + toZ * toZ);
+        double aheadDist = Math.min(horiz, 4.0);
+        BlockPos aheadCheck = (horiz < 0.5)
+                ? BlockPos.containing(directTarget)
+                : BlockPos.containing(new Vec3(
+                        playerPos.x + toX / horiz * aheadDist,
+                        directTarget.y,
+                        playerPos.z + toZ / horiz * aheadDist));
+        boolean landingSafe = SafetySystem.isJumpLandingSafe(playerPos, player.getDeltaMovement(), world);
+        boolean pathSafe = !SafetySystem.hasHolesOnPath(playerPos, aheadCheck, world);
+        // isWalkable needs a SOLID block under the feet — always false mid-air. Evaluating
+        // it while airborne false-bailed the live chase at every bunny-hop apex ("danger ->
+        // BFS") and armed the 2s steer cooldown, so the drift-prone physics executor did the
+        // moving and never closed on a runner (RW-9). Only a danger when actually grounded.
+        boolean groundSafe = !player.onGround()
+                || CombatPathfinder.isWalkable(player.blockPosition(), world);
+
+        // ⛔ A HOLE IS NOT THE ONLY THING ON A STRAIGHT LINE THAT KILLS (G108 nether, 2026-09-21).
+        // DIRECT is the mode this walker STARTS in -- "direct-sprint toward target, BFS path is
+        // fallback" -- so on most legs the body is steered at a point with the route's cells never
+        // consulted. Its safety gate asked two questions: are there HOLES ahead (hasHolesOnPath),
+        // and is the cell I am STANDING IN walkable. Neither sees lava ahead: lava is not a hole,
+        // and the standing test only fires once the feet are already in it.
+        //
+        // Measured with the second-pass lava instrument on the nether stage, two entries, both
+        // unambiguous: onGround=1, constant y=52, the body walking 131.7,52.0,153.5 -> 131.5,52.0,
+        // 151.3 over ten ticks and into lava at (131,52,151), driver `walker1`, task "Going to
+        // biome", and fallHeight at the cell it came from reading 1 -- i.e. flat ground, no drop,
+        // nothing in the terrain model objecting. It simply walked in. (This also corrects the
+        // earlier attribution of these deaths to Enderman knockback: knockback imparts horizontal
+        // velocity and the instrument measured zero, while vgCalls=0 / reposition=0 show the combat
+        // pipeline was not driving at all.)
+        //
+        // CombatPathfinder already owns the hazard predicate and its BFS refuses lava by
+        // construction, which is why the FALLBACK route is safe and the direct line is not. So ask
+        // the same predicate along the line before sprinting down it, and bail to that safe route.
+        // Lethal ahead? The shared baritone-shaped check (RouteHazards), over the next two blocks
+        // toward the target -- the stretch the body will cover before it could stop.
+        double hazardScan = Math.min(horiz, 2.0);
+        boolean hazardAhead = horiz > 0.01 && kaptainwutax.tungsten.path.RouteHazards.segmentLethal(
+                world, playerPos, new Vec3(playerPos.x + toX / horiz * hazardScan, playerPos.y,
+                        playerPos.z + toZ / horiz * hazardScan));
+        if (hazardAhead) dirHazardAhead++;
+
+        // bail to BFS if: no LOS, stalled, or IMMEDIATE danger
+        if (!hasLOS || stalled || !pathSafe || !groundSafe || hazardAhead) {
+            if (DEBUG) Debug.logMessage(String.format(
+                    "dirBAIL los%d stall%d path%d grnd%d hzd%d d%.1f", hasLOS ? 1 : 0,
+                    stalled ? 1 : 0, pathSafe ? 1 : 0, groundSafe ? 1 : 0, hazardAhead ? 1 : 0, dist));
+            if (!hasLOS) Debug.logMessage("Walker: no LOS → BFS");
+            else if (stalled) Debug.logMessage("Walker: stalled → BFS");
+            else if (hazardAhead) Debug.logMessage("Walker: hazard ahead → BFS");
+            else Debug.logMessage("Walker: danger → BFS");
+            stoppedByBail = true;
+            switchToBFS();
+            return;
+        }
+
+        // close enough — done (success, not a bail)
+        if (dist < 1.5) {
+            stoppedByBail = false;
+            stop();
+            return;
+        }
+
+        // movement
+        float yaw = AttackTiming.yawTo(playerPos, directTarget);
+        // FAST nav turn: the 45deg face-before-move gate below only stays open if the
+        // camera swings to the new bearing quickly. The slow humanized turn stalled sprint
+        // on every bearing change of a moving target, halving chase speed (RW-9, dead
+        // setTargetFast). Fast mode still goes through the mouse pipeline (anti-cheat safe).
+        WindMouseRotation.INSTANCE.setTargetFast(yaw, 0);
+
+        // FACE-BEFORE-MOVE (same fix as tickBFS): the humanized WindMouse yaw takes a few
+        // frames to converge; pressing forward while it's still off makes the bot chase a
+        // moving aim target and SPIN in a circle instead of approaching (the v0.44.0 walker
+        // spin, in DIRECT mode). Gate movement on facing while onGround; keep momentum in
+        // the air (a jump/leap sets its direction at take-off). Without this, enabling the
+        // follow walker would make the combat approach circle the target.
+        double yawErr = Math.abs(WindMouseRotation.wrapDelta(yaw - player.getYRot()));
+        boolean onGround = player.onGround();
+        // Keep the strict 45deg gate: a wider gate let the bot sprint while badly mis-aimed
+        // and it wandered off-course (even off a ledge). Aligned-only sprint; the turn speed
+        // (WindMouse) is what must be fast enough to keep the gate open — see setTargetFast.
+        boolean move = (yawErr < 45.0) || !onGround;
+
+        Minecraft mc = Minecraft.getInstance();
+        mc.options.keyUp.setDown(move);
+        mc.options.keySprint.setDown(move);
+        mc.options.keyDown.setDown(false);
+        mc.options.keyLeft.setDown(false);
+        mc.options.keyRight.setDown(false);
+        mc.options.keyShift.setDown(false);
+
+        boolean canJump = (yawErr < 45.0) && TungstenConfig.get().followJumpingEnabled
+                && onGround && landingSafe;
+        mc.options.keyJump.setDown(canJump);
+
+        if (DEBUG && (dbgN++ % 2 == 0)) {
+            Vec3 v = player.getDeltaMovement();
+            double spd = Math.sqrt(v.x * v.x + v.z * v.z);
+            Debug.logMessage(String.format(
+                "dir live%d d%.1f yawErr%.0f move%d grnd%d stuck%d spd%.2f los%d",
+                liveMode ? 1 : 0, dist, yawErr, move ? 1 : 0, onGround ? 1 : 0,
+                liveStuckTicks, spd, hasLOS ? 1 : 0));
+        }
+    }
+
+    private static void switchToBFS() {
+        if (path != null && path.size() >= 2) {
+            mode = Mode.BFS;
+            noProgressTicks = 0;
+        } else {
+            stop();
+        }
+    }
+
+    // ── BFS: follow waypoints ────────────────────────────────────────────────
+
+    private static void tickBFS(LocalPlayer player) {
+        if (path == null || waypointIdx >= path.size()) {
+            stop();
+            return;
+        }
+
+        // A SLIME PAD IS ONE MANOEUVRE, NOT A RUN OF WAYPOINTS. Hand the whole crossing to
+        // the task that keeps heading and throttle across every bounce; the walker cannot,
+        // because it re-decides each waypoint independently and bleeds the speed the last
+        // bounce needs. Hand over the moment we are standing on the pad, aimed at the first
+        // waypoint beyond it whose floor is NOT slime.
+        bfsTicks++;
+        if (kaptainwutax.tungsten.task.SlimeBounceTask.isActive()) return;
+        // TRIGGER ON THE PLAN, NOT ON THE INSTANT. The first version of this asked whether we
+        // were STANDING on slime, and it never once fired: on a bouncing pad the bot is
+        // airborne almost every tick, so that window barely exists (measured — zero crossings
+        // started across three runs). The route itself is the reliable signal: if the waypoint
+        // we are heading for stands on slime, this is a crossing.
+        if (TungstenConfig.get().slimeCrossing
+                && path.get(waypointIdx) != null
+                && player.level().getBlockState(path.get(waypointIdx).below())
+                        .getBlock() instanceof net.minecraft.world.level.block.SlimeBlock) {
+            slimeWpSeen++;
+            BlockPos exit = null;
+            for (int i = waypointIdx; i < path.size(); i++) {
+                BlockPos c = path.get(i);
+                if (!(player.level().getBlockState(c.below()).getBlock()
+                        instanceof net.minecraft.world.level.block.SlimeBlock)) {
+                    exit = c;
+                    waypointIdx = i;
+                    break;
+                }
+            }
+            // THE LEG MAY END ON THE PAD. The walker is given a LEG, not the whole route, and
+            // on this course the leg stops on the slime while the ledge belongs to the next
+            // one — so "first waypoint past the pad" simply does not exist yet. Measured with
+            // counters rather than logs, because the chat drops messages here: the trigger
+            // condition was true 59 times in one run and a crossing still never started.
+            // Aim at the far end of what we DO know; the navigator re-plans on arrival.
+            if (exit == null && !path.isEmpty()) exit = path.get(path.size() - 1);
+            if (exit != null) {
+                kaptainwutax.tungsten.task.SlimeBounceTask.startTo(exit);
+                return;
+            }
+        }
+
+        BlockPos wp = path.get(waypointIdx);
+        Vec3 wpPos = Vec3.atBottomCenterOf(wp);
+        Vec3 playerPos = player.position();
+        double dist = horizontalDist(playerPos, wpPos);
+
+        // advance waypoint. WHILE ON A LADDER, HORIZONTAL DISTANCE MEANS NOTHING: every cell
+        // of the column shares one x/z, so this test is true from the first tick and would
+        // consume the whole climb before a single rung is gained. On a ladder, arrival is a
+        // VERTICAL question. (Only ladders are affected — off a ladder this is unchanged.)
+        boolean onLadderNow = player.onClimbable();
+        // FALLING PAST A LANDING IS NOT ARRIVING AT IT. Waypoints advance on horizontal
+        // distance, so while airborne above a landing the walker ticked straight through it
+        // and steered at the waypoints BEYOND. Arrival, while we are in the air and the
+        // target is genuinely below us, is a vertical question — as on a ladder.
+        //
+        // This was briefly reverted on a FALSE regression signal: nav_gaps had gone flaky and
+        // these walker changes looked responsible. An A/B on the same session settled it —
+        // the last known-good build flakes on nav_gaps IDENTICALLY (1 pass in 3) on this
+        // stand, which has drifted from ~15 fps to ~9 over a long session. The code was not
+        // the cause. Measured effect of keeping this: nav_slime goes from 20.7 blocks short
+        // with a void fall on every run, to 8.0-8.4 short with no falls at all, 3 runs of 3.
+        // (Releasing the hold once we had flown PAST the waypoint was tried — the trace shows
+        // the bot crossing its held waypoint five blocks up, steering back and walking off the
+        // pad. Releasing measured WORSE, 3 failures in 3 against 1 landing in 3, so it is not
+        // kept. Both behaviours are the same missing thing: the walker has no model of a
+        // BOUNCING surface, and no rule bolted onto generic walking will give it one.)
+        boolean fallingToward = !player.onGround() && (playerPos.y - wpPos.y) > 1.0;
+        // ADVANCE ON OCCUPANCY — CORRECT, BUT IT CANNOT LAND ALONE. Ported from baritone's
+        // PathExecutor.onTick (:102, plus the skip-forward scan at :115-123). It fixes a real
+        // defect: a 1.5-block radius consumes a TWO-CELL leg without a step, which is why the bot
+        // parked 0.56 blocks short of every bridge lip ("PLACEWAIT against=12,-61 feet=11,-60").
+        // With it the bot does reach the lip — and then walks straight through it into the void,
+        // because nothing reliably sneaks there (see the note below on two writers of sneakKey):
+        // 22.5 against 11.6 standing. Both halves have to land together, inside one movement,
+        // which is unit 2 of docs/BARITONE-PORT-SPEC.md. Kept out until then; falling is worse
+        // than standing.
+        // ⛔ A WAYPOINT BELOW THE FEET IS REACHED BY GOING DOWN, NOT BY STANDING OVER IT (G53,
+        // 2026-09-11). Arrival here is horizontal, so a body hanging on a lip -- its centre
+        // already over the column it must drop into, its hitbox still resting on the block
+        // behind -- "reached" a waypoint three blocks below it without moving, the leg ended,
+        // and the navigator read "no progress", re-planned to the same leg, and gave the route
+        // up. tree_drop: the stick five blocks below on the skirt, the bot at (803.1,-54) on
+        // the edge of the body layer, "Failed! No block path" fifty times, the drop
+        // blacklisted; the same shape as the 14:23 recording on a felled spruce. While the body
+        // is ON THE GROUND and the waypoint is clearly lower, keep walking to the waypoint's
+        // centre: the hitbox leaves the lip, the body falls, and the airborne rule below takes
+        // over until it lands. A ladder keeps its own vertical rule.
+        boolean standingAbove = TungstenConfig.get().walkerDescentNeedsDescent
+                && player.onGround() && !onLadderNow && (playerPos.y - wpPos.y) > 0.6;
+        if (standingAbove) walkerHeldAboveWp++;
+        // An ascent must enter its destination cell before handing off the next action.
+        // A two-cell walk before a dig was consumed at horizontal distance 0.8 while
+        // still one block below the stand. The centering phase cannot perform that jump.
+        // Keep the ascent identity after take-off, when comparing only live Y would
+        // again accept the waypoint before the body has crossed onto the step.
+        boolean ascentNotReached = TungstenConfig.get().walkerAscentNeedsAscent
+                && waypointIdx > 0 && wp.getY() > path.get(waypointIdx - 1).getY()
+                && !kaptainwutax.tungsten.path.movements.RotationHelper.playerFeet(player).equals(wp);
+        // The last walkable stand is an arrival, not an intermediate steering hint.
+        // After digging a low tunnel, the 1.5-block radius consumed the remaining
+        // two-cell walk 1.2 blocks short; the navigator then reported no progress.
+        // Centre on a real stand. Floorless endpoints retain their separate build handoff.
+        boolean finalStandNotReached = TungstenConfig.get().walkerFinalStandArrival
+                && waypointIdx == path.size() - 1 && dist > 0.35
+                && kaptainwutax.tungsten.helpers.PlayerFit.standable(player.level(), wp);
+        if (dist < 1.5 && (!onLadderNow || Math.abs(playerPos.y - wpPos.y) < 0.4)
+                && !fallingToward && !standingAbove && !ascentNotReached && !finalStandNotReached) {
+            waypointIdx++;
+            if (waypointIdx >= path.size()) {
+                stop();
+                return;
+            }
+            wp = path.get(waypointIdx);
+            wpPos = Vec3.atBottomCenterOf(wp);
+            // RECOMPUTE, or every test below this line judges the waypoint we just left: the
+            // diagnostic caught "dist=0.8" while the new waypoint was 3.8 blocks away, and
+            // that stale value also feeds the ladder threshold.
+            dist = horizontalDist(playerPos, wpPos);
+        }
+
+        // ── LADDER: A COLUMN OF WAYPOINTS HAS NO HORIZONTAL EXTENT ──────────────────
+        // Waypoints advance on HORIZONTAL distance (see `dist` above), so a ladder column —
+        // every cell sharing one x/z — is swallowed whole in a single tick without the bot
+        // gaining a millimetre of height, and the walker then reports "arrived". The bearing
+        // is no help either: a waypoint straight overhead has no meaningful yaw.
+        // Vanilla climbs by holding forward INTO the ladder — that contact is what grants
+        // climbing speed — so aim at the block the ladder hangs on, and advance on VERTICAL
+        // arrival instead of horizontal.
+        if (player.onClimbable()) {
+            BlockPos cell = player.blockPosition();
+            var state = player.level().getBlockState(cell);
+            if (state.getBlock() instanceof LadderBlock) {
+                // FACING points AWAY from the block the ladder is fixed to, so push the
+                // opposite way to press into it.
+                Direction into = state.getValue(LadderBlock.FACING).getOpposite();
+                Vec3 support = Vec3.atCenterOf(cell.relative(into));
+                WindMouseRotation.INSTANCE.setTargetFast(
+                        (float) DirectionHelper.calcYawFromVec3d(playerPos, support), 0);
+
+                Minecraft lmc = Minecraft.getInstance();
+                lmc.options.keyUp.setDown(true);
+                lmc.options.keySprint.setDown(false);
+                lmc.options.keyDown.setDown(false);
+                lmc.options.keyLeft.setDown(false);
+                lmc.options.keyRight.setDown(false);
+                lmc.options.keyShift.setDown(false);
+                // Going up: jump as well as press in. Going down: contact alone is a slow,
+                // controlled slide, which is what we want — never jump to descend.
+                lmc.options.keyJump.setDown(wp.getY() > cell.getY());
+
+                return;   // the advance above is already vertical-aware on a ladder
+            }
+        }
+
+        // ONE OWNER OF THE CAMERA AT A TIME. While the executor is in range and aiming at the
+        // face it is about to click, the walker must not re-aim at its waypoint — baritone has
+        // exactly one thing steering (the movement sets a MovementTarget, LookBehavior applies
+        // it) and never two.
+        //
+        // This was tried before and recorded as a dead end because it measured NEUTRAL. That
+        // measurement was worthless: placement at the time FORGED its BlockHitResult and did
+        // not care where the camera pointed, so of course nothing changed. With placement going
+        // through the game's real ray trace the aim has to converge, and nav_bridge fails
+        // outright (11.6 blocks short, twice) while both owners fight for it. Keep WALKING —
+        // only the steering is yielded; an earlier attempt returned outright here and was worse.
+        var execAim = TungstenModDataContainer.EXECUTOR;
+        // THE MINER GETS THE SAME COURTESY THE PLACER ALREADY HAS.
+        // The placer's claim is honoured below and the miner's never was, which is what a viewer
+        // sees as the camera looking one way while a block breaks in another, and as the bot
+        // shuffling on the spot: DestroyBlockTask holds MOVE_BACK and SNEAK within two blocks of
+        // its target while this method holds MOVE_FORWARD toward a waypoint in the same tick.
+        // Two writers, last one wins, every tick. Reported from a recording rather than a counter,
+        // which is why it survived a whole session of reading numbers.
+        boolean placerOwnsAim = (execAim != null && execAim.placingNow)
+                || (TungstenConfig.get().walkerYieldsToMiner
+                    && TungstenModDataContainer.minerOwnsAim());
+        if (TungstenConfig.get().walkerYieldsToMiner && TungstenModDataContainer.minerOwnsAim()) {
+            walkerYieldedToMiner++;
+        }
+        // ONE OWNER OF THE BODY, NOT JUST THE CAMERA. The backplace manoeuvre has to creep the
+        // body ~0.3 past the lip — sneaking allows exactly that much, since the box's rear
+        // stays supported — and it is the only position from which the block's SIDE face is
+        // visible at all. The walker was still pressing towards its waypoint underneath it, and
+        // with the placer facing BACK up the bridge those two pushes cancel: measured
+        // "called=11041 inRange=11040 clicked=0", eleven thousand ticks in range and the
+        // crosshair never once on the right face, because the body never got past the lip.
+        //
+        // Yielding here was previously recorded as MEASURED WORSE. That measurement was taken
+        // while placement forged its hit result and therefore did not care where the body or
+        // the camera were; it says nothing about this code.
+        if (placerOwnsAim) {
+            // Do NOT releaseKeys() here: the placer has already set sneak and MOVE_BACK for
+            // this tick, and depending on tick order releasing would wipe the very inputs the
+            // manoeuvre needs. Yielding means keeping hands off, not undoing the other owner.
+            return;
+        }
+        float yaw = AttackTiming.yawTo(playerPos, wpPos);
+        if (!placerOwnsAim) {
+            WindMouseRotation.INSTANCE.setTargetFast(yaw, 0);  // fast nav turn — keep the 45deg gate open
+        }
+
+        // FACE-BEFORE-MOVE (on the ground only). The camera turns via WindMouse (humanized,
+        // several frames to converge). Pressing forward while the yaw is still off makes the
+        // bot walk in the WRONG direction, which shifts the waypoint bearing, which moves the
+        // aim target — a feedback SPIN: the bot circles and never converges (white-box trace:
+        // yaw swept ~680 deg, position spiralled, climb failed ~40%). So while ON THE GROUND,
+        // gate movement on being roughly pointed at the waypoint: pivot in place first, then
+        // walk straight. But NEVER cut movement while AIRBORNE — a gap jump / slime bounce
+        // sets its direction at take-off, and releasing forward mid-arc kills the momentum
+        // and drops the bot short (that killed parkour: course B, slime drop-bounce).
+        double yawErr = Math.abs(WindMouseRotation.wrapDelta(yaw - player.getYRot()));
+        boolean onGround = player.onGround();
+        boolean facing = placerOwnsAim || yawErr < 45.0;
+        // ⛔ A CELL BELOW IS ENTERED BY A PRECISE WALK, NOT A SPRINT (G65, 2026-09-12). A one-wide
+        // hole takes a body only when its whole hitbox is over the air: 0.6 wide in a 1.0 cell is a
+        // window of 0.4 in BOTH axes. At sprint speed (0.28 a tick) with a 45-degree facing
+        // tolerance the body crosses that window in a tick and lands on the far rim -- buried_goal
+        // phase two: the sand over the chest dug open, the body shuffling 859 <-> 861 on either
+        // rim for forty seconds, "no progress" every three; and on the 19:00 recording a bot
+        // standing over a one-wide shaft with a cobblestone at its bottom, "arrived (1.3)",
+        // six and a half minutes. Baritone's MovementDescend walks to the destination's CENTRE
+        // at walking pace with its full aim on it, and falls in because it arrives there. Same
+        // here: while the waypoint is below the feet and close, no sprint, a tight bearing, no
+        // hop, and the waypoint is held (standingAbove, G53) until the body drops.
+        boolean intoHole = standingAbove && dist < 1.6;
+        if (intoHole) {
+            facing = placerOwnsAim || yawErr < 8.0;
+            walkerIntoHole++;
+        }
+        // CLIMBING A STEP. A vanilla step-up is jump + FORWARD PRESSURE: jumping
+        // without it just bounces on the spot. Right at the step the horizontal
+        // distance is ~0, so the bearing is numerically unstable, `facing` flickers
+        // and the forward key was released exactly when it was needed — the bot
+        // hammered the jump key with X/Z frozen and Y oscillating for the rest of
+        // the run (stand-measured at a 1-block ledge). When the waypoint is higher
+        // and we are already on top of it horizontally, push forward regardless.
+        boolean climbing = wp.getY() > player.blockPosition().getY() && dist < 1.6;
+        // TODOS.md C5.18, TungstenConfig.walkerFacingBypassNearZeroDist: the SAME numerical-
+        // instability class the climbing case above already documents, generalised. A bearing
+        // computed from a near-zero horizontal vector carries no usable direction, so gating
+        // movement on it can only be wrong -- yet that is exactly the state a live stall was
+        // caught in (WALKSTOP dist=0.1 yawErr=180 facing=false). Default false: unmeasured,
+        // and this file's own history has more than one "obviously right" fix here that wasn't.
+        boolean nearZeroDist = TungstenConfig.get().walkerFacingBypassNearZeroDist
+                && dist < NEAR_ZERO_DIST;
+        boolean move = facing || !onGround || climbing || nearZeroDist;
+        // Do not keep adding speed once we are directly over the landing, or the arc carries
+        // us past it. Known limit: on a bounce CHAIN this also throttles above every
+        // intermediate hop and the bot bleeds speed, which is why the far ledge is still out
+        // of reach. It is nonetheless the better of the two measured states — without it the
+        // bot flies past the hop, turns back toward a waypoint now behind it and drops off
+        // the pad. The real answer is a bounce chain the executor understands.
+        // ...UNLESS that landing is a bouncy one. Cutting the throttle above every hop of a
+        // bounce chain bled the bot from 0.25 to 0.00 blocks/tick (airborne trace), so it
+        // could never carry speed to the far ledge; letting it run free instead made it fly
+        // past the hop and drop off the pad. The world tells the two apart: land on SLIME and
+        // you are going straight back up and still need the speed; land on solid ground and
+        // you are stopping there.
+        if (!onGround && (playerPos.y - wpPos.y) > 1.0 && dist < 1.0
+                && !(player.level().getBlockState(wp.below()).getBlock()
+                        instanceof net.minecraft.world.level.block.SlimeBlock)) {
+            move = false;
+        }
+
+        // DIRECT LOOKS BEFORE IT SPRINTS; BFS NEVER DID. tickDirect asks SafetySystem for
+        // isJumpLandingSafe and hasHolesOnPath before it commits, and this half of the same class
+        // asks nothing at all -- it steers at the waypoint it was handed and presses forward.
+        // That is fine while the cells it is handed have floors. They do not: a build leg refused
+        // by the MovementQueue arrives here, and by construction a bridge's cells are the ones
+        // with nothing underneath -- four fifths of them measured floorless on the expansion
+        // probe. The bot sprints along them and falls, which on the navigation repro reads as
+        // y=127 down to y=118 with health 20 to 5.5, while the target stayed at y=127 throughout.
+        //
+        // NARROW, BECAUSE A DROP IS SOMETIMES THE ROUTE. hasHolesOnPath trips on a fall of three
+        // or more, and nav_descend descends exactly three on purpose -- gating on the predicate
+        // alone would break a passing course. What separates them is the WAYPOINT: a planned
+        // descent aims at a cell BELOW us, a bridge aims at one level with us and hides the gap
+        // in between. Only the second is refused.
+        //
+        // Refusing means STANDING, which is this file's own measured preference rather than a
+        // guess -- the note on sneaking at a lip, below, measures 11.0 standing against 22.5 and
+        // 22.5 for the falls. The navigator's watchdog can replan from a bot still on the ground;
+        // it can do nothing with one at the bottom of a hole.
+        if (kaptainwutax.tungsten.TungstenConfig.get().walkerRefusesHoleOnLevelRun
+                && move && onGround
+                && wp.getY() >= player.blockPosition().getY()
+                && !kaptainwutax.tungsten.task.SlimeBounceTask.isActive()
+                && SafetySystem.hasHolesOnPath(playerPos, wp, player.level())) {
+            move = false;
+            walkerHoleHeld++;
+        }
+        // ⛔ BARITONE'S PER-TICK CHECK, NOT A GATE OF OUR OWN (G108 nether, 2026-09-23). Both nether
+        // lava deaths this method caused -- walking into lava on level ground, and jumping off a
+        // ledge over a lake -- were routes nothing re-checked once they were being walked. Baritone
+        // re-costs the movement it is on and the next few every tick and cancels the moment one is
+        // impossible (PathExecutor.java:196-210). Here: the stretch from the body to this waypoint
+        // and on to the next one, against the same predicate the planner uses. Lethal means stand,
+        // do not jump, and hand the route back (stop) so the caller plans a new one from the
+        // ground -- standing is this file's measured preference over falling.
+        Vec3 nextWpPos = waypointIdx + 1 < path.size()
+                ? Vec3.atBottomCenterOf(path.get(waypointIdx + 1)) : null;
+        boolean lavaAhead = onGround && (
+                kaptainwutax.tungsten.path.RouteHazards.segmentLethal(player.level(), playerPos, wpPos)
+                || (nextWpPos != null && dist < 1.5 && kaptainwutax.tungsten.path.RouteHazards
+                        .segmentLethal(player.level(), wpPos, nextWpPos)));
+        if (lavaAhead) {
+            kaptainwutax.tungsten.path.RouteHazards.refusedWalker++;
+            walkerLavaHeld++;
+            Minecraft hmc = Minecraft.getInstance();
+            hmc.options.keyUp.setDown(false);
+            hmc.options.keySprint.setDown(false);
+            hmc.options.keyJump.setDown(false);
+            Debug.logMessage("Walker: route ahead is lethal (hazard) -> stop, replan");
+            stop();
+            return;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        mc.options.keyUp.setDown(move);
+        // WHY IS THE BOT STANDING? Measured: on three runs of four it never leaves the pad's
+        // lip (minY stays at -53, maxX at 6.7-6.9) even though the drop onto the slime is
+        // planned 553 times a run. Standing on the ground with movement NOT pressed is the
+        // exact state to explain, so print what the gate saw.
+        if (!move && player.onGround() && TungstenConfig.get().verboseDebugLogging
+                && (dbgN++ % 20 == 0)) {
+            Debug.logMessage(String.format(
+                    "WALKSTOP pos=(%.1f,%.1f) wp=(%d,%d,%d) dist=%.1f yawErr=%.0f facing=%b",
+                    playerPos.x, playerPos.z, wp.getX(), wp.getY(), wp.getZ(), dist, yawErr, facing));
+        }
+        // SNEAKING AT A LIP FROM HERE — MEASURED, PARTIAL, NOT KEPT. The rule itself is right
+        // (walking into a floorless cell is a fall, and sneaking cannot leave a ledge) and it did
+        // save one run in three: 11.0 standing against 22.5 / 22.5 falls. It cannot be made
+        // reliable from this side, because the walker and the placer BOTH write sneakKey in the
+        // same tick and the last writer wins — the placer clears it on its exit paths. That is
+        // the "exactly one per-tick writer of keys" point from docs/BARITONE-PORT-SPEC.md,
+        // measured rather than argued: the fix is unit 2, one movement owning the manoeuvre.
+        // ⛔ NO SPRINT WHEN AN OVERSHOOT WOULD LAND IN DANGER -- baritone MovementTraverse :274-277
+        // (G108 nether, 2026-09-24). Baritone sprints a traverse only if the cell ONE PAST the
+        // destination, in the direction of travel (`into = dest + (dest - src)`), is not something to
+        // avoid walking into: a sprinting body carries past its target, and if that carry ends in
+        // lava it is not worth the speed. This walker sprinted unconditionally. The nether measured
+        // what that costs: a sprint jump by the walker (takeoff vel 0.037,+0.165,-0.171, walker=true)
+        // off the top of a step and 20 blocks down into lava. Tungsten's executor also drifts where
+        // baritone's does not, so the overshoot cell must be neither lethal (RouteHazards) nor the lip
+        // of a drop deeper than 3.
+        boolean overshootSafe = overshootSafe(player.level(), playerPos, wp);
+        if (!overshootSafe && move) walkerNoSprintOvershoot++;
+        mc.options.keySprint.setDown(move && !climbing && !intoHole && overshootSafe);   // sprint-jump overshoots a ledge, and a hole
+        mc.options.keyDown.setDown(false);
+        mc.options.keyLeft.setDown(false);
+        mc.options.keyRight.setDown(false);
+        mc.options.keyShift.setDown(false);
+
+        // DIAGNOSTIC: the harness samples roughly every 3 s because each sample is a py4j
+        // round trip, which is far too coarse to see a fall — two samples showed the bot on
+        // the lip and then 16 blocks away and 57 down, with no way to tell whether it ever
+        // touched the pad in between. Print the actual flight, tick by tick.
+        if (!onGround && TungstenConfig.get().verboseDebugLogging && (dbgN++ % 4 == 0)) {
+            Vec3 vv = player.getDeltaMovement();
+            Debug.logMessage(String.format(
+                    "AIR pos=(%.1f,%.1f,%.1f) vel=(%.2f,%.2f,%.2f) wp=(%d,%d,%d) idx=%d/%d",
+                    playerPos.x, playerPos.y, playerPos.z, vv.x, vv.y, vv.z,
+                    wp.getX(), wp.getY(), wp.getZ(), waypointIdx, path.size()));
+        }
+
+        boolean needJumpUp = wp.getY() > player.blockPosition().getY();
+        // YOU STEP OFF A HIGH LEDGE, YOU DO NOT LEAP OFF IT. A sprint-jump at a lip adds
+        // height and forward momentum and stretches the arc far past the target — measured
+        // on the bounce course at ~0.4 blocks/tick where a walk carries 0.28. Only a REAL
+        // drop is meant here: a gap whose far side sits a block lower still has to be
+        // jumped, so the line is drawn at two blocks, not at any descent at all.
+        boolean droppingTo = wp.getY() < player.blockPosition().getY() - 2;
+        boolean canJump = (facing || climbing) && TungstenConfig.get().followJumpingEnabled
+                && onGround && !droppingTo && !intoHole
+                && (needJumpUp || SafetySystem.isJumpLandingSafe(
+                        playerPos, player.getDeltaMovement(), player.level()));
+        mc.options.keyJump.setDown(canJump);
+
+        if (DEBUG && (dbgN++ % 3 == 0)) {
+            Vec3 v = player.getDeltaMovement();
+            Debug.logMessage(String.format(
+                "wlk i%d/%d d%.1f wp(%d,%d,%d) g%d j%d yaw%.0f>%.0f v(%.2f,%.2f,%.2f) p(%.1f,%.1f,%.1f)",
+                waypointIdx, path.size(), dist, wp.getX(), wp.getY(), wp.getZ(),
+                player.onGround() ? 1 : 0, canJump ? 1 : 0,
+                player.getYRot(), yaw, v.x, v.y, v.z,
+                playerPos.x, playerPos.y, playerPos.z));
+        }
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    private static double horizontalDist(Vec3 a, Vec3 b) {
+        double dx = a.x - b.x;
+        double dz = a.z - b.z;
+        return Math.sqrt(dx * dx + dz * dz);
+    }
+
+    private static void releaseKeys() {
+        Minecraft mc = Minecraft.getInstance();
+        mc.options.keyUp.setDown(false);
+        mc.options.keySprint.setDown(false);
+        mc.options.keyJump.setDown(false);
+        mc.options.keyDown.setDown(false);
+        mc.options.keyLeft.setDown(false);
+        mc.options.keyRight.setDown(false);
+        mc.options.keyShift.setDown(false);
+        WindMouseRotation.INSTANCE.clearTarget();
+    }
+}

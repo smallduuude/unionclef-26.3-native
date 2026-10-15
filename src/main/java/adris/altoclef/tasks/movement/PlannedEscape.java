@@ -1,0 +1,180 @@
+package adris.altoclef.tasks.movement;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.Vec3;
+
+/**
+ * A recovery is a PLAN, never a random walk (docs/BARITONE-GAPS.md G26/G29, 2026-09-11).
+ *
+ * <p>Two places used to answer "the bot is not moving" with a random jiggle: UnstuckChain's
+ * shimmy (which also DUG, at random) and TimeoutWanderTask's spiral of unreachable points. Both
+ * throw the body at the world and hope. This helper answers it with the one engine that can
+ * break and place its way anywhere: FastNavigator (FastPlanner with breakThrough / breakDown /
+ * breakStair / pillarUp / placeAcross).
+ *
+ * <p>Where to? In this order:
+ * <ol>
+ *   <li>the LIVE altoclef goal, if the drive published one in the last two seconds and it is not
+ *       where we already stand -- the thing we were trying to reach is the thing to reach;</li>
+ *   <li>the SURFACE above the feet, when we are below it -- a pit, a shaft, a cave pocket;</li>
+ *   <li>the nearest standable cell at least three blocks away, otherwise.</li>
+ * </ol>
+ * Arming is rate-limited so a navigator that gives a route up is not re-armed twenty times a
+ * second, and callers keep control of the body while it drives (they return null / hold their
+ * priority), so there is exactly one owner of the movement keys.
+ */
+public final class PlannedEscape {
+
+    private PlannedEscape() {}
+
+    /** Escapes armed, and how the goal was chosen. Read as escape=armed/goal/surface/nearby/none. */
+    public static volatile int escapeArmed, escapeToGoal, escapeToSurface, escapeToNearby, escapeNoWhere;
+
+    private static long lastArmMs = 0L;
+    private static Vec3 armedFrom = null;
+    private static boolean lastPickWasLiveGoal = false;
+
+    /** Where the body was when the current escape started (null when none is running). */
+    public static Vec3 armedFrom() {
+        return kaptainwutax.tungsten.task.FastNavigator.isActive() ? armedFrom : null;
+    }
+
+    /**
+     * Start a planned escape unless one is already running. Returns true while FastNavigator is
+     * driving an escape (freshly armed or still going), false when nothing could be armed.
+     */
+    public static boolean tryStart(AltoClef mod, String why) {
+        if (kaptainwutax.tungsten.task.FastNavigator.isActive()) return true;
+        long now = System.currentTimeMillis();
+        if (now - lastArmMs < 3000) return false;
+        if (mod == null || mod.getPlayer() == null || mod.getWorld() == null) return false;
+        Vec3 goal = pickGoal(mod);
+        if (goal == null) {
+            escapeNoWhere++;
+            return false;
+        }
+        kaptainwutax.tungsten.task.BlockPathWalker.stop();
+        kaptainwutax.tungsten.path.movements.MovementQueue.stop();
+        var ex = kaptainwutax.tungsten.TungstenModDataContainer.EXECUTOR;
+        if (ex != null) ex.stop = false;
+        BlockPos reach = lastPickWasLiveGoal ? CustomBaritoneGoalTask.lastGoalReachBlock : null;
+        if (reach != null) kaptainwutax.tungsten.task.FastNavigator.start(goal, reach);
+        else kaptainwutax.tungsten.task.FastNavigator.start(goal);
+        armedFrom = mod.getPlayer().position();
+        lastArmMs = now;
+        escapeArmed++;
+        Debug.logMessage(String.format("Planned escape (%s) -> %.1f,%.1f,%.1f via FastPlanner (dig/build allowed)",
+                why, goal.x, goal.y, goal.z));
+        return true;
+    }
+
+    private static Vec3 pickGoal(AltoClef mod) {
+        Vec3 me = mod.getPlayer().position();
+        net.minecraft.world.level.Level w = mod.getWorld();
+        lastPickWasLiveGoal = false;
+        // 1. the live goal
+        Vec3 live = CustomBaritoneGoalTask.lastGoalVec;
+        if (live != null && System.currentTimeMillis() - CustomBaritoneGoalTask.lastGoalAtMs < 2000
+                && live.distanceToSqr(me) > 4.0) {
+            escapeToGoal++;
+            lastPickWasLiveGoal = true;
+            return live;
+        }
+        // 2. the surface above -- ONLY where the heightmap top is open sky. Under a ceiling (the
+        //    nether) MOTION_BLOCKING's top is the bedrock roof, and "escape to the surface" turns
+        //    into "pillar eighty blocks up through Ghast country to bedrock you cannot pass".
+        //    Measured 2026-09-21 from a nether start enclosed in a 1x1 netherrack hole: this armed
+        //    for y=128 on the first tick, the body was at y=117 ninety seconds later, and the server
+        //    logged "doomed to fall by Ghast". A roofed dimension has no surface to escape to; its
+        //    escape is the nearest standable cell (3.), which the build engine digs to sideways.
+        BlockPos feet = kaptainwutax.tungsten.path.movements.RotationHelper.playerFeet(mod.getPlayer());
+        if (!w.dimensionType().hasCeiling()) {
+            int top = w.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, feet.getX(), feet.getZ());
+            if (top > feet.getY() + 1) {
+                escapeToSurface++;
+                return new Vec3(feet.getX() + 0.5, top, feet.getZ() + 0.5);
+            }
+        }
+        // 3. the nearest standable cell at least three blocks away
+        for (int r = 3; r <= 10; r++) {
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) continue;
+                    for (int dy = 0; dy <= 2; dy++) {
+                        for (int sy : dy == 0 ? new int[]{0} : new int[]{dy, -dy}) {
+                            int x = feet.getX() + dx, y = feet.getY() + sy, z = feet.getZ() + dz;
+                            if (CustomBaritoneGoalTask.standable(w, x, y, z)) {
+                                escapeToNearby++;
+                                return new Vec3(x + 0.5, y, z + 0.5);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Enclosures seen from a body afloat, judged from the floor under it instead of the feet cell. */
+    public static volatile int enclosedAfloat;
+    /** Pits noted once by {@link #describePit}: where, and what was around. */
+    public static volatile String lastPit = "-";
+
+    /**
+     * All four cardinal neighbours of the cell the body STANDS in are solid: it cannot step anywhere.
+     *
+     * <p>⛔ FROM THE FLOOR, NOT FROM THE FEET (2026-09-30). A body in water bobs: at the top of each
+     * bob the feet cell is a block higher, its neighbours are the open air above the pit's rim, and
+     * this answered "not enclosed" on every other tick. portal_lava_lake: six minutes in a one-block
+     * pit of cast water by the frame's corner, the wander never handing the body to the build
+     * engine. The stance is the cell above the first solid block under the body, through any fluid.
+     */
+    public static boolean enclosed(AltoClef mod) {
+        if (mod == null || mod.getPlayer() == null || mod.getWorld() == null) return false;
+        BlockPos feet = kaptainwutax.tungsten.path.movements.RotationHelper.playerFeet(mod.getPlayer());
+        net.minecraft.world.level.Level w = mod.getWorld();
+        if (!mod.getPlayer().onGround() && mod.getPlayer().isInWater()) {
+            BlockPos c = feet;
+            for (int i = 0; i < 3 && w.getBlockState(c.below()).getCollisionShape(w, c.below()).isEmpty()
+                    && !w.getFluidState(c.below()).isEmpty(); i++) {
+                c = c.below();
+            }
+            if (!w.getBlockState(c.below()).getCollisionShape(w, c.below()).isEmpty() && !c.equals(feet)) {
+                feet = c;
+                enclosedAfloat++;
+            }
+        }
+        for (net.minecraft.core.Direction d : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+            BlockPos n = feet.relative(d);
+            if (w.getBlockState(n).getCollisionShape(w, n).isEmpty()) return false;
+        }
+        describePit(w, feet);
+        return true;
+    }
+
+    /** Write the 3x3x3 around a pit to the log once per pit, so a stall there can be read later
+     *  without reproducing it: '#' solid, '~' water, 'L' lava, '.' air; layers from the floor up. */
+    private static void describePit(net.minecraft.world.level.Level w, BlockPos feet) {
+        String at = feet.toShortString();
+        if (lastPit.startsWith(at)) return;
+        StringBuilder sb = new StringBuilder(at).append(" |");
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                sb.append(' ');
+                for (int dx = -1; dx <= 1; dx++) {
+                    BlockPos p = feet.offset(dx, dy, dz);
+                    var st = w.getBlockState(p);
+                    char ch = !st.getCollisionShape(w, p).isEmpty() ? '#'
+                            : st.getFluidState().is(net.minecraft.tags.FluidTags.LAVA) ? 'L'
+                            : !st.getFluidState().isEmpty() ? '~' : '.';
+                    sb.append(ch);
+                }
+            }
+            sb.append(" |");
+        }
+        lastPit = sb.toString();
+        System.out.println("[PlannedEscape] enclosed at " + lastPit);   // log only, once per pit
+    }
+}

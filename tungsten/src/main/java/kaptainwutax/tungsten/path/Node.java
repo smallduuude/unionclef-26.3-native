@@ -1,0 +1,500 @@
+package kaptainwutax.tungsten.path;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.ConcurrentModificationException;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import com.google.common.collect.Streams;
+
+import kaptainwutax.tungsten.Debug;
+import kaptainwutax.tungsten.TungstenConfig;
+import kaptainwutax.tungsten.TungstenMod;
+import kaptainwutax.tungsten.TungstenModDataContainer;
+import kaptainwutax.tungsten.agent.Agent;
+import kaptainwutax.tungsten.helpers.BlockShapeChecker;
+import kaptainwutax.tungsten.helpers.BlockStateChecker;
+import kaptainwutax.tungsten.helpers.DirectionHelper;
+import kaptainwutax.tungsten.helpers.DistanceCalculator;
+import kaptainwutax.tungsten.helpers.MovementHelper;
+import kaptainwutax.tungsten.path.blockSpaceSearchAssist.BlockNode;
+import kaptainwutax.tungsten.path.specialMoves.ClimbALadderMove;
+import kaptainwutax.tungsten.path.specialMoves.CornerJump;
+import kaptainwutax.tungsten.path.specialMoves.DivingMove;
+import kaptainwutax.tungsten.path.specialMoves.EnterWaterAndSwimMove;
+import kaptainwutax.tungsten.path.specialMoves.ExitWaterMove;
+import kaptainwutax.tungsten.path.specialMoves.LongJump;
+import kaptainwutax.tungsten.path.specialMoves.RunToNode;
+import kaptainwutax.tungsten.path.specialMoves.SlimeBounceMove;
+import kaptainwutax.tungsten.path.specialMoves.SprintJumpMove;
+import kaptainwutax.tungsten.path.specialMoves.SwimmingMove;
+import kaptainwutax.tungsten.path.specialMoves.WalkToNode;
+import kaptainwutax.tungsten.path.specialMoves.neo.NeoJump;
+import kaptainwutax.tungsten.render.Color;
+import net.minecraft.core.Direction;
+import net.minecraft.world.level.LevelReader;
+import net.minecraft.world.level.block.IceBlock;
+import net.minecraft.world.level.block.LadderBlock;
+import net.minecraft.world.level.block.SlimeBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
+
+public class Node {
+	/** Moves discarded because the completed fall simulation landed harder than the guard allows. */
+	public static volatile int fallMovesRejected;
+	/** Three-block drops handed back by fallGuardAllowsHarmlessDrop. Vanilla-free falls. */
+	public static volatile int fallHarmlessAllowed;
+	/** Descents kept and charged for rather than refused. Proof the price fired. */
+	public static volatile int fallPriced;
+
+
+	public Node parent;
+	public Agent agent;
+	public PathInput input;
+	public double cost;
+	public double estimatedCostToGoal = 0;
+	public int heapPosition;
+	public double combinedCost;
+	public Color color;
+
+	public Node(Node parent, Agent agent, Color color, double pathCost) {
+		this.parent = parent;
+		this.agent = agent;
+		this.color = color;
+		this.cost = pathCost;
+		this.combinedCost = 0;
+		this.heapPosition = -1;
+	}
+
+	public Node(Node parent, LevelReader world, PathInput input, Color color, double pathCost) {
+		this.parent = parent;
+		this.agent = Agent.of(parent.agent, input).tick(world);
+		this.input = input;
+		this.color = color;
+		this.cost = pathCost;
+		this.combinedCost = 0;
+		this.heapPosition = -1;
+	}
+	
+	 public boolean isOpen() {
+	        return heapPosition != -1;
+    }
+	 
+	 public int hashCode() {
+		 return (int) hashCode(1, true);
+	 }
+	 
+	 public int hashCode(int round, boolean shouldAddYaw) {
+		 long result = 3241;
+		 if (this.input != null) {
+			 if (this.input.forward) result += "forward".hashCode();
+			 if (this.input.back) result += "back".hashCode();
+			 if (this.input.right) result += "right".hashCode();
+			 if (this.input.left) result += "left".hashCode();
+			 if (this.input.jump) result += "jump".hashCode();
+			 if (this.input.sneak) result += "sneak".hashCode();
+			 if (this.input.sprint) result += "sprint".hashCode();
+//		    result = result + (Math.round(this.input.pitch));
+		    if (shouldAddYaw) result = result + (Math.round(this.input.yaw / 45f));
+		    // velocity removed from hash — too many unique values caused
+		    // excessive hash collisions in the closed set
+		 }
+//	    if (round > 1) {
+//		    result = 34L * result + Double.hashCode(roundToPrecision(this.agent.getPos().x, round));
+//		    result = 87L * result + Double.hashCode(roundToPrecision(this.agent.getPos().y, round));
+//		    result = 28L * result + Double.hashCode(roundToPrecision(this.agent.getPos().z, round));
+//	    } else {
+//		    result = 34L * result + Double.hashCode(this.agent.getPos().x);
+//		    result = 87L * result + Double.hashCode(this.agent.getPos().y);
+//		    result = 28L * result + Double.hashCode(this.agent.getPos().z);
+//	    }
+	    return (int) result;
+    }
+
+
+	/** Which rejection inside createNode fires: the last unmeasured link. */
+	/** Candidates offered to the simulation, and simulations actually attempted. */
+	/** Expansions kept that the sprint-jump shortcut would have replaced. */
+	/** Sweeps run with the narrowed yaw window. */
+	public static volatile int sweepNarrowed;
+	private boolean narrowSweep = false;
+
+	public static volatile int sweepKept;
+
+	public static volatile int paramsOffered, createCalls;
+
+	public static volatile int rejJumpSneak, rejAtWaypoint, rejSneakAir, rejSneakJump;
+
+	public List<Node> getChildren(LevelReader world, Vec3 target, BlockNode nextBlockNode) {
+		if (shouldSkipNodeGeneration(nextBlockNode)) {
+	        return Collections.emptyList();
+	    }
+
+	    List<Node> nodes = new ArrayList<>();
+
+	    
+	    // ⛔ REMOVED 2026-09-05: JumpToLadderMove.java deleted -- this call was already commented
+	    // out, superseded by ClimbALadderMove.generateMove() right below (which IS live). The
+	    // deleted file had its own bug (a per-iteration forward decision computed from the stale
+	    // pre-move `agent` position instead of the current `newNode.agent`, so it never adapted to
+	    // progress across the loop) that never mattered because this call never ran.
+	    if (DistanceCalculator.getHorizontalManhattanDistance(agent.getPos(), nextBlockNode.getPos(true)) <= 0.5 && nextBlockNode.getBlockState(world).getBlock() instanceof LadderBlock) {
+	    	Node climbALadderMove = ClimbALadderMove.generateMove(this, nextBlockNode);
+	    	boolean isClimbALadderMoveClose = Math.abs(climbALadderMove.agent.getPos().y - nextBlockNode.getPos(true).y) < 0.4;
+	    	nodes.add(climbALadderMove);
+	    	if (isClimbALadderMoveClose) {
+	    		return nodes;
+	    	}
+	    }
+
+	    
+	    if (agent.onGround && this.agent.canSprint()) {
+	    	if (nextBlockNode.isDoingNeo()) {
+	    		nodes.add(NeoJump.generateMove(this, nextBlockNode));
+	    	}
+		    if (nextBlockNode.isDoingLongJump(world) || world.getBlockState(nextBlockNode.getBlockPos()).getBlock() instanceof LadderBlock || nextBlockNode.previous != null && world.getBlockState(nextBlockNode.previous.getBlockPos()).getBlock() instanceof IceBlock) {
+		    	nodes.add(LongJump.generateMove(this, nextBlockNode));
+		    }
+	    }
+	    // Slime bounce: when on slime, generate a bounce trajectory toward target
+	    if (agent.onGround && world.getBlockState(agent.getBlockPos().below()).getBlock() instanceof SlimeBlock) {
+	    	nodes.add(SlimeBounceMove.generateMove(this, nextBlockNode));
+	    }
+	    if (!agent.touchingWater && BlockStateChecker.isAnyWater(nextBlockNode.getBlockState(world))) {
+	    	Node enterWaterAndSwimMove = EnterWaterAndSwimMove.generateMove(this, nextBlockNode);
+//	    	boolean isEnterWaterAndSwimMoveClose = enterWaterAndSwimMove.agent.getPos().distanceTo(nextBlockNode.getPos(true)) > 1.5;
+	    	nodes.add(enterWaterAndSwimMove);
+//	    	if (isEnterWaterAndSwimMoveClose) return nodes;
+	    }
+
+        if (agent.touchingWater) {
+            if (BlockShapeChecker.getShapeVolume(nextBlockNode.getBlockPos().above(), world) == 0) nodes.add(SwimmingMove.generateMove(this, nextBlockNode));
+            else  nodes.add(DivingMove.generateMove(this, nextBlockNode));
+            return nodes;
+        }
+
+            if (this.agent.canSprint()) {
+                Node sprintJumpMove = SprintJumpMove.generateMove(this, nextBlockNode);
+                boolean isSprintJumpMoveClose = sprintJumpMove.agent.getPos().distanceTo(nextBlockNode.getPos(true)) < 0.85;
+                // ⛔ A GOOD SPRINT-JUMP IS A MOVE, NOT THE ONLY MOVE.
+                //
+                // This skipped the entire sweep whenever the sprint-jump landed on ground within
+                // 0.85 of the waypoint -- which on open ground is every time -- leaving the node
+                // with exactly ONE successor. A search with one successor per node is a straight
+                // line: it cannot route around anything, and when the line does not arrive it
+                // exhausts. Measured on an empty flat field: children 170/83/83 over ~130 searches,
+                // gen=0/0 (the sweep never entered), srch=5/0/0, and no route ever emitted.
+                boolean onGoodLine = sprintJumpMove.agent.onGround && isSprintJumpMoveClose;
+                if (!onGoodLine || TungstenConfig.get().sprintJumpDoesNotReplaceTheSweep
+                        || TungstenConfig.get().sweepYawWindowOnGoodLine > 0) {
+                    if (onGoodLine) { sweepKept++; narrowSweep = true; } else narrowSweep = false;
+                    if (agent.onGround || agent.touchingWater || agent.isClimbing(world)) {
+                        generateGroundOrWaterNodes(world, target, nextBlockNode, nodes);
+                    } else {
+                        generateAirborneNodes(world, nextBlockNode, nodes);
+                    }
+
+                }
+                nodes.add(sprintJumpMove);
+//	    	if (isSprintJumpMoveClose) return nodes;
+            } else {
+                if (agent.onGround || agent.touchingWater || agent.isClimbing(world)) {
+                    narrowSweep = false;
+                    generateGroundOrWaterNodes(world, target, nextBlockNode, nodes);
+                } else {
+                    generateAirborneNodes(world, nextBlockNode, nodes);
+                }
+            }
+	    
+	    if (agent.onGround) {
+	    	if (!world.getBlockState(agent.getBlockPos().above(2)).isAir() && nextBlockNode.getPos(true).distanceTo(agent.getPos()) < 3) {
+	    		// ⛔ REMOVED 2026-09-05: TurnACornerMove.java deleted -- this call was already
+	    		// commented out, superseded by CornerJump.generateMove() below (live). The deleted
+	    		// file also had an unconditional Thread.sleep(200) x up to 16 and an ungated
+	    		// RenderHelper.renderNode() call per invocation, which would have been a serious
+	    		// stall if this dead call had ever been re-enabled without noticing.
+	    		Node cj1 = CornerJump.generateMove(this, nextBlockNode, false);
+	    		Node cj2 = CornerJump.generateMove(this, nextBlockNode, true);
+	    		if (cj1 != null) nodes.add(cj1);
+	    		if (cj2 != null) nodes.add(cj2);
+	    	}
+	    }
+	    if (agent.touchingWater && BlockShapeChecker.getShapeVolume(nextBlockNode.getBlockPos(), world) == 0 && !BlockStateChecker.isAnyWater(nextBlockNode.getBlockState(world))) {
+	    	Node exitWaterMove = ExitWaterMove.generateMove(this, nextBlockNode);
+//	    	boolean isExitWaterMoveClose = exitWaterMove.agent.getPos().distanceTo(nextBlockNode.getPos(true)) < 1.5;
+	    	nodes.add(exitWaterMove);
+//	    	if (isExitWaterMoveClose) return nodes;
+	    }
+
+	    if (!agent.touchingWater && !this.agent.canSprint()) {
+	    	nodes.add(WalkToNode.generateMove(this, nextBlockNode));
+	    }
+
+	    if (!agent.touchingWater && this.agent.canSprint() && nextBlockNode.getPos(true).distanceTo(agent.getPos()) < 4) {
+	    	nodes.add(RunToNode.generateMove(this, nextBlockNode));
+	    }
+    	if (!agent.isClimbing(world) && world.getBlockState(agent.getBlockPos().below()).getBlock() instanceof LadderBlock) {	
+	    	nodes.add(LongJump.generateMove(this, nextBlockNode));    		
+//    		nodes.add(CornerJump.generateMove(this, nextBlockNode));
+    	}
+    	
+	    return nodes;
+	}
+
+	
+	private boolean shouldSkipNodeGeneration(BlockNode nextBlockNode) {
+	    Node n = this.parent;
+	    if (n != null && (n.agent.isInLava() || agent.isInLava() || (agent.fallDistance >
+	    this.agent.getPos().y - nextBlockNode.getBlockPos().getY()+2
+	    && !agent.slimeBounce
+	    && !agent.touchingWater
+	    && !MovementHelper.isSlimeColumnBelow(TungstenModDataContainer.world, agent.getBlockPos(), 32)
+	    ))) {
+	        return true;
+	    }
+	    return false;
+	}
+
+	/** Parameter tuple for deferred parallel node creation. */
+	private record ChildGenParams(boolean forward, boolean right, boolean left, boolean sneak,
+	                               boolean sprint, boolean jump, float yaw) {}
+
+	private void generateGroundOrWaterNodes(LevelReader world, Vec3 target, BlockNode nextBlockNode, List<Node> nodes) {
+	    boolean isDoingLongJump = nextBlockNode.isDoingLongJump(world) || nextBlockNode.isDoingNeo();
+	    boolean isCloseToBlockNode = DistanceCalculator.getHorizontalEuclideanDistance(agent.getPos(), nextBlockNode.getPos(true)) < 1;
+//	    boolean needToJump = agent.blockY < nextBlockNode.y;
+    	BlockState state = world.getBlockState(nextBlockNode.getBlockPos());
+
+	    if (agent.isClimbing(world)
+	    		&& state.getBlock() instanceof LadderBlock
+	    		&& nextBlockNode.getBlockPos().getX() == agent.blockX
+	    		&& nextBlockNode.getBlockPos().getZ() == agent.blockZ) {
+	    	Direction dir = state.getValue(BlockStateProperties.HORIZONTAL_FACING);
+	    	double desiredYaw = DirectionHelper.calcYawFromVec3d(agent.getPos(), nextBlockNode.getPos(true).relative(dir.getOpposite(), 1)) /*+ MathHelper.roundToPrecision(Math.random(), 2) / 1000000*/;
+	    	if (nextBlockNode.getBlockPos().getY() > agent.blockY) {
+		    	{ Node n = createNode(world, nextBlockNode, true, false, false, false, false, true, (float) desiredYaw, isDoingLongJump, isCloseToBlockNode); if (n != null) nodes.add(n); }
+		    	return;
+	    	}
+	    	if (nextBlockNode.getBlockPos().getY() < agent.blockY) {
+	    		{ Node n = createNode(world, nextBlockNode, true, false, false, false, false, false, (float) desiredYaw, isDoingLongJump, isCloseToBlockNode); if (n != null) nodes.add(n); }
+	    		return;
+	    	}
+	    }
+	    // 1) Collect parameter combinations (cheap — no physics)
+	    List<ChildGenParams> params = new ArrayList<>();
+	    float desiredYaw = (float) DirectionHelper.calcYawFromVec3d(agent.getPos(), nextBlockNode.getPos(true));
+	    // NARROWED WHEN THE LINE IS ALREADY GOOD -- see sweepYawWindowOnGoodLine. Twelve
+	    // headings are what the full window is for: a blocked line that must be routed around.
+	    // On a good line a few headings are enough, and the difference is 144 candidates a node
+	    // against 48.
+	    float a = 134.4f;
+	    if (narrowSweep && TungstenConfig.get().sweepYawWindowOnGoodLine > 0) {
+	        a = (float) TungstenConfig.get().sweepYawWindowOnGoodLine;
+	        sweepNarrowed++;
+	    }
+	    float fromYaw = Math.max(desiredYaw - a, -180.0f);
+	    float toYaw = Math.min(desiredYaw + a, 180f);
+	    for (boolean forward : new boolean[]{true, false}) {
+	        for (boolean right : new boolean[]{true, false}) {
+	            for (boolean left : new boolean[]{true, false}) {
+	                    for (float yaw = fromYaw; yaw < toYaw; yaw += 22.5f) {
+	                        for (boolean sprint : new boolean[]{true, false}) {
+	                        	if (!this.agent.canSprint() && sprint) continue;
+								if (!right && !left && !forward) continue;
+								if (right && left) continue;
+	                            if (( ((right || left) && !forward)) && sprint) continue;
+
+	                            for (boolean jump : new boolean[]{true, false}) {
+	                                paramsOffered++;
+	                                params.add(new ChildGenParams(forward, right, left, false, sprint, jump, yaw));
+	                            }
+	                        }
+	                    }
+	            }
+	        }
+	    }
+
+	    // 2) Create nodes (parallel if enabled, sequential otherwise)
+	    List<Node> created = (TungstenConfig.get().enableParallelStreaming ? params.parallelStream() : params.stream())
+	        .map(p -> createNode(world, nextBlockNode, p.forward, p.right, p.left, p.sneak, p.sprint, p.jump, p.yaw, isDoingLongJump, isCloseToBlockNode))
+	        .filter(Objects::nonNull)
+	        .collect(Collectors.toList());
+	    nodes.addAll(created);
+	}
+
+	private Node createNode(LevelReader world, BlockNode nextBlockNode,
+	                        boolean forward, boolean right, boolean left, boolean sneak, boolean sprint, boolean jump,
+	                        float yaw, boolean isDoingLongJump, boolean isCloseToBlockNode) {
+		createCalls++;   // how many candidates the simulation is asked to build
+	    try {
+
+            if (jump && sneak) { rejJumpSneak++; return null; }
+	        Node newNode = new Node(this, world, new PathInput(forward, false, right, left, jump, sneak, sprint, agent.pitch, yaw),
+	                new Color(sneak ? 220 : 0, 255, sneak ? 50 : 0), this.cost);
+	        double addNodeCost = calculateNodeCost(forward, sprint, jump, sneak, newNode.agent);
+	        if (newNode.agent.getPos().closerThan(nextBlockNode.getPos(true), 0.1, 0.4)) { rejAtWaypoint++; return null; }
+
+	        boolean isMoving = (forward || right || left);
+	        if (newNode.agent.isClimbing(world)) jump = this.agent.getBlockPos().getY() < nextBlockNode.getBlockPos().getY();
+
+	            if (!newNode.agent.touchingWater && !newNode.agent.onGround && sneak) { rejSneakAir++; return null; }
+	            if (!newNode.agent.touchingWater && sneak && jump) { rejSneakJump++; return null; }
+	            if (!newNode.agent.touchingWater && (sneak && sprint)) return null;
+	            if (!newNode.agent.touchingWater && sneak && (right || left) && forward) return null;
+	            if (!newNode.agent.touchingWater && sneak && Math.abs(newNode.parent.agent.yaw - newNode.agent.yaw) > 80) return null;
+	            if (newNode.agent.touchingWater && (sneak || jump) && newNode.agent.getBlockPos().getY() == nextBlockNode.getBlockPos().getY()) return null;
+	            if (newNode.agent.touchingWater && jump && newNode.agent.getBlockPos().getY() > nextBlockNode.getBlockPos().getY()) return null;
+	            if (!sneak) {
+		            for (int j = 0; j < ((!jump) && !newNode.agent.isClimbing(world) ? 1 : 10); j++) {
+		                if (!isMoving) break;
+		                AABB adjustedBox = newNode.agent.box.move(0, -0.5, 0).inflate(-0.001, 0, -0.001);
+		                // ⛔ FIXED 2026-09-05: queried collisions via the STALE `agent` (= this.agent,
+		                // the PARENT node's pre-move state, unqualified field access) instead of
+		                // `newNode.agent` (the current simulated tick) -- the same bug class found and
+		                // fixed repeatedly this session in the specialMoves classes this method feeds
+		                // (SprintJumpMove, WalkToNode, RunToNode, CornerJump, NeoJump, LongJump). Here
+		                // it is the highest-volume instance: createNode() is the candidate generator
+		                // for essentially every ground-based move, called from a parallelStream over
+		                // up to hundreds of parameter combinations per node, each looping up to 10
+		                // times. Agent.getBlockCollisions() builds an AgentShapeContext from the
+		                // agent's OWN box.minY (read by isAbove()), so every iteration after the first
+		                // tested candidate shapes against the move's STARTING Y instead of the current
+		                // one -- confirmed concrete effect, same as CornerJump/NeoJump.
+		                Stream<VoxelShape> blockCollisions = Streams.stream(newNode.agent.getBlockCollisions(world, adjustedBox));
+			            if (blockCollisions.findAny().isEmpty() && isDoingLongJump) jump = true;
+		                newNode = new Node(newNode, world, new PathInput(forward, false, right, left, jump, sneak, sprint, agent.pitch, yaw),
+		                        jump ? new Color(150, 55, 85) : new Color(sneak ? 220 : 0, 255, sneak ? 50 : 0), this.cost + addNodeCost + 2.4);
+		                if (!isDoingLongJump && jump && j > 1) break;
+                        if (!newNode.agent.onGround && !newNode.agent.isClimbing(world)) break;
+		            }
+	            }
+
+	        return newNode;
+	    } catch (ConcurrentModificationException e) {
+	        return null;
+	    }
+	}
+
+	private double calculateNodeCost(boolean forward, boolean sprint, boolean jump, boolean sneak, Agent agent) {
+	    double addNodeCost = 4.358; // Magic number makes pathfinder go FAST. DO NOT TOUCH
+
+//	    if (forward && sprint && jump && !sneak) {
+//	        addNodeCost -= 0.2;
+//	    }
+		if (agent.touchingWater) {
+			addNodeCost += 0.2;
+		}
+
+		if (Math.abs(agent.velX) < 0.01 && Math.abs(agent.velY) < 0.01 && Math.abs(agent.velZ) < 0.01) {
+			addNodeCost += 15;
+		}
+		if (agent.horizontalCollision) {
+			addNodeCost += 0.0004;
+		}
+
+		if (agent.isInLava()) addNodeCost += 2e6;
+
+	    if (sneak) {
+	        addNodeCost += 2000;
+	    }
+
+//        if (agent.touchingWater) {
+//            addNodeCost += 200;
+//        }
+
+
+        return addNodeCost; //+ Math.abs(agent.yaw- this.agent.yaw) * 5;
+	}
+
+	private void generateAirborneNodes(LevelReader world, BlockNode nextBlockNode, List<Node> nodes) {
+	    try {
+	        float targetYaw = (float) DirectionHelper.calcYawFromVec3d(agent.getPos(), nextBlockNode.getPos(true));
+	        for (float yaw : new float[]{agent.yaw, targetYaw, targetYaw - 30f}) {
+	            createAirborneNodes(world, nextBlockNode, nodes, true, false, yaw);
+	        }
+	    } catch (ConcurrentModificationException e) {
+	    }
+	}
+
+	private void createAirborneNodes(LevelReader world, BlockNode nextBlockNode, List<Node> nodes, boolean forward, boolean right, float yaw) {
+	    Node newNode = new Node(this, world, new PathInput(forward, false, right, false, false, false, true, agent.pitch, yaw),
+	            new Color(0, 255, 255), this.cost + 1);
+
+
+        if (newNode.agent.getPos().closerThan(nextBlockNode.getPos(true), 0.9, 0.4)) return;
+        double newNodeDistanceToBlockNode = Math.ceil(newNode.agent.getPos().distanceTo(nextBlockNode.getPos(true)) * 1e4);
+        double parentNodeDistanceToBlockNode = Math.ceil(newNode.parent.agent.getPos().distanceTo(nextBlockNode.getPos(true)) * 1e4);
+
+        if (newNodeDistanceToBlockNode >= parentNodeDistanceToBlockNode) return;
+	    int i = 0;
+	    boolean isBelowClosedTrapDoor = BlockStateChecker.isClosedBottomTrapdoor(world.getBlockState(nextBlockNode.getBlockPos().below()));
+	    boolean shouldAllowWalkingOnLowerBlock = !world.getBlockState(agent.getBlockPos().above(2)).isAir() && nextBlockNode.getPos(true).distanceTo(agent.getPos()) < 3;
+	    boolean slimeBelow = MovementHelper.isSlimeColumnBelow(world, newNode.agent.getBlockPos(), 32);
+	    double minY = isBelowClosedTrapDoor ? nextBlockNode.getPos(true).y - 1 : nextBlockNode.getBlockPos().getY() - (shouldAllowWalkingOnLowerBlock ? 1.4 : 0.4);
+	    // ⛔ A FALL GUARD MUST REJECT THE MOVE, NOT TRUNCATE THE SIMULATION.
+	    //
+	    // This loop simulates the body FALLING until it lands. The guard used to sit in the loop
+	    // CONDITION, so with it active the simulation stopped the moment the drop passed three
+	    // blocks -- and the node that came out was still IN MID-AIR. An airborne node cannot be
+	    // executed, so the physics layer produced nothing the movement queue could use, while the
+	    // search neither exhausted nor timed out. Measured with pathAvoidsFallDamage on: two
+	    // playthrough runs frozen at exactly (71.7, 120.0, -70.7), items=0, pdEnter+460 and
+	    // mqSteps+0, and srch=0/0/0 -- no exhaustion anywhere to explain it. My first fix put a
+	    // retry on the exhaustion branch and fallRetry read 0, which is what said the branch was
+	    // wrong rather than the idea.
+	    //
+	    // So: always simulate to the ground, and decide afterwards. A move that lands too hard is
+	    // DISCARDED, leaving the search to find another route or the caller to relax the guard --
+	    // both of which are answers. A half-simulated node is not.
+	    final boolean fallGuardActive = !TungstenModDataContainer.searchIgnoresFallDamage() && !slimeBelow;
+	    while (!newNode.agent.onGround && !newNode.agent.isClimbing(world) && newNode.agent.getPos().y >= minY) {
+	    	if (i > 60) break;
+	    	i++;
+			double addNodeCost = calculateNodeCost(forward, true, false, false, newNode.agent);
+	        newNode = new Node(newNode, world, new PathInput(forward, false, right, false, false, false, true, agent.pitch, yaw),
+	                new Color(0, 255, 255), this.cost + addNodeCost + (this.agent.canSprint() ? 1 : 8));
+	    }
+		double addNodeCost = calculateNodeCost(forward, true, false, false, newNode.agent);
+        newNode = new Node(newNode, world, new PathInput(forward, false, right, false, false, false, true, agent.pitch, yaw),
+                new Color(0, 255, 255), this.cost + addNodeCost + (this.agent.canSprint() ? 1 : 8));
+
+        if (newNode.agent.getPos().distanceTo(this.agent.getPos()) < 1.05) return;
+	    // The drop is judged on the COMPLETED simulation, so the number is the real landing depth
+	    // rather than wherever a truncated loop happened to stop.
+	    //
+	    // Vanilla fall damage is floor(distance - 3), so a THREE-block drop costs nothing. This
+	    // read <= -3 and refused it: a damage guard vetoing a fall that deals no damage. Four
+	    // blocks and deeper stay refused, and the relaxation retry still covers the rest.
+	    final double drop = DistanceCalculator.getJumpHeight(agent.posY, newNode.agent.posY);
+	    final boolean harmlessOk = TungstenConfig.get().fallGuardAllowsHarmlessDrop;
+	    // A TOLERANCE, NOT ==. This read `drop == -3` on a double and matched nothing: the
+	    // counter read 0 in both arms while the block-space one read 253567, which is what
+	    // said the comparison was wrong rather than the site being dead.
+	    if (fallGuardActive && harmlessOk && drop > -4 && drop <= -3
+	            && !newNode.agent.touchingWater) {
+	        fallHarmlessAllowed++;          // proof this fired: a free drop the old threshold refused
+	    }
+	    // PRICED, NOT REFUSED: charge the descent onto this node's cost and keep it, so the
+	    // search can still prefer a bridge while a drop stays available when nothing else is.
+	    if (fallGuardActive && drop <= (harmlessOk ? -4 : -3) && !newNode.agent.touchingWater
+	            && TungstenConfig.get().fallDepthPriced
+	            && drop >= -TungstenConfig.get().fallDepthHardLimit) {
+	        newNode.cost += (-drop - 2) * TungstenConfig.get().fallCostPerBlock;
+	        fallPriced++;
+	        nodes.add(newNode);
+	        return;
+	    }
+	    if (fallGuardActive && drop <= (harmlessOk ? -4 : -3) && !newNode.agent.touchingWater) {
+	        fallMovesRejected++;
+	        return;
+	    }
+	    nodes.add(newNode);
+	}
+	
+}

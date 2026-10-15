@@ -1,0 +1,328 @@
+package adris.altoclef.tasks.movement;
+
+import adris.altoclef.control.Nav;
+import adris.altoclef.AltoClef;
+import adris.altoclef.multiversion.FoodComponentWrapper;
+import adris.altoclef.multiversion.item.ItemVer;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.helpers.LookHelper;
+import adris.altoclef.util.progresscheck.MovementProgressChecker;
+import kaptainwutax.tungsten.path.movements.Rotation;
+import kaptainwutax.tungsten.path.movements.Input;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.world.item.*;
+import net.minecraft.util.Mth;
+import net.minecraft.core.*;
+import net.minecraft.world.phys.*;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.util.Mth;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
+import java.util.Optional;
+import java.util.function.Predicate;
+
+public class EscapeFromLavaTask extends CustomBaritoneGoalTask {
+
+    private final float strength;
+    private int ticks = 0;
+    private final Predicate<BlockPos> avoidPlacingRiskyBlock;
+
+    public EscapeFromLavaTask(AltoClef mod,float strength) {
+        this.strength = strength;
+        avoidPlacingRiskyBlock = (blockPos -> mod.getPlayer().getBoundingBox().intersects(new AABB(blockPos))
+                && (mod.getWorld().getBlockState(mod.getPlayer().blockPosition().below()).getBlock() == Blocks.LAVA || mod.getPlayer().isInLava()));
+    }
+
+
+    public EscapeFromLavaTask(AltoClef mod) {
+        this(mod, 100);
+    }
+
+    @Override
+    protected void onStart() {
+        AltoClef mod = AltoClef.getInstance();
+
+        mod.getBehaviour().push();
+        Nav.stopExploring();
+        Nav.clearGoal();
+        mod.getBehaviour().allowSwimThroughLava(true);
+        // Encourage placing of all blocks!
+        mod.getBehaviour().setBlockPlacePenalty(0);
+        mod.getBehaviour().setBlockBreakAdditionalPenalty(0); // Normally 2
+        // do NOT ever wander
+        checker = new MovementProgressChecker((int) Float.POSITIVE_INFINITY);
+
+        // avoid trying to place block right under us if there is lava
+        mod.getExtraBaritoneSettings().avoidBlockPlace(avoidPlacingRiskyBlock);
+    }
+
+    @Override
+    protected Task onTick() {
+        AltoClef mod = AltoClef.getInstance();
+
+       // if (mod.getWorld().getBlockState(mod.getPlayer().getBlockPos().up()).getBlock().equals(Blocks.LAVA)) {
+            mod.getInputControls().hold(Input.JUMP);
+            mod.getInputControls().hold(Input.SPRINT);
+           /* setDebugState("escaping submerged lava");
+            return null;
+        }*/
+
+        Optional<Item> food = calculateFood(mod);
+        if (food.isPresent() && mod.getPlayer().getFoodData().getFoodLevel() < 20) {
+            // can be interrupted by block placing, but we should try to eat whenever we can
+            if (mod.getPlayer().isBlocking()) {
+                mod.log("want to eat, trying to stop shielding...");
+                mod.getInputControls().release(Input.CLICK_RIGHT);
+            } else {
+                mod.getSlotHandler().forceEquipItem(new Item[]{food.get()}, true);
+                mod.getInputControls().hold(Input.CLICK_RIGHT);
+            }
+        }
+
+
+        // Sprint through lava + jump, it's faster
+        if (mod.getPlayer().isInLava() || mod.getWorld().getBlockState(mod.getPlayer().blockPosition().below()).getBlock() == Blocks.LAVA) {
+
+            setDebugState("run away from lava");
+
+            BlockPos steppingPos = mod.getPlayer().getOnPos();
+            if (!mod.getWorld().getBlockState(steppingPos.east()).getBlock().equals(Blocks.LAVA) ||
+                    !mod.getWorld().getBlockState(steppingPos.west()).getBlock().equals(Blocks.LAVA) ||
+                    !mod.getWorld().getBlockState(steppingPos.south()).getBlock().equals(Blocks.LAVA) ||
+                    !mod.getWorld().getBlockState(steppingPos.north()).getBlock().equals(Blocks.LAVA) ||
+                    !mod.getWorld().getBlockState(steppingPos.east().north()).getBlock().equals(Blocks.LAVA) ||
+                    !mod.getWorld().getBlockState(steppingPos.east().south()).getBlock().equals(Blocks.LAVA) ||
+                    !mod.getWorld().getBlockState(steppingPos.west().north()).getBlock().equals(Blocks.LAVA) ||
+                    !mod.getWorld().getBlockState(steppingPos.west().south()).getBlock().equals(Blocks.LAVA)) {
+
+                return super.onTick();
+            }
+
+            // NOTHING TO PLACE, NOTHING TO AIM FOR. The block search below turns the head and
+            // returns null on every tick it finds a face, which takes the tick from the drive; with
+            // no block to put there that is a bot staring at the floor of a lava pool for good.
+            // Measured on escape_lava_pool (empty kit): 90 s in the middle of the pool, the drive
+            // never moved the body. Without a block, swim for the shore instead.
+            if (!mod.getItemStorage().hasItem(Items.NETHERRACK)
+                    && !mod.getItemStorage().hasItem(mod.getThrowawayItems().toArray(new Item[0]))) {
+                setDebugState("run away from lava (nothing to place)");
+                return super.onTick();
+            }
+
+            if (mod.getPlayer().isBlocking()) {
+                mod.log("want to place block, trying to stop shielding...");
+                mod.getInputControls().release(Input.CLICK_RIGHT);
+            }
+
+            for (float pitch = 25; pitch < 90; pitch += 1f) {
+                for (float yaw = -180; yaw < 180; yaw += 1f) {
+                    HitResult result = raycast(mod, 4, pitch, yaw);
+                    if (result.getType() == HitResult.Type.BLOCK) {
+                        BlockHitResult blockHitResult = (BlockHitResult) result;
+                        BlockPos pos = blockHitResult.getBlockPos();
+
+                        if (pos.getY() > mod.getPlayer().getOnPos().getY()) continue;
+
+                        Direction facing = blockHitResult.getDirection();
+
+                        if (facing == Direction.UP) continue;
+                        LookHelper.lookAt(new Rotation(yaw,pitch));
+
+                        if (mod.getItemStorage().hasItem(Items.NETHERRACK)) {
+                            mod.getSlotHandler().forceEquipItem(Items.NETHERRACK);
+                        } else {
+                            mod.getSlotHandler().forceEquipItem(mod.getThrowawayItems().toArray(new Item[0]));
+                        }
+                        mod.log(pos+"");
+                        mod.log(facing+"");
+
+
+                        mod.getInputControls().tryPress(Input.CLICK_RIGHT);
+                        return null;
+                    }
+                }
+            }
+
+        }
+
+        return super.onTick();
+    }
+
+    // similar to FoodChain
+    // TODO add config for this
+    private Optional<Item> calculateFood(AltoClef mod) {
+        Item bestFood = null;
+        double bestFoodScore = Double.NEGATIVE_INFINITY;
+        LocalPlayer player = mod.getPlayer();
+
+        float hunger = player != null ? player.getFoodData().getFoodLevel() : 20;
+        float saturation = player != null ? player.getFoodData().getSaturationLevel() : 20;
+        // Get best food item + calculate food total
+        for (ItemStack stack : mod.getItemStorage().getItemStacksPlayerInventory(true)) {
+            if (ItemVer.isFood(stack)) {
+                //screw that, we are in lava, eat whatever we can
+                // Ignore protected items
+               // if (!ItemHelper.canThrowAwayStack(mod, stack)) continue;
+
+                // Ignore spider eyes
+                if (stack.getItem() == Items.SPIDER_EYE) {
+                    continue;
+                }
+
+                float score = getScore(stack, hunger, saturation);
+                if (score > bestFoodScore) {
+                    bestFoodScore = score;
+                    bestFood = stack.getItem();
+                }
+            }
+        }
+
+        return Optional.ofNullable(bestFood);
+    }
+
+    private static float getScore(ItemStack stack, float hunger, float saturation) {
+        FoodComponentWrapper food = ItemVer.getFoodComponent(stack.getItem());
+
+        assert food != null;
+        float hungerIfEaten = Math.min(hunger + food.getHunger(), 20);
+        float saturationIfEaten = Math.min(hungerIfEaten, saturation + food.getSaturationModifier());
+        float gainedSaturation = (saturationIfEaten - saturation);
+
+        float hungerNotFilled = 20 - hungerIfEaten;
+        float saturationGoodScore = gainedSaturation * 10;
+        float hungerNotFilledPenalty = hungerNotFilled * 2;
+
+        float score = saturationGoodScore - hungerNotFilledPenalty;
+
+        if (stack.getItem() == Items.ROTTEN_FLESH) {
+            score = 0;
+        }
+        return score;
+    }
+
+
+    public HitResult raycast(AltoClef mod,double maxDistance, float pitch, float yaw) {
+        Vec3 cameraPos = mod.getPlayer().getEyePosition(Minecraft.getInstance().getDeltaTracker().getGameTimeDeltaPartialTick(true));
+        Vec3 rotationVector = getRotationVector(pitch,yaw);
+
+        Vec3 vec3d3 = cameraPos.add(rotationVector.x * maxDistance, rotationVector.y * maxDistance, rotationVector.z * maxDistance);
+        return mod.getPlayer().level()
+                .clip(
+                        new ClipContext(
+                                cameraPos, vec3d3, ClipContext.Block.OUTLINE,
+                                false ? ClipContext.Fluid.ANY : ClipContext.Fluid.NONE, mod.getPlayer()
+                        )
+                );
+    }
+    protected final Vec3 getRotationVector(float pitch, float yaw) {
+        float f = pitch * (float) (Math.PI / 180.0);
+        float g = -yaw * (float) (Math.PI / 180.0);
+        float h = Mth.cos(g);
+        float i = Mth.sin(g);
+        float j = Mth.cos(f);
+        float k = Mth.sin(f);
+        return new Vec3((double)(i * j), (double)(-k), (double)(h * j));
+    }
+
+
+    @Override
+    protected void onStop(Task interruptTask) {
+        AltoClef mod = AltoClef.getInstance();
+
+        mod.getBehaviour().pop();
+        mod.getInputControls().release(Input.JUMP);
+        mod.getInputControls().release(Input.SPRINT);
+        mod.getInputControls().release(Input.CLICK_RIGHT);
+
+        // remove our custom place avoider
+        synchronized (mod.getExtraBaritoneSettings().getPlaceMutex()) {
+            mod.getExtraBaritoneSettings().getPlaceAvoiders().remove(avoidPlacingRiskyBlock);
+        }
+    }
+
+    @Override
+    protected adris.altoclef.util.goals.AltoGoal newAltoGoal(AltoClef mod) {
+        // G-0 + the escape_lava finding: EscapeFromLavaGoal was a PREDICATE with no point in it,
+        // and the tungsten drive steers at points. That is why the bot stood in lava for ninety
+        // seconds without moving -- the task ran, the goal could not be translated. Water had the
+        // identical defect and was fixed today (nav_water PASS at 16.2 fps).
+        //
+        // TWO STAGES, AND THE ORDER IS THE BEHAVIOUR. The old heuristic priced water at -100:
+        // escaping INTO water is strongly preferred because it extinguishes, and that preference
+        // does not fall off with distance. A predicate cannot express a preference -- the ORDER OF
+        // CALLS can. So look for water first, and settle for dry ground only if none is near.
+        BlockPos feet = mod.getPlayer().blockPosition();
+        adris.altoclef.util.goals.AltoGoal water = new adris.altoclef.util.goals.AltoGoal.NearestSatisfying(
+                pos -> EscapeFromLavaGoal.isWater(pos.getX(), pos.getY(), pos.getZ()), feet, 12);
+        if (water.target() != null) {
+            return water;
+        }
+        // SOMEWHERE TO STAND, NOT MERELY SOMEWHERE WITHOUT LAVA. "Not lava and not next to lava" is
+        // true of the air right above a lava pool, which is the nearest such cell to a body in the
+        // middle of one: measured on escape_lava_pool, the goal was the cell over the bot's head,
+        // the navigator's sphere called that arrived, the goal's own test refused it (5 times), and
+        // the bot bobbed in the lava for the whole run. baritone's EscapeFromLavaGoal was a
+        // heuristic over walkable nodes, so its answer always had a floor.
+        return new adris.altoclef.util.goals.AltoGoal.NearestSatisfying(
+                pos -> !EscapeFromLavaGoal.isLava(pos.getX(), pos.getY(), pos.getZ())
+                        && !EscapeFromLavaGoal.isLavaAdjacent(pos.getX(), pos.getY(), pos.getZ())
+                        && EscapeFromLavaGoal.canStand(pos),
+                feet, 16);
+    }
+
+    @Override
+    protected boolean isEqual(Task other) {
+        return other instanceof EscapeFromLavaTask;
+    }
+
+    @Override
+    public boolean isFinished() {
+        LocalPlayer player = AltoClef.getInstance().getPlayer();
+
+        return !player.isInLava() && !player.isOnFire();
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "Escaping lava";
+    }
+
+    private static final class EscapeFromLavaGoal {
+
+        private static boolean isLava(int x, int y, int z) {
+            if (Minecraft.getInstance().level == null) return false;
+            return adris.altoclef.util.helpers.WorldHelper.isLavaState(Minecraft.getInstance().level.getBlockState(new BlockPos(x, y, z)));
+        }
+
+        private static boolean isLavaAdjacent(int x, int y, int z) {
+            return isLava(x + 1, y, z) || isLava(x - 1, y, z) || isLava(x, y, z + 1) || isLava(x, y, z - 1)
+                    || isLava(x + 1, y, z - 1) || isLava(x + 1, y, z + 1) || isLava(x - 1, y, z - 1)
+                    || isLava(x - 1, y, z + 1);
+        }
+
+        /** Solid support directly under the feet cell and room for the body above it. */
+        private static boolean canStand(BlockPos pos) {
+            var world = Minecraft.getInstance().level;
+            if (world == null) return false;
+            double top = kaptainwutax.tungsten.helpers.PlayerFit.supportTop(world, pos);
+            if (Double.isNaN(top) || top < pos.getY() - 0.01 || top >= pos.getY() + 1) return false;
+            return kaptainwutax.tungsten.helpers.PlayerFit.bodyFits(world, pos.getX() + 0.5, top, pos.getZ() + 0.5);
+        }
+
+        private static boolean isWater(int x, int y, int z) {
+            if (Minecraft.getInstance().level == null) return false;
+            return adris.altoclef.util.helpers.WorldHelper.isWaterState(Minecraft.getInstance().level.getBlockState(new BlockPos(x, y, z)));
+        }
+
+    }
+}

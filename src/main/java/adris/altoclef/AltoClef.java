@@ -1,0 +1,1182 @@
+package adris.altoclef;
+
+
+import adris.altoclef.butler.Butler;
+import adris.altoclef.chains.*;
+import adris.altoclef.commandsystem.CommandExecutor;
+import adris.altoclef.commandsystem.TabCompleter;
+import adris.altoclef.control.InputControls;
+import adris.altoclef.control.PlayerExtraController;
+import adris.altoclef.control.SlotHandler;
+import adris.altoclef.eventbus.EventBus;
+import adris.altoclef.eventbus.events.BlockBrokenEvent;
+import adris.altoclef.eventbus.events.ClientRenderEvent;
+import adris.altoclef.eventbus.events.ClientTickEvent;
+import adris.altoclef.eventbus.events.SendChatEvent;
+import adris.altoclef.eventbus.events.TitleScreenEntryEvent;
+import adris.altoclef.multiversion.DrawContextWrapper;
+import adris.altoclef.multiversion.RenderLayerVer;
+import adris.altoclef.multiversion.versionedfields.Blocks;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.tasksystem.TaskRunner;
+import adris.altoclef.trackers.*;
+import adris.altoclef.trackers.storage.ContainerSubTracker;
+import adris.altoclef.trackers.storage.ItemStorageTracker;
+import adris.altoclef.ui.AltoClefTickChart;
+import adris.altoclef.ui.CommandStatusOverlay;
+import adris.altoclef.ui.MessagePriority;
+import adris.altoclef.ui.MessageSender;
+import adris.altoclef.util.helpers.InputHelper;
+import adris.altoclef.util.helpers.LookHelper;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.settings.AltoClefSettings;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.User;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Block;
+import adris.altoclef.mixins.MinecraftClientSessionMixin;
+import adris.altoclef.util.helpers.ConfigHelper;
+import py4j.GatewayServer;
+import py4j.Py4JNetworkException;
+
+import java.util.*;
+import java.util.function.Consumer;
+import com.mojang.blaze3d.platform.InputConstants;
+
+/**
+ * Central access point for AltoClef
+ */
+public class AltoClef implements ModInitializer {
+
+    // Static access to altoclef
+    private static final Queue<Consumer<AltoClef>> _postInitQueue = new ArrayDeque<>();
+
+    // Camera modifier statics (used by CameraMixin / EpicCamera).
+    // Kept fully qualified because this file also imports baritone types; the rotation itself is
+    // tungsten's now — same (yaw, pitch) value type, it never crossed into the pathfinder.
+    public static kaptainwutax.tungsten.path.movements.Rotation _cameraRotationModifer = null;
+    public static net.minecraft.world.phys.Vec3 _cameraPositionModifer = null;
+
+    public static kaptainwutax.tungsten.path.movements.Rotation getCameraRotationModifer() {
+        return _cameraRotationModifer;
+    }
+    public static void setCameraRotationModifer(kaptainwutax.tungsten.path.movements.Rotation rotation) {
+        _cameraRotationModifer = rotation;
+    }
+    public static void resetCameraRotationModifer() {
+        _cameraRotationModifer = null;
+    }
+    public static net.minecraft.world.phys.Vec3 getCameraPositionModifer() {
+        return _cameraPositionModifer;
+    }
+    public static void setCameraPositionModifer(net.minecraft.world.phys.Vec3 pos) {
+        _cameraPositionModifer = pos;
+    }
+    public static void resetCameraPositionModifer() {
+        _cameraPositionModifer = null;
+    }
+
+    // Central Managers
+    private static CommandExecutor commandExecutor;
+    private TaskRunner taskRunner;
+    private TrackerManager trackerManager;
+    private BotBehaviour botBehaviour;
+    private PlayerExtraController extraController;
+    // Task chains
+    private UserTaskChain userTaskChain;
+    private FoodChain foodChain;
+    private MobDefenseChain mobDefenseChain;
+    private MLGBucketFallChain mlgBucketChain;
+    private WorldSurvivalChain worldSurvivalChain;
+    // Trackers
+    private ItemStorageTracker storageTracker;
+    private ContainerSubTracker containerSubTracker;
+    private EntityTracker entityTracker;
+    private BlockScanner blockScanner;
+    private SimpleChunkTracker chunkTracker;
+    private MiscBlockTracker miscBlockTracker;
+    private CraftingRecipeTracker craftingRecipeTracker;
+    private DamageTracker damageTracker;
+    // Renderers
+    private CommandStatusOverlay commandStatusOverlay;
+    private AltoClefTickChart altoClefTickChart;
+    // Settings
+    private adris.altoclef.Settings settings;
+    // Misc managers/input
+    private MessageSender messageSender;
+    private InputControls inputControls;
+    private SlotHandler slotHandler;
+    // Butler
+    private Butler butler;
+    // Pausing
+    private boolean paused = false;
+    private Task storedTask;
+
+    // Task timeout
+    private boolean _timeoutActive = false;
+    private float _timeoutDuration = 60;
+    private long _timeoutStartMs;
+
+    private static AltoClef instance;
+
+    // Pipeline (multiplayer game mode)
+    private static adris.altoclef.util.agent.Pipeline _pipeline = adris.altoclef.util.agent.Pipeline.None;
+
+    // Py4j bridge
+    private Py4jEntryPoint _py4jEntryPoint = null;
+    private GatewayServer _gatewayServer = null;
+    // MCP server (LAN-hosted control surface over the same levers)
+    private adris.altoclef.mcp.McpServer _mcpServer = null;
+
+    public static adris.altoclef.util.agent.Pipeline getPipeline() {
+        return _pipeline;
+    }
+
+    public static void setPipeline(adris.altoclef.util.agent.Pipeline pipeline) {
+        _pipeline = pipeline;
+    }
+
+    public Py4jEntryPoint getInfoSender() {
+        return _py4jEntryPoint;
+    }
+
+    public GatewayServer getGateway() {
+        return _gatewayServer;
+    }
+
+    public DamageTracker getDamageTracker() {
+        return damageTracker;
+    }
+
+    public Task getCurrentTask() {
+        if (getUserTaskChain() != null) {
+            return getUserTaskChain().getCurrentTask();
+        }
+        return null;
+    }
+
+    public void initializePythonSender() {
+        if (_gatewayServer != null) {
+            // Already running — restart cleanly to pick up new port settings
+            reloadPythonSender();
+            return;
+        }
+        _py4jEntryPoint = new Py4jEntryPoint(this);
+        int port = getModSettings().getPythonGatewayPort();
+        final int originalPort = port;
+        final int MAX_ATTEMPTS = 20;
+        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            _gatewayServer = new GatewayServer(
+                    _py4jEntryPoint,
+                    port,
+                    port + 1,
+                    GatewayServer.DEFAULT_CONNECT_TIMEOUT,
+                    GatewayServer.DEFAULT_READ_TIMEOUT,
+                    null
+            );
+            try {
+                _gatewayServer.start();
+                // Port changed — save to settings so next launch uses the same port
+                if (port != originalPort) {
+                    getModSettings().setPythonGatewayPort(port);
+                    ConfigHelper.saveConfig(adris.altoclef.Settings.SETTINGS_PATH, getModSettings());
+                    Debug.logMessage("Py4j port conflict — bound to " + port + " (saved to settings)");
+                }
+                _py4jEntryPoint.InitPythonCallback();
+                Debug.logMessage("Py4j gateway started on port " + port);
+                startMcpServer();
+                return;
+            } catch (Py4JNetworkException e) {
+                if (e.getCause() instanceof java.net.BindException) {
+                    _gatewayServer = null;
+                    Debug.logWarning("Py4j port " + port + " in use, trying " + (port + 2) + "...");
+                    port += 2;
+                } else {
+                    throw e;
+                }
+            }
+        }
+        Debug.logError("Py4j: failed to bind after " + MAX_ATTEMPTS + " attempts, giving up");
+    }
+
+    /** Start the in-mod MCP server (LAN-hosted, 0.0.0.0:mcpPort) so a cognitive
+     *  agent can drive the bot over the network through the same levers. */
+    private void startMcpServer() {
+        if (!getModSettings().isMcpEnabled() || _mcpServer != null || _py4jEntryPoint == null) return;
+        try {
+            String token = getModSettings().getMcpAuthToken();
+            if (token == null || token.isEmpty()) {
+                // TODOS.md C7.3: first start on this machine (or the token was cleared) —
+                // mint one and persist it so it survives restarts, the same pattern used
+                // a few lines up for a re-bound py4j port.
+                token = java.util.UUID.randomUUID().toString();
+                getModSettings().setMcpAuthToken(token);
+                ConfigHelper.saveConfig(adris.altoclef.Settings.SETTINGS_PATH, getModSettings());
+            }
+            _mcpServer = new adris.altoclef.mcp.McpServer(_py4jEntryPoint, token);
+            int mport = getModSettings().getMcpPort();
+            _mcpServer.start(mport);
+            Debug.logMessage("MCP server started on 0.0.0.0:" + mport + " (http://<lan-ip>:" + mport
+                    + "/mcp) — auth token in " + adris.altoclef.Settings.SETTINGS_PATH
+                    + " (mcpAuthToken), required as 'Authorization: Bearer <token>'");
+        } catch (Exception e) {
+            Debug.logWarning("MCP server failed to start: " + e.getMessage());
+            _mcpServer = null;
+        }
+    }
+
+    public void stopPythonSender() {
+        if (_gatewayServer != null) _gatewayServer.shutdown();
+    }
+
+    public void reloadPythonSender() {
+        stopPythonSender();
+        _gatewayServer = null;
+        initializePythonSender();
+    }
+
+    public static String getSelfName() {
+        Minecraft client = Minecraft.getInstance();
+        if (client == null) return "";
+        if (client.getUser() != null) return client.getUser().getName();
+        if (client.player != null) return client.player.getName().getString();
+        return "";
+    }
+
+    /**
+     * Replaces the client session with a new one bearing a different username.
+     * Only works before connecting to a server.
+     */
+    public static boolean changePlayerName(String newUsername) {
+        if (newUsername == null || newUsername.isBlank()) {
+            Debug.logWarning("Cannot change username: empty");
+            return false;
+        }
+        Minecraft client = Minecraft.getInstance();
+        if (client == null || client.getUser() == null) {
+            Debug.logWarning("Cannot change username: no session");
+            return false;
+        }
+        try {
+            User cur = client.getUser();
+            // TODO [1.21.11] Session.getAccountType() removed — constructor changed
+            User next = new User(
+                    newUsername,
+                    cur.getProfileId(),
+                    cur.getAccessToken(),
+                    cur.getXuid(),
+                    cur.getClientId()
+            );
+            ((MinecraftClientSessionMixin) client).setSession(next);
+            Debug.logMessage("Username changed to: " + newUsername);
+            return true;
+        } catch (Exception e) {
+            Debug.logError("Failed to change username: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean looksLikeDefaultNick(String name) {
+        return name != null && name.matches("(?i)player\\d+");
+    }
+
+    private void tryRestoreNickname() {
+        String currentName = getSelfName();
+        if (settings == null) return;
+
+        if (!looksLikeDefaultNick(currentName)) {
+            // Good nick — remember it
+            if (!currentName.equals(settings.getLastNickname())) {
+                settings.setLastNickname(currentName);
+                ConfigHelper.saveConfig(adris.altoclef.Settings.SETTINGS_PATH, settings);
+                Debug.logMessage("Saved nickname: " + currentName);
+            }
+            return;
+        }
+        // Current nick is PlayerNNN — restore saved one
+        String last = settings.getLastNickname();
+        if (last != null && !last.isBlank() && !looksLikeDefaultNick(last)) {
+            Debug.logMessage("Detected default nick '" + currentName + "', restoring to: " + last);
+            changePlayerName(last);
+        }
+    }
+
+    // Are we in game (playing in a server/world)
+    public static boolean inGame() {
+        return Minecraft.getInstance().player != null && Minecraft.getInstance().getConnection() != null;
+    }
+
+    /**
+     * Executes commands (ex. `@get`/`@gamer`)
+     */
+    public static CommandExecutor getCommandExecutor() {
+        return commandExecutor;
+    }
+
+    @Override
+    public void onInitialize() {
+        // This code runs as soon as Minecraft is in a mod-load-ready state.
+        // However, some things (like resources) may still be uninitialized.
+        // As such, nothing will be loaded here but basic initialization.
+        EventBus.subscribe(TitleScreenEntryEvent.class, evt -> onInitializeLoad());
+
+        if (instance != null) {
+            throw new IllegalStateException("AltoClef already loaded!");
+        }
+        instance = this;
+    }
+
+    public void onInitializeLoad() {
+        // This code should be run after Minecraft loads everything else in.
+        // This is the actual start point, controlled by a mixin.
+
+        initializeBaritoneSettings();
+
+        // Central Managers
+        commandExecutor = new CommandExecutor(this);
+        taskRunner = new TaskRunner(this);
+        trackerManager = new TrackerManager(this);
+        botBehaviour = new BotBehaviour(this);
+        extraController = new PlayerExtraController(this);
+
+        // Task chains
+        new GameMenuTaskChain(taskRunner);
+        userTaskChain = new UserTaskChain(taskRunner);
+        mobDefenseChain = new MobDefenseChain(taskRunner);
+        new DeathMenuChain(taskRunner);
+        new PlayerInteractionFixChain(taskRunner);
+        mlgBucketChain = new MLGBucketFallChain(taskRunner);
+        new UnstuckChain(taskRunner);
+        new PreEquipItemChain(taskRunner);
+        worldSurvivalChain = new WorldSurvivalChain(taskRunner);
+        foodChain = new FoodChain(taskRunner);
+
+        // Trackers
+        storageTracker = new ItemStorageTracker(this, trackerManager, container -> containerSubTracker = container);
+        entityTracker = new EntityTracker(trackerManager);
+        blockScanner = new BlockScanner(this);
+        chunkTracker = new SimpleChunkTracker(this);
+        miscBlockTracker = new MiscBlockTracker(this);
+        craftingRecipeTracker = new CraftingRecipeTracker(trackerManager);
+        damageTracker = new DamageTracker(trackerManager);
+
+        // Renderers
+        commandStatusOverlay = new CommandStatusOverlay();
+        altoClefTickChart = new AltoClefTickChart(Minecraft.getInstance().font);
+
+        // Misc managers
+        messageSender = new MessageSender();
+        inputControls = new InputControls();
+        slotHandler = new SlotHandler(this);
+
+        butler = new Butler(this);
+
+        initializeCommands();
+
+        // Load settings
+        adris.altoclef.Settings.load(newSettings -> {
+            settings = newSettings;
+            // Tungsten narrates pathfinding to the chat HUD, which is expensive (glyph baking +
+            // reflow every frame) and noisy. Respect the SAME chat verbosity altoclef's own Debug
+            // uses: only "All" keeps tungsten's routine status lines on screen; they always still
+            // go to the console. Warnings/errors are unaffected.
+            kaptainwutax.tungsten.Debug.chatStatusEnabled = "All".equals(settings.getChatVerbosity());
+            // The arrow dodge is the bot's defence against skeletons and defaults to on, but an old
+            // settings file can carry false (issue #34). Say so on every load rather than let it
+            // pass for a broken dodge.
+            if (!settings.isDodgeProjectiles()) {
+                Debug.logWarning("dodgeProjectiles is false in " + adris.altoclef.Settings.SETTINGS_PATH
+                        + ": the bot will not sidestep arrows. Set it to true and @reload_settings.");
+            }
+            // Baritone's `acceptableThrowawayItems` should match our own.
+            List<Item> placeableThrowaways = Arrays.stream(settings.getThrowawayItems(true))
+                    .filter(item -> item != Items.SOUL_SAND && item != Items.MAGMA_BLOCK && item != Items.SAND && item
+                            != Items.GRAVEL).toList();
+            // G-0: the pathfinder that owned this list is gone, so altoclef owns it outright. The
+            // four defaults below came from that settings object -- dirt, cobblestone, netherrack,
+            // stone -- and the union with our own throwaways is what every reader wanted, so it is
+            // built here once instead of being read back out of a foreign type.
+            throwawayItems.clear();
+            throwawayItems.addAll(List.of(Blocks.DIRT.asItem(), Blocks.COBBLESTONE.asItem(),
+                    Blocks.NETHERRACK.asItem(), Blocks.STONE.asItem()));
+            throwawayItems.addAll(placeableThrowaways);
+            // ⛔ AND SNAPSHOT THE RESULT AS ALTOCLEF'S OWN (G-0b).
+            // Six places in this mod read the throwaway list back OUT of the pathfinder's settings
+            // object, which is how a list altoclef derives from its OWN settings ends up being
+            // owned by a foreign type. The union is what matters -- the pathfinder ships defaults
+            // (cobblestone, dirt, ...) and the line above adds ours -- so it is captured HERE, at
+            // the one moment both halves are present, rather than reconstructed by each reader.
+            // The write above stays: the pathfinder still needs the list to plan placements. What
+            // goes away is six READS of a foreign object model for data we produced.
+            // If we should run an idle command...
+            if ((!getUserTaskChain().isActive() || getUserTaskChain().isRunningIdleTask()) && getModSettings().shouldRunIdleCommandWhenNotActive()) {
+                getUserTaskChain().signalNextTaskToBeIdleTask();
+                getCommandExecutor().executeWithPrefix(getModSettings().getIdleCommand());
+            }
+            // Don't break blocks or place blocks where we are explicitly protected.
+            getExtraBaritoneSettings().avoidBlockBreak(blockPos -> settings.isPositionExplicitlyProtected(blockPos));
+            getExtraBaritoneSettings().avoidBlockPlace(blockPos -> settings.isPositionExplicitlyProtected(blockPos));
+            getExtraBaritoneSettings().getForceSaveToolPredicates().add((state, item) -> StorageHelper.shouldSaveStack(this, state.getBlock(), item));
+
+            // Auto-restore nickname if current name looks like PlayerNNN
+            tryRestoreNickname();
+
+            // Auto-connect to server if configured
+            if (settings.shouldAutoConnect() && !inGame()) {
+                String server = settings.getAutoConnectServer();
+                Debug.logMessage("Auto-connecting to server: " + server);
+                // Delay slightly to let the title screen settle
+                _postInitQueue.add(mod -> {
+                    if (taskRunner != null && taskRunner.gameMenuTaskChain != null) {
+                        taskRunner.gameMenuTaskChain.connectToServer(server);
+                    }
+                });
+            }
+
+            // Initialize Python sender after settings are loaded (needs getPythonGatewayPort())
+            initializePythonSender();
+        });
+
+        // Forward incoming server chat/game messages through Butler
+        // (server detection, chatType, autoJoin, strong/weak py4j forwarding)
+        String _modChatPrefixNoCodes = getModSettings().getChatLogPrefix();
+        ClientReceiveMessageEvents.ALLOW_CHAT.register((message, signedMessage, sender, params, receptionTimestamp) -> {
+            String msg = message.getString();
+            if (getInfoSender() != null) getInfoSender().recordChat(msg);
+            if (!msg.startsWith(_modChatPrefixNoCodes) && getButler() != null)
+                getButler().onReceiveChat(msg);
+            return true;
+        });
+        ClientReceiveMessageEvents.ALLOW_GAME.register((message, overlay) -> {
+            if (!overlay) {
+                String msg = message.getString();
+                // RECORD FIRST, FILTER SECOND. The filter exists so Butler does not parse the
+                // bot's own log lines as server chat; it must not also blind the chat ring, which
+                // is the only channel a test has for seeing the mod's own errors.
+                if (getInfoSender() != null) getInfoSender().recordChat(msg);
+                if (!msg.contains(_modChatPrefixNoCodes) && getButler() != null)
+                    getButler().onReceiveChat(msg);
+            }
+            return true;
+        });
+
+        // Receive + cancel chat
+        EventBus.subscribe(SendChatEvent.class, evt -> {
+            String line = evt.message;
+            // `@@` WorldEdit command handler (user 2026-07-24) — `@@` distances the many WE
+            // commands from the main `@` altoclef commands (mirrors WorldEdit's `//`) and dodges
+            // the `@set` clash. Checked BEFORE the `@` dispatch. Read the player / crosshair block
+            // HERE on the client thread (safe), then run the handler OFF-thread so the worldedit
+            // primitives' onClientThread marshalling doesn't deadlock the client.
+            if (line.startsWith("@@")) {
+                evt.cancel();
+                final String weCmd = line.substring(2).strip();
+                net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+                int[] pb = null, cb = null;
+                if (mc.player != null) {
+                    net.minecraft.core.BlockPos p = mc.player.blockPosition();
+                    pb = new int[]{p.getX(), p.getY(), p.getZ()};
+                }
+                if (mc.hitResult instanceof net.minecraft.world.phys.BlockHitResult bhr
+                        && mc.hitResult.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK) {
+                    net.minecraft.core.BlockPos p = bhr.getBlockPos();
+                    cb = new int[]{p.getX(), p.getY(), p.getZ()};
+                }
+                final int[] fpb = pb, fcb = cb;
+                new Thread(() -> adris.altoclef.commands.worldedit.WorldEditCommands.handle(this, weCmd, fpb, fcb),
+                        "we-cmd").start();
+                return;
+            }
+            if (getCommandExecutor().isClientCommand(line)) {
+                evt.cancel();
+                getCommandExecutor().execute(line);
+            }
+        });
+
+        // Tick with the client
+        EventBus.subscribe(ClientTickEvent.class, evt -> {
+            long nanos = System.nanoTime();
+            onClientTick();
+            altoClefTickChart.pushTickNanos(System.nanoTime()-nanos);
+        });
+        net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK
+                .register(client -> adris.altoclef.tasksystem.TaskMovementTrace.tick());
+
+        // Render
+        EventBus.subscribe(ClientRenderEvent.class, evt -> onClientRenderOverlay(evt.context));
+
+        // Track attempted breaks. General world-change events cannot identify a
+        // failed player placement; placement executors own their refusal handling.
+        EventBus.subscribe(BlockBrokenEvent.class, evt -> worldSurvivalChain.onBlockBroken(this, evt.blockPos, evt.blockState, evt.player));
+
+        // Projectile detection — instant reaction to incoming arrows
+        EventBus.subscribe(adris.altoclef.eventbus.events.multiplayer.ProjectileEvent.class, evt ->
+                getMobDefenseChain().onProjectileLaunched(this, evt.entity, evt.sticked));
+
+        // Item use detection — detect players aiming bows (disabled in MobDefenseChain for now)
+        EventBus.subscribe(adris.altoclef.eventbus.events.multiplayer.ItemUseEvent.class, evt ->
+                getMobDefenseChain().onPlayerItemUse(this, evt.entity, evt.released));
+
+        // AUTO-ACCEPT server resource-pack prompts (operator 2026-06-21): some servers (fdmc.pw) push a
+        // REQUIRED resource pack with a "this server requires a resource pack — decline = DISCONNECT" screen.
+        // A headless bot would sit on it / get kicked. When that ConfirmScreen opens, click YES automatically.
+        EventBus.subscribe(adris.altoclef.eventbus.events.ScreenOpenEvent.class, evt -> {
+            if (evt.preOpen) return;
+            net.minecraft.client.gui.screens.Screen s = evt.screen;
+            if (!(s instanceof net.minecraft.client.gui.screens.ConfirmScreen)) return;
+            String t = s.getTitle().getString().toLowerCase();
+            if (t.contains("resource pack") || t.contains("texture")
+                    // ru client title text: "ресурс" / "набор ресурс" = "resource" / "resource pack".
+                    || t.contains("ресурс") || t.contains("набор ресурс")) {
+                try {
+                    it.unimi.dsi.fastutil.booleans.BooleanConsumer cb =
+                            ((adris.altoclef.mixins.ConfirmScreenAccessor) s).getCallback();
+                    if (cb != null) {
+                        Debug.logMessage("Auto-accepting server resource-pack prompt.");
+                        cb.accept(true);
+                    }
+                } catch (Throwable e) {
+                    Debug.logWarning("RP auto-accept failed: " + e.getMessage());
+                }
+            }
+        });
+
+        // Playground
+        Playground.IDLE_TEST_INIT_FUNCTION(this);
+
+        // Tasks
+        TaskCatalogue.init();
+
+        // G-0: nothing dispatches tab-complete events now; ChatInputSuggestorMixin calls
+        // TabCompleter.complete() directly.
+
+        // Tungsten need-fulfiller, stage 1 (docs/features/TUNGSTEN_ALTOCLEF_API.md):
+        // when the tungsten executor mines a block, equip the best tool for it.
+        // Runs on the client thread (tungsten calls it from its mining tick).
+        kaptainwutax.tungsten.TungstenModDataContainer.equipToolHook = (pos, state) -> {
+            try {
+                if (getFoodChain().isTryingToEat()) return;
+                java.util.Optional<adris.altoclef.util.slots.Slot> best =
+                        adris.altoclef.util.helpers.StorageHelper.getBestToolSlot(this, state);
+                if (best.isEmpty()) return;
+                adris.altoclef.util.slots.Slot current = adris.altoclef.util.slots.PlayerSlot.getEquipSlot();
+                net.minecraft.world.item.Item bestItem =
+                        adris.altoclef.util.helpers.StorageHelper.getItemStackInSlot(best.get()).getItem();
+                if (adris.altoclef.util.helpers.StorageHelper.getItemStackInSlot(current).getItem() == bestItem) return;
+                getSlotHandler().forceEquipItem(bestItem);
+            } catch (Throwable t) {
+                // the hook must never break mining
+            }
+        };
+
+        // when the tungsten executor paves a planned bridge, equip a cheap build block
+        // into the main hand (mirror of equipToolHook for placing). Runs on the client
+        // thread from tickPlacing. Tungsten never touches the inventory itself.
+        kaptainwutax.tungsten.TungstenModDataContainer.canUseScaffoldHook =
+                stack -> !getBehaviour().isProtected(stack.getItem());
+
+        kaptainwutax.tungsten.TungstenModDataContainer.equipBlockHook = () -> {
+            try {
+                if (getPlayer() == null) return;
+                if (kaptainwutax.tungsten.helpers.BlockPlaceHelper.isScaffold(getPlayer().getMainHandItem())) return;
+                // ⛔ EIGHT NAMED BLOCKS WERE THE WHOLE RESTOCK (G62, 2026-09-12). Cobblestone, dirt,
+                // stone, netherrack, cobbled deepslate, OAK planks, deepslate, andesite -- so a bot in
+                // a spruce forest with a stack of spruce planks and logs in the pack was told "out
+                // of blocks" by every tower and bridge, while the planner had counted that same
+                // pack and priced the route on it. Two two-minute stands and a death in the 16:30
+                // recording. The restock now takes the cheapest scaffold anywhere in the pack by
+                // the same predicate and rank the tungsten side uses (BlockPlaceHelper.isScaffold /
+                // scaffoldRank): rubble first, then planks, then logs, then the rest.
+                net.minecraft.world.item.Item best = null;
+                int bestRank = Integer.MAX_VALUE;
+                for (net.minecraft.world.item.ItemStack st : getItemStorage().getItemStacksPlayerInventory(false)) {
+                    if (!kaptainwutax.tungsten.helpers.BlockPlaceHelper.isScaffold(st)) continue;
+                    int r = kaptainwutax.tungsten.helpers.BlockPlaceHelper.scaffoldRank(st);
+                    if (r < bestRank) { bestRank = r; best = st.getItem(); }
+                }
+                if (best != null) getSlotHandler().forceEquipItem(best);
+            } catch (Throwable t) {
+                // the hook must never break placing
+            }
+        };
+
+        // Tungsten protection hook: altoclef's break-avoiders (bed protection,
+        // task-scoped avoid lists, protected zones) are the single source of
+        // truth for "may we mine this" — bridge them into tungsten BreakRules.
+        kaptainwutax.tungsten.TungstenModDataContainer.canBreakHook = pos -> {
+            try {
+                // ⛔ OPEN A DOOR, DO NOT MINE IT — BUT THE RULE NO LONGER LIVES HERE.
+                //
+                // It is registered as a break-avoider in initializeBaritoneSettings(), which is
+                // consulted by every break path (the mining task's canClear, its target checks, and
+                // this hook). Keeping a second copy here is how the two drifted apart in the first
+                // place: this hook is a TUNGSTEN planner input, and while the engine is Baritone
+                // nothing reads it — so the copy that mattered was the avoider's, not this one's.
+                return !getExtraBaritoneSettings().shouldAvoidBreaking(pos);
+            } catch (Throwable t) {
+                return true; // protection lookup failure must not freeze pathing
+            }
+        };
+        // Symmetric place-protection: altoclef's place-avoiders / protected zones
+        // are the single source of truth for "may we build here" — bridge them
+        // into tungsten PlaceRules (bridge/fill/build/schematic all honour it).
+        kaptainwutax.tungsten.TungstenModDataContainer.canPlaceHook = pos -> {
+            try {
+                return !getExtraBaritoneSettings().shouldAvoidPlacingAt(pos);
+            } catch (Throwable t) {
+                return true; // protection lookup failure must not freeze building
+            }
+        };
+
+        // Best-owned-tool pricing hook (docs/BARITONE-GAPS.md G8): the planner can only ever see
+        // the item in the main hand at search time, which is only correct at execution. Answer
+        // with the same "best tool anywhere in the pack" lookup the equip step itself already
+        // uses (StorageHelper.getBestToolSlot), so a route to reachable ore is never refused just
+        // because a sword happens to be in hand, and a stone axe in the pack prices in instead of
+        // whatever is held. Called from the planner's own background search thread; StorageHelper
+        // reads live inventory the same way every other per-node lookup in that planner already
+        // reads live world state, and tungsten caches the answer per search (MovementHelperB).
+        kaptainwutax.tungsten.TungstenModDataContainer.bestToolSpeedHook = state -> {
+            try {
+                var bestSlot = adris.altoclef.util.helpers.StorageHelper.getBestToolSlot(this, state);
+                if (bestSlot.isEmpty()) return -1;
+                net.minecraft.world.item.ItemStack stack =
+                        adris.altoclef.util.helpers.StorageHelper.getItemStackInSlot(bestSlot.get());
+                return adris.altoclef.util.helpers.ItemHelper.miningSpeedVsBlock(stack, state);
+            } catch (Throwable t) {
+                return -1; // a broken hook must never freeze pathing -- fall back to the held item
+            }
+        };
+
+        // External mod initialization
+        runEnqueuedPostInits();
+    }
+
+    // Client tick
+    private void onClientTick() {
+        runEnqueuedPostInits();
+
+        inputControls.onTickPre();
+
+        // Cancel shortcut
+        if (InputHelper.isKeyPressed(InputConstants.KEY_LCONTROL) && InputHelper.isKeyPressed(InputConstants.KEY_K)) {
+            stopTasks();
+        }
+
+        // TODO: should this go here?
+        storageTracker.setDirty();
+        containerSubTracker.onServerTick();
+        miscBlockTracker.tick();
+        trackerManager.tick();
+        blockScanner.tick();
+        damageTracker.tick();
+        adris.altoclef.chains.MobDefenseChain.tickDamageLedger(this);
+        kaptainwutax.tungsten.combat.WeaponSelector.reassertSlotAfterRespawn(getPlayer());
+        kaptainwutax.tungsten.combat.WeaponSelector.noticeStrayAttacks(getPlayer());
+        // Nav.tickEngineOverlap() REMOVED with the engine it measured (G-0).
+        adris.altoclef.control.Nav.tickOreVisibility();
+        adris.altoclef.util.helpers.TungstenHelper.tickLockAnatomy();
+        taskRunner.tick();
+
+        if (taskRunner.gameMenuTaskChain != null) {
+            taskRunner.gameMenuTaskChain.onTickPost(this);
+        }
+
+        messageSender.tick();
+
+        inputControls.onTickPost();
+    }
+
+    public void stopTasks() {
+        if (userTaskChain != null) {
+            userTaskChain.cancel(this);
+        }
+        if (taskRunner.getCurrentTaskChain() != null) {
+            taskRunner.getCurrentTaskChain().stop();
+        }
+        // "Stop all automation" has never included the thing walking the body. This method cancels
+        // the CHAIN and has never spoken to a pathfinder, so `@stop` left whatever route was in
+        // flight steering the bot -- which is why the bench has to send `;stop` separately after
+        // every `@stop`, a workaround for a gap rather than a second concern.
+        adris.altoclef.control.Nav.cancelAll();
+        commandStatusOverlay.resetTimer();
+    }
+
+    /// GETTERS AND SETTERS
+
+    private void onClientRenderOverlay(DrawContextWrapper context) {
+        context.setRenderLayer(RenderLayerVer.getGuiOverlay());
+
+        float scale = settings.getOverlayTextScale();
+        boolean scaled = scale != 1.0f;
+        if (scaled) {
+            context.getMatrices().pushMatrix();
+            context.getMatrices().scale(scale, scale);
+        }
+
+        if (settings.shouldShowTaskChain()) {
+            commandStatusOverlay.render(this, context);
+        }
+
+        if (settings.shouldShowDebugTickMs()) {
+            altoClefTickChart.render(this, context, 1, context.getScaledWindowWidth() / 2 - 124);
+        }
+
+        if (scaled) {
+            context.getMatrices().popMatrix();
+        }
+
+        if (inGame()) {
+            LookHelper.updateWindMouseRotation(this);
+            // Baritone ships able to face where it walks and to ease its turns; switch both on the
+            // first tick of every world. See BaritoneBridge.applyOptimalSettings.
+            adris.altoclef.control.BaritoneBridge.tick();
+        }
+    }
+
+    private void initializeBaritoneSettings() {
+        // G-0: every getClientBaritoneSettings() line that stood here configured the LEGACY
+        // pathfinder's cost model -- parkour, diagonals, blocks to avoid, free look. That
+        // pathfinder is deleted; tungsten has its own config. What survives is the part that
+        // was always altoclef's: what not to break, and what may be placed.
+        getExtraBaritoneSettings().canWalkOnEndPortal(false);
+
+        // dont try to break nether portal block
+        avoidBreaking(Blocks.NETHER_PORTAL);
+
+        // ⛔ A DOOR IS OPENED, NEVER MINED — AND THIS IS THE PLACE THAT MAKES IT TRUE EVERYWHERE.
+        //
+        // The rule used to live in the TUNGSTEN planner hook (canBreakHook) and nowhere else. That
+        // was enough while tungsten drove, and it is not any more: the engine is Baritone, so
+        // nothing consulted the hook, and the only door rule left was the client-side refusal of the
+        // swing. Measured consequence, reported by the operator: "it opens the door and then starts
+        // mining the door". DestroyBlockTask picks the block that BLOCKS its reach ray and asks
+        // canClear() whether it may remove it; canClear defers to shouldAvoidBreaking(); that did not
+        // know about doors, so it answered YES, the task aimed at the door and held attack — and the
+        // client-side refusal then stopped the break landing, leaving the bot swinging at a door it
+        // can never break, for ever.
+        //
+        // Registered as a break-AVOIDER, which is altoclef's own extension point (the same list
+        // bed protection and task-scoped avoid lists use), so every consumer sees it: the mining
+        // task's canClear, its own target checks, and the tungsten hook, which now delegates here
+        // instead of keeping a second copy of the rule.
+        //
+        // With a door unavailable, DestroyBlockTask does what its own design comment already says it
+        // should: "The answer there is to MOVE so the line opens, not to dig" — it repositions, and
+        // Baritone walks it through the doorway it just opened.
+        //
+        // IRON DOORS STAY BREAKABLE: no hand can open one, and the pathfinder will not walk through
+        // it either, so refusing the swing there only walls the bot out.
+        getExtraBaritoneSettings().avoidBlockBreak(pos -> {
+            var world = getWorld();
+            if (world == null) return false;
+            var block = world.getBlockState(pos).getBlock();
+            if (block instanceof net.minecraft.world.level.block.FenceGateBlock) return true;
+            return block instanceof net.minecraft.world.level.block.DoorBlock
+                    && block != Blocks.IRON_DOOR;
+        });
+
+        // Let baritone move items to hotbar to use them
+        // Reduces a bit of far rendering to save FPS
+        // Don't let baritone scan dropped items, we handle that ourselves.
+        // Don't let baritone wait for drops, we handle that ourselves.
+
+        // Water bucket placement will be handled by us exclusively
+        getExtraBaritoneSettings().configurePlaceBucketButDontFall(true);
+
+        // For render smoothing
+
+        // Give baritone more time to calculate paths. Sometimes they can be really far away.
+        // Was: 2000L
+        // Was: 5000L
+        // Was 100
+    }
+
+    // List all command sources here.
+    private void initializeCommands() {
+        try {
+            // This creates the commands. If you want any more commands feel free to initialize new command lists.
+            AltoClefCommands.init();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    // TODO refactor codebase to use this instead of passing an argument around
+    /**
+     * @return the instance of this class or null if it has not been initialized yet
+     */
+    public static AltoClef getInstance() {
+        return instance;
+    }
+
+    /**
+     * Runs the highest priority task chain
+     * (task chains run the task tree)
+     */
+    public TaskRunner getTaskRunner() {
+        return taskRunner;
+    }
+
+    /**
+     * The user task chain (runs your command. Ex. Get Diamonds, Beat the Game)
+     */
+    public UserTaskChain getUserTaskChain() {
+        return userTaskChain;
+    }
+
+    /**
+     * Controls bot behaviours, like whether to temporarily "protect" certain blocks or items
+     */
+    public BotBehaviour getBehaviour() {
+        return botBehaviour;
+    }
+
+    /**
+     * Controls tasks, for pausing and unpausing the bot
+     */
+    public boolean isPaused() {
+        return paused;
+    }
+
+    public void setPaused(boolean pausing) {
+        this.paused = pausing;
+    }
+
+    /**
+     * storages the task you where doing before pausing.
+     */
+    public void setStoredTask(Task currentTask) {
+        this.storedTask = currentTask;
+    }
+
+    /**
+     * Gets the task you where doing before pausing.
+     */
+    public Task getStoredTask() {
+        return storedTask;
+    }
+
+    // --- Task timeout ---
+    /** Enable task timeout with default duration (60s). */
+    public void setTimeoutTaskFlag(boolean active) {
+        _timeoutActive = active;
+        _timeoutDuration = 60;
+        _timeoutStartMs = System.currentTimeMillis();
+    }
+
+    /** Enable task timeout with a specific duration in seconds. */
+    public void setTimeoutTask(float seconds) {
+        _timeoutActive = true;
+        _timeoutDuration = seconds;
+        _timeoutStartMs = System.currentTimeMillis();
+    }
+
+    /**
+     * Returns true (and clears the flag) if a timeout was active and has elapsed.
+     * Called from UserTaskChain each tick.
+     */
+    public boolean checkAndClearTimeout() {
+        if (!_timeoutActive) return false;
+        float elapsed = (System.currentTimeMillis() - _timeoutStartMs) / 1000f;
+        if (elapsed >= _timeoutDuration) {
+            _timeoutActive = false;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Tracks items in your inventory and in storage containers.
+     */
+    public ItemStorageTracker getItemStorage() {
+        return storageTracker;
+    }
+
+    /**
+     * Tracks loaded entities
+     */
+    public EntityTracker getEntityTracker() {
+        return entityTracker;
+    }
+
+    /**
+     * Manages a list of all available recipes
+     */
+    public CraftingRecipeTracker getCraftingRecipeTracker() {
+        return craftingRecipeTracker;
+    }
+
+    /**
+     * Tracks blocks and their positions - better version of BlockTracker
+     */
+    public BlockScanner getBlockScanner() {
+        return blockScanner;
+    }
+
+    /**
+     * Tracks of whether a chunk is loaded/visible or not
+     */
+    public SimpleChunkTracker getChunkTracker() {
+        return chunkTracker;
+    }
+
+    /**
+     * Tracks random block things, like the last nether portal we used
+     */
+    public MiscBlockTracker getMiscBlockTracker() {
+        return miscBlockTracker;
+    }
+
+    // getClientBaritone() REMOVED (G-0, 2026-08-24): there is no second engine to hand
+    // the body to. Tungsten is the only one, and it is reached through TungstenHelper.
+
+
+
+    // getClientBaritoneSettings() REMOVED (G-0): it returned the deleted pathfinder's
+    // tuning object. Its only surviving reader was the throwaway list, which altoclef
+    // now owns outright.
+
+
+    /**
+     * Baritone settings special to AltoClef (could just be static honestly)
+     */
+    public AltoClefSettings getExtraBaritoneSettings() {
+        return AltoClefSettings.getInstance();
+    }
+
+    /**
+     * AltoClef Settings
+     */
+    public adris.altoclef.Settings getModSettings() {
+        return settings;
+    }
+
+    /**
+     * Butler controller. Keeps track of users and lets you receive user messages
+     */
+    public Butler getButler() {
+        return butler;
+    }
+
+    /**
+     * Sends chat messages (avoids auto-kicking)
+     */
+    public MessageSender getMessageSender() {
+        return messageSender;
+    }
+
+    /**
+     * Does Inventory/container slot actions
+     */
+    public SlotHandler getSlotHandler() {
+        return slotHandler;
+    }
+
+    /**
+     * Minecraft player client access (could just be static honestly)
+     */
+    /**
+     * Items this bot is willing to place and lose — altoclef's own list, snapshotted at load.
+     *
+     * <p>The union of the pathfinder's shipped defaults and the throwaways altoclef derives from
+     * its settings, taken at the moment both are present. A snapshot rather than a live view
+     * because there is exactly one writer, in the settings-load callback; if a second appears this
+     * has to become a re-read, and that is the thing to check first if the list ever looks stale.
+     */
+    private final List<Item> throwawayItems = new ArrayList<>();
+
+    /**
+     * Protect blocks from the pathfinder's pick — and let them go again (G-0b).
+     *
+     * <p>Eleven call sites reached into {@code getClientBaritoneSettings().blocksToAvoidBreaking
+     * .value} to add or remove a block, which is altoclef's OWN policy stored in, and mutated
+     * through, a foreign object model. Every one of them is a WRITE; nothing ever read the list
+     * back. So the port is an encapsulation rather than a data move: one seam instead of eleven,
+     * and when the pathfinder behind it is replaced only this method changes.
+     *
+     * <p>Pairs of add/remove across a task's lifetime are exactly the shape that drifts. It already
+     * had: ConstructGraveTask protected COBBLESTONE_SLAB and released STONE_SLAB, so the slab it
+     * actually added was never released and the pathfinder refused to break cobblestone slabs for
+     * the rest of the session.
+     */
+    /**
+     * Blocks the bot must not break, and blocks it must not route through (G-0, 2026-08-24).
+     *
+     * <p>These four setters are altoclef's own API -- avoidBreaking, allowBreaking,
+     * avoidWalkingThrough, allowWalkingThrough -- and they used to write into the deleted
+     * pathfinder's settings object, which is where the lists happened to live. The API stays; the
+     * storage comes home.
+     *
+     * <p>Read them through {@link #shouldAvoidBreaking} and {@link #shouldAvoidWalkingThrough},
+     * which is what WorldHelper.canBreak and tungsten's move generation consult.
+     */
+    private final java.util.Set<Block> blocksToAvoidBreaking = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.Set<Block> blocksToAvoidWalkingThrough = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private volatile boolean avoidUpdatingFallingBlocks = false;
+
+    /** Is this block one the bot has been told not to break? */
+    public boolean shouldAvoidBreaking(Block b) {
+        return blocksToAvoidBreaking.contains(b);
+    }
+
+    /** Is this block one the bot has been told not to route through? */
+    public boolean shouldAvoidWalkingThrough(Block b) {
+        return blocksToAvoidWalkingThrough.contains(b);
+    }
+
+    /** Should gravel and sand be left alone? Bucket work turns this on. */
+    public boolean shouldAvoidUpdatingFallingBlocks() {
+        return avoidUpdatingFallingBlocks;
+    }
+
+    public void avoidBreaking(Block... blocks) {
+        blocksToAvoidBreaking.addAll(Arrays.asList(blocks));
+    }
+
+    /** Release blocks protected by {@link #avoidBreaking}. Pass exactly what was passed there. */
+    public void allowBreaking(Block... blocks) {
+        blocksToAvoidBreaking.removeAll(Arrays.asList(blocks));
+    }
+
+    /** Keep the pathfinder from routing THROUGH these blocks, and let them go again. */
+    public void avoidWalkingThrough(Block... blocks) {
+        blocksToAvoidWalkingThrough.addAll(Arrays.asList(blocks));
+    }
+
+    /** Undo {@link #avoidWalkingThrough}. */
+    public void allowWalkingThrough(Block... blocks) {
+        blocksToAvoidWalkingThrough.removeAll(Arrays.asList(blocks));
+    }
+
+    /** Whether the pathfinder should leave gravel and sand alone (bucket work turns this on). */
+    public void setAvoidUpdatingFallingBlocks(boolean avoid) {
+        avoidUpdatingFallingBlocks = avoid;
+    }
+
+    /** @return items safe to place and abandon — see {@link #throwawayItems}. Never null. */
+    public List<Item> getThrowawayItems() {
+        return throwawayItems;
+    }
+
+    public LocalPlayer getPlayer() {
+        return Minecraft.getInstance().player;
+    }
+
+    /**
+     * Minecraft world access (could just be static honestly)
+     */
+    public ClientLevel getWorld() {
+        return Minecraft.getInstance().level;
+    }
+
+    /**
+     * Minecraft client interaction controller access (could just be static honestly)
+     */
+    public MultiPlayerGameMode getController() {
+        return Minecraft.getInstance().gameMode;
+    }
+
+    /**
+     * Extra controls not present in ClientPlayerInteractionManager. This REALLY should be made static or combined with something else.
+     */
+    public PlayerExtraController getControllerExtras() {
+        return extraController;
+    }
+
+    /**
+     * Manual control over input actions (ex. jumping, attacking)
+     */
+    public InputControls getInputControls() {
+        return inputControls;
+    }
+
+    /**
+     * Run a user task
+     */
+    public void runUserTask(Task task) {
+        runUserTask(task, () -> {
+        });
+    }
+
+    /**
+     * Run a user task
+     */
+    public void runUserTask(Task task, Runnable onFinish) {
+        userTaskChain.runTask(this, task, onFinish);
+    }
+
+    /**
+     * Cancel currently running user task
+     */
+    public void cancelUserTask() {
+        userTaskChain.cancel(this);
+    }
+
+    /**
+     * Takes control away to eat food
+     */
+    public FoodChain getFoodChain() {
+        return foodChain;
+    }
+
+    /**
+     * Takes control away to defend against mobs
+     */
+    public MobDefenseChain getMobDefenseChain() {
+        return mobDefenseChain;
+    }
+
+    /**
+     * Takes control away to perform bucket saves
+     */
+    public MLGBucketFallChain getMLGBucketChain() {
+        return mlgBucketChain;
+    }
+
+    public void log(String message) {
+        log(message, MessagePriority.TIMELY);
+    }
+
+    /**
+     * Logs to the console and also messages any player using the bot as a butler.
+     */
+    public void log(String message, MessagePriority priority) {
+        Debug.logMessage(message);
+        // ⛔ FIXED 2026-09-05: this method's own doc promises butler forwarding, but never called
+        // it -- Butler.onLog(String, MessagePriority) exists, is correctly implemented (forwards
+        // to sendWhisper only when a butler user is active, respecting priority), and had ZERO
+        // callers anywhere in the codebase (grepped the whole tree). A fully-built, correctly
+        // wired feature was simply never connected to the one method whose doc says it does this.
+        if (getButler() != null) getButler().onLog(message, priority);
+    }
+
+    public void logWarning(String message) {
+        logWarning(message, MessagePriority.TIMELY);
+    }
+
+    /**
+     * Logs a warning to the console and also alerts any player using the bot as a butler.
+     */
+    public void logWarning(String message, MessagePriority priority) {
+        Debug.logWarning(message);
+        // ⛔ FIXED 2026-09-05: same missing-wiring bug as log() above -- Butler.onLogWarning()
+        // exists and is correctly implemented, but nothing called it.
+        if (getButler() != null) getButler().onLogWarning(message, priority);
+    }
+
+    private void runEnqueuedPostInits() {
+        synchronized (_postInitQueue) {
+            while (!_postInitQueue.isEmpty()) {
+                _postInitQueue.poll().accept(this);
+            }
+        }
+    }
+
+}

@@ -89,6 +89,41 @@ supported, not something to avoid.
 
 ---
 
+## Antivirus — and verifying your download
+
+A mod that automates a player and writes inside your game directory gets flagged by heuristic
+scanners from time to time. This build is clean on VirusTotal:
+
+> ### ➡️ [VirusTotal report for `unionclef-0.97.0+26.3.jar`](https://www.virustotal.com/gui/file/e29615dfa6658cae2e29b8101521d047ff7babaac7b7738a1eeed04f0115e975/detection)
+
+**The hash is the point, not the badge.** That report is for one specific file, and here is that file's
+digest — which GitHub also publishes on the release asset:
+
+```
+SHA-256  e29615dfa6658cae2e29b8101521d047ff7babaac7b7738a1eeed04f0115e975
+```
+
+Check your download against it:
+
+```powershell
+Get-FileHash unionclef-0.97.0+26.3.jar -Algorithm SHA256     # Windows
+```
+```bash
+shasum -a 256 unionclef-0.97.0+26.3.jar                      # macOS / Linux
+```
+
+If it matches, you have the file that was scanned.
+
+> **What this is and is not.** A clean scan is *evidence, not a guarantee* — and it is only valid for
+> the exact file it was run on, so **this link covers 0.97.0 only**; a new version needs a new scan.
+> For the curious: the mod phones nothing home, downloads nothing, and writes only under
+> `<game dir>/altoclef/`. The two things scanners dislike about game mods are reading process memory
+> and writing files, which is exactly what a pathfinding bot has to do. The optional **Py4j** and
+> **MCP** bridges *do* open local network ports — they are **off by default** and must be enabled
+> deliberately (see [Automation bridges](#automation-bridges-advanced-optional)).
+
+---
+
 ## Usage
 
 ### Quick tasks — no commands needed

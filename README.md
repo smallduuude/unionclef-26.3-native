@@ -367,8 +367,10 @@ James Green, Marvion Kirito, MiranCZ, and 3ndetz. The 26.3 native port is mainta
 | [Cloth Config](https://github.com/shedaniel/cloth-config) | LGPL-3.0 | yes |
 | [Simple Voice Chat API](https://github.com/henkelmax/simple-voice-chat) | MIT (compile-time only) | no |
 
-Baritone is **not** redistributed here: it is neither bundled nor modified, only called through its
-documented API at runtime, so its licence obligations sit with your own Baritone installation.
+Baritone **is** redistributed here — unmodified, as a Fabric nested JAR — because it is a required
+dependency and a user should not have to go and find it. Its LGPL-3.0 licence travels with it at
+`META-INF/licenses/LGPL-3.0.txt`. You can replace it with your own copy in `mods/`: Fabric Loader
+resolves one version per mod id and prefers yours.
 
 Copyright © the UnionClef contributors. Released under the **GNU General Public License v3.0**
 (GPL-3.0-only) — see [`LICENSE`](LICENSE) for the full text. As required by the GPL, if you

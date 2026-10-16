@@ -14,11 +14,18 @@ nothing here is a bug report, and everything here is *not done*.
 
 ## 1. Release mechanics
 
-- [ ] **`git init` and publish.** The directory is not a git repo yet. Target:
-      `https://github.com/smallduuude/unionclef-26.3-native`.
-- [ ] **Tag and release.** Tag `v0.97.0`, attach `build/libs/unionclef-0.97.0+26.3.jar`, and use
-      `docs/releases/0.97.0.md` as the body. State the Baritone dependency and the tested build
-      (`baritone-api-fabric-1.20.0.jar`, 26.3) — see `docs/RELEASE.md`.
+**0.97.0 was published on 2026-10-16** —
+<https://github.com/smallduuude/unionclef-26.3-native/releases/tag/v0.97.0>
+
+- [x] ~~`git init` and publish~~ — done. `main` is live, local and remote in sync, and the repo has a
+      description, topics, wiki/projects off, issues on, and delete-branch-on-merge.
+- [x] ~~Tag and release~~ — done. Tag `v0.97.0` pushed, the 11.26 MB jar attached, and
+      `docs/releases/0.97.0.md` is the release body.
+- [ ] **Per release: re-scan the jar on VirusTotal, and update the hash.** The README and the release
+      body both carry a scan link **pinned to one file's SHA-256**. A new jar has a new hash, so a new
+      version needs a new scan and the new digest in *both* places — otherwise the link points at a
+      file nobody is downloading, which is worse than having no link at all. This is now a required
+      step in `docs/RELEASE.md`.
 - [ ] *(optional)* `CONTRIBUTING.md`. Not required for a release.
 
 ## 2. Verification — the biggest gap by far

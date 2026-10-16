@@ -12,6 +12,8 @@ Start with the [project README](../README.md) for installation and usage.
 
 - [../TODOS.md](../TODOS.md) — what is deliberately not done yet: item-coverage gaps, the
   verification pass, chain work, and the things decided against
+- [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) — bundled and runtime dependencies, and the
+  licences they carry
 
 ## Features
 

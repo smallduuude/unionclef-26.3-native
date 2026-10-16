@@ -51,7 +51,12 @@ build/libs/unionclef-<mod_version>+26.3.jar
    LGPL-3.0, shipped at `META-INF/licenses/LGPL-3.0.txt`). `docs/releases/0.97.0.md` is the worked
    example — copy its opening section.
 
-5. **Verify.** Download the uploaded asset and confirm its `fabric.mod.json` reports the right
+5. **Re-scan and re-pin the VirusTotal hash.** The README and the release body both carry a scan link
+   pinned to one specific file's SHA-256. Run the new jar through VirusTotal, then update the link
+   **and the digest** in `README.md` and in the release notes. A link pinned to the previous build is
+   worse than no link: it invites a user to verify a file they are not downloading.
+
+6. **Verify.** Download the uploaded asset and confirm its `fabric.mod.json` reports the right
    version and `license`, then install it in a test instance and launch.
 
 ## What ships in the jar

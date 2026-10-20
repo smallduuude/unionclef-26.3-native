@@ -22,7 +22,7 @@ import net.minecraft.world.entity.AreaEffectCloud;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.boss.enderdragon.EndCrystal;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
-import net.minecraft.world.entity.monster.Enderman;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.entity.projectile.hurtingprojectile.DragonFireball;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.phys.BlockHitResult;
@@ -79,8 +79,8 @@ public class WaitForDragonAndPearlTask extends Task {
     protected Task onTick() {
         AltoClef mod = AltoClef.getInstance();
 
-        Optional<Entity> enderMen = mod.getEntityTracker().getClosestEntity(Enderman.class);
-        if (enderMen.isPresent() && (enderMen.get() instanceof Enderman endermanEntity) &&
+        Optional<Entity> enderMen = mod.getEntityTracker().getClosestEntity(EnderMan.class);
+        if (enderMen.isPresent() && (enderMen.get() instanceof EnderMan endermanEntity) &&
                 endermanEntity.getTarget()==mod.getPlayer()) {
             setDebugState("Killing angry endermen");
             Predicate<Entity> angry = entity -> endermanEntity.getTarget()==mod.getPlayer();

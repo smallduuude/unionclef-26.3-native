@@ -36,7 +36,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Vec3i;
 import net.minecraft.tags.EnchantmentTags;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.entity.monster.Enderman;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.entity.monster.Silverfish;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -761,8 +761,8 @@ public class BeatMinecraft2Task extends Task {
             }
             return new TradeWithPiglinsTask(32, Items.ENDER_PEARL, count);
         } else {
-            if (mod.getEntityTracker().entityFound(Enderman.class) || mod.getEntityTracker().itemDropped(Items.ENDER_PEARL)) {
-                return new KillAndLootTask(Enderman.class, new ItemTarget(Items.ENDER_PEARL, count));
+            if (mod.getEntityTracker().entityFound(EnderMan.class) || mod.getEntityTracker().itemDropped(Items.ENDER_PEARL)) {
+                return new KillAndLootTask(EnderMan.class, new ItemTarget(Items.ENDER_PEARL, count));
             }
             // Search for warped forests this way...
             return new SearchChunkForBlockTask(Blocks.WARPED_NYLIUM);

@@ -15,7 +15,7 @@ mod_version=0.97.0
 `processResources` expands `${version}` into `fabric.mod.json`. The output jar is therefore:
 
 ```
-build/libs/unionclef-<mod_version>+26.3.jar
+build/libs/unionclef-<mod_version>+26.2.jar
 ```
 
 ## Release checklist
@@ -32,7 +32,7 @@ build/libs/unionclef-<mod_version>+26.3.jar
    ./gradlew clean build
    ```
 
-   Confirm `BUILD SUCCESSFUL` and that `build/libs/unionclef-<mod_version>+26.3.jar` exists.
+   Confirm `BUILD SUCCESSFUL` and that `build/libs/unionclef-<mod_version>+26.2.jar` exists.
 
 4. **Publish.** Create a GitHub release tagged `v<mod_version>` and attach the jar (there is only one
    jar — the sources/dev variants are not produced). Paste `docs/releases/<mod_version>.md` as the
@@ -47,7 +47,7 @@ build/libs/unionclef-<mod_version>+26.3.jar
    - and the note that a player who already has Baritone in `mods/` keeps theirs — Fabric Loader
      resolves one version per mod id, so their copy takes priority.
 
-   Name the bundled build and its licence each time (0.97.0: `baritone-api-fabric-1.20.0.jar`,
+   Name the bundled build and its licence each time (0.97.0: `baritone-api-fabric-1.19.0.jar`,
    LGPL-3.0, shipped at `META-INF/licenses/LGPL-3.0.txt`). `docs/releases/0.97.0.md` is the worked
    example — copy its opening section.
 
@@ -66,7 +66,7 @@ The jar is a self-contained Fabric jar-in-jar bundle — users install **one fil
 - UnionClef (altoclef) classes
 - tungsten — the fallback pathfinder, and the aim/combat engine (the `:tungsten` subproject)
 - **Baritone** — the movement engine, bundled as a Fabric nested JAR
-  (`META-INF/jars/baritone-api-fabric-1.20.0.jar`), unmodified
+  (`META-INF/jars/baritone-api-fabric-1.19.0.jar`), unmodified
 - the Nether pathfinder
 - Jackson (core / annotations / databind)
 - Py4j

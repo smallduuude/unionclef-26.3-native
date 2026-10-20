@@ -202,8 +202,8 @@ public class ProjectileProtectionWallTask extends Task implements ITaskRequiresG
 
         InteractionResult result = mod.getController().useItemOn(mod.getPlayer(),hand, blockHitResult);
 
-        if (result instanceof InteractionResult.Success success && success.swingSource() == InteractionResult.SwingSource.PREDICTED) {
-            mod.getPlayer().swing(hand, SwingAnimation.DEFAULT, false);
+        if (result instanceof InteractionResult.Success success && success.swingSource() == InteractionResult.SwingSource.CLIENT) {
+            mod.getPlayer().swing(hand, false);
         }
 
         net.minecraft.world.entity.player.Input postInput = clientInput.keyPresses;

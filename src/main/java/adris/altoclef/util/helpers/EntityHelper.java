@@ -10,7 +10,7 @@ import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
-import net.minecraft.world.entity.monster.Enderman;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.monster.cubemob.Slime;
@@ -44,7 +44,7 @@ public class EntityHelper {
             if (mob instanceof Piglin piglin) {
                 return piglin.isAggressive() && !isTradingPiglin(mob) && piglin.isAdult();
             }
-            if (mob instanceof Enderman enderman) {
+            if (mob instanceof EnderMan enderman) {
                 return enderman.isCreepy();
             }
             if (mob instanceof ZombifiedPiglin zombifiedPiglin) {

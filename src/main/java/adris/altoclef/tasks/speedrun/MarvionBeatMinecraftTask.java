@@ -29,7 +29,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.animal.pig.Pig;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.entity.monster.Enderman;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.entity.monster.Silverfish;
 import net.minecraft.world.entity.monster.Witch;
 import net.minecraft.world.entity.monster.illager.Pillager;
@@ -1350,12 +1350,12 @@ public class MarvionBeatMinecraftTask extends Task {
             return new TradeWithPiglinsTask(32, Items.ENDER_PEARL, count);
         }
 
-        boolean endermanFound = mod.getEntityTracker().entityFound(Enderman.class);
+        boolean endermanFound = mod.getEntityTracker().entityFound(EnderMan.class);
         boolean pearlDropped = mod.getEntityTracker().itemDropped(Items.ENDER_PEARL);
         boolean hasTwistingVines = mod.getItemStorage().getItemCount(Items.TWISTING_VINES) > TWISTING_VINES_COUNT_MIN;
 
         if ((endermanFound || pearlDropped) && hasTwistingVines) {
-            Optional<Entity> toKill = mod.getEntityTracker().getClosestEntity(Enderman.class);
+            Optional<Entity> toKill = mod.getEntityTracker().getClosestEntity(EnderMan.class);
             if (toKill.isPresent()) {
                 return new KillEndermanTask(count);
             }

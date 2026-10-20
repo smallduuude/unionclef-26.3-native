@@ -10,7 +10,7 @@
 >
 > **➡️ [Open a bug report or a feature request](../../issues/new/choose)**
 
-**A chat-driven automation bot for Minecraft 26.3 (Fabric).** Type `@help` in chat and a
+**A chat-driven automation bot for Minecraft 26.2 (Fabric).** Type `@help` in chat and a
 computer plays the game for you — mining, crafting, fighting, exploring, and beating the game.
 
 UnionClef is the union of two things:
@@ -26,7 +26,7 @@ UnionClef is the union of two things:
 
 See [Choosing the pathfinder](#choosing-the-pathfinder).
 
-Built for **Minecraft 26.3**, **Java 25**, **Fabric**.
+Built for **Minecraft 26.2**, **Java 25**, **Fabric**.
 
 ---
 
@@ -38,9 +38,9 @@ Built for **Minecraft 26.3**, **Java 25**, **Fabric**.
 - **Humanised movement.** Baritone paths, mines and collects dropped items; tungsten's human-like
   mouse pipeline aims (WindMouse rotation), and the engine is configured for anti-cheat-safe movement
   out of the box.
-- **Registry-wide item sourcing.** `@get` resolves **any** item in the 26.3 registry, not a curated
+- **Registry-wide item sourcing.** `@get` resolves **any** item in the 26.2 registry, not a curated
   shortlist: it crafts from the server's own recipe book, mines the block, smelts, or hunts the mob
-  that drops it. 26.3's new content is covered — sulfur, resin, pale oak, poplar, the copper family,
+  that drops it. 26.2's new content is covered — sulfur, resin, pale oak, the copper family,
   the mace, nautilus shells and the nautilus-armour family's ingredient.
 - **Mining and collecting belong to the engine.** altoclef decides *what* and *when*; Baritone
   decides *how* — including opening the doors on the way to a drop.
@@ -60,11 +60,11 @@ Built for **Minecraft 26.3**, **Java 25**, **Fabric**.
 
 | Component | Version |
 |---|---|
-| Minecraft | **26.3** (declared compatible from 26.1) |
+| Minecraft | **26.2** (declared `~26.2`) |
 | Fabric Loader | `>= 0.19.0` |
-| Fabric API | `0.162.0+26.3` |
-| Baritone | **bundled** — nothing to install (v1.20.0 ships inside the jar; your own copy in `mods/` takes priority) |
-| Cloth Config | `>= 26.3` *(bundled — do not install separately)* |
+| Fabric API | `0.161.0+26.2` |
+| Baritone | **bundled** — nothing to install (v1.19.0 ships inside the jar; your own copy in `mods/` takes priority) |
+| Cloth Config | `>= 26.2` *(bundled — do not install separately)* |
 | Java | **25** |
 
 The release jar bundles Cloth Config, Jackson, the Nether pathfinder, Py4j, tungsten **and Baritone** —
@@ -74,9 +74,9 @@ one file, nothing else to install.
 
 ## Installation
 
-1. Install **Fabric Loader 0.19.0+** for **Minecraft 26.3** ([fabricmc.net](https://fabricmc.net/use/installer/)).
+1. Install **Fabric Loader 0.19.0+** for **Minecraft 26.2** ([fabricmc.net](https://fabricmc.net/use/installer/)).
 2. Put **[Fabric API](https://modrinth.com/mod/fabric-api)** in your `mods/` folder.
-3. Put **`unionclef-<version>+26.3.jar`** in the same `mods/` folder.
+3. Put **`unionclef-<version>+26.2.jar`** in the same `mods/` folder.
 4. Launch with **Java 25**.
 
 **That's it — one file.** Baritone is a required dependency, and it **ships inside the UnionClef jar**
@@ -92,30 +92,28 @@ supported, not something to avoid.
 ## Antivirus — and verifying your download
 
 A mod that automates a player and writes inside your game directory gets flagged by heuristic
-scanners from time to time. This build is clean on VirusTotal:
-
-> ### ➡️ [VirusTotal report for `unionclef-0.97.0+26.3.jar`](https://www.virustotal.com/gui/file/e29615dfa6658cae2e29b8101521d047ff7babaac7b7738a1eeed04f0115e975/detection)
-
-**The hash is the point, not the badge.** That report is for one specific file, and here is that file's
-digest — which GitHub also publishes on the release asset:
+scanners from time to time. **This 26.2 build has not been uploaded to VirusTotal yet**; the 26.3
+build of the same version was clean. The digest is the part that matters, and GitHub publishes it on
+the release asset:
 
 ```
-SHA-256  e29615dfa6658cae2e29b8101521d047ff7babaac7b7738a1eeed04f0115e975
+SHA-256  293aca05add26188383e0874f193607ca0b0fa63c82c56921a4a9d3b78aeb697
 ```
 
 Check your download against it:
 
 ```powershell
-Get-FileHash unionclef-0.97.0+26.3.jar -Algorithm SHA256     # Windows
+Get-FileHash unionclef-0.97.0+26.2.jar -Algorithm SHA256     # Windows
 ```
 ```bash
-shasum -a 256 unionclef-0.97.0+26.3.jar                      # macOS / Linux
+shasum -a 256 unionclef-0.97.0+26.2.jar                      # macOS / Linux
 ```
 
-If it matches, you have the file that was scanned.
+If it matches, you have the exact file this README describes.
 
-> **What this is and is not.** A clean scan is *evidence, not a guarantee* — and it is only valid for
-> the exact file it was run on, so **this link covers 0.97.0 only**; a new version needs a new scan.
+> **What this is and is not.** A scan is *evidence, not a guarantee* — and it is only valid for the
+> exact file it was run on. **The VirusTotal report linked from the 26.3 release covers that file,
+> not this one**; if you want a report for this build, upload it yourself and compare the digest.
 > For the curious: the mod phones nothing home, downloads nothing, and writes only under
 > `<game dir>/altoclef/`. The two things scanners dislike about game mods are reading process memory
 > and writing files, which is exactly what a pathfinding bot has to do. The optional **Py4j** and
@@ -207,7 +205,7 @@ Everything is prefixed with `@` and typed into the in-game chat:
 - **`@get` gathers on top of what you hold.** `@get bed 1` with a bed already in your pack fetches
   *one more* — it does not consider the job done because you have one. (Internal tasks used by
   `@gamer` and the rest still mean "ensure I have at least N"; only the command works this way.)
-- **`@get` resolves any real 26.3 item id**, so a name the curated catalogue has never heard of still
+- **`@get` resolves any real 26.2 item id**, so a name the curated catalogue has never heard of still
   works. See [What it can't reach yet](#what-it-cant-reach-yet) for the exceptions.
 - **`@help` lists what a player needs, not everything.** A few debug and agent commands (`@test`,
   `@dummy`, `@agent`, `@custom`, `@gamma`, `@scan`, `@nick`, `@pearl`, …) stay callable by name —
@@ -255,7 +253,7 @@ cd unionclef-26.3-native
 The distributable, remapped mod jar is written to:
 
 ```
-build/libs/unionclef-<mod_version>+26.3.jar
+build/libs/unionclef-<mod_version>+26.2.jar
 ```
 
 Other useful tasks:
@@ -310,9 +308,11 @@ Full docs live in [`docs/`](docs/):
 
 ## What it can't reach yet
 
-`@get` covers the large majority of the 26.3 registry, and the gaps are **known** rather than
-unknown. The full audit — every item, its source, and how it was measured against the 26.3 jar — is in
-[`docs/features/ITEM_BLOCK_COVERAGE.md`](docs/features/ITEM_BLOCK_COVERAGE.md).
+`@get` covers the large majority of the 26.2 registry, and the gaps are **known** rather than
+unknown. The full audit — every item, its source, and how it was measured — is in
+[`docs/features/ITEM_BLOCK_COVERAGE.md`](docs/features/ITEM_BLOCK_COVERAGE.md). It was measured
+against the 26.3 client jar; this build ships the same chains over the 26.2 registry, which lacks
+the handful of items introduced in 26.3 (for example `poplar`).
 
 - **Structure loot** — 68 items, including `echo_shard` and `disc_fragment_5` (ancient city), trial
   keys, the nautilus-armour set, and most explorer maps and banner patterns. Needs a "locate the
@@ -322,7 +322,7 @@ unknown. The full audit — every item, its source, and how it was measured agai
 - **Husbandry** — `blue_egg`, `brown_egg`, `armadillo_scute`, `turtle_scute`, `pitcher_pod`. These are
   *laid*, *shed*, *grown into* or *dug up*, not dropped on death, so there is deliberately no
   kill-and-loot chain for them: a chain that cannot complete is worse than a documented gap.
-- **Separate projects** — `elytra`, `dragon_breath`, and the pre-26.3 **music discs**, which come from
+- **Separate projects** — `elytra`, `dragon_breath`, and the older **music discs**, which come from
   a creeper killed *by a skeleton's arrow* (a mechanic, not a drop table).
 - **Creative-only items** (`*_spawn_egg`, `debug_stick`, `knowledge_book`, `command_block_minecart`)
   have no survival source in vanilla and are not targets.
@@ -333,7 +333,7 @@ Everything outstanding, in the order it should be tackled, is in [`TODOS.md`](TO
 
 ## Status
 
-UnionClef for Minecraft 26.3 is an **alpha**. The port to official Mojang mappings on Java 25 is done;
+UnionClef for Minecraft 26.2 is an **alpha**. The port to official Mojang mappings on Java 25 is done;
 the movement engine is **Baritone end to end** — pathing, mining and collecting — with tungsten kept
 for aim and combat, and the in-game GUI drives it without any command syntax.
 
@@ -352,7 +352,7 @@ for.
 
 Original UnionClef by **3ndetz** — <https://github.com/3ndetz/unionclef>.
 UnionClef is the union of **AltoClef** and **Tungsten**; contributors include TacoTechnica,
-James Green, Marvion Kirito, MiranCZ, and 3ndetz. The 26.3 native port is maintained by
+James Green, Marvion Kirito, MiranCZ, and 3ndetz. The 26.2 native port is maintained by
 **smallduuude** — <https://github.com/smallduuude/unionclef-26.3-native>.
 
 ### Third-party software

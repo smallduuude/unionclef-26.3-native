@@ -15,7 +15,7 @@ import java.util.Optional;
 import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.monster.Enderman;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
 
@@ -52,7 +52,7 @@ public class KillEndermanTask extends ResourceTask {
     @Override
     protected Task onResourceTick(AltoClef mod) {
         // Dimension
-        if (!mod.getEntityTracker().entityFound(Enderman.class)) {
+        if (!mod.getEntityTracker().entityFound(EnderMan.class)) {
             if (WorldHelper.getCurrentDimension() != Dimension.NETHER) {
                 if (_anyDimension) {
                     setDebugState("Waiting for endermen");
@@ -87,7 +87,7 @@ public class KillEndermanTask extends ResourceTask {
         // geometry. Healing still comes first: the shelter is where the next fight starts.
         boolean shelter = adris.altoclef.tasks.entity.EndermanShelterTask.hasBlocks(mod);
         boolean anyAngry = false;
-        for (Enderman entity : mod.getEntityTracker().getTrackedEntities(Enderman.class)) {
+        for (EnderMan entity : mod.getEntityTracker().getTrackedEntities(EnderMan.class)) {
             if (belowNetherRoof.test(entity) && entity.isCreepy() && entity.position().closerThan(mod.getPlayer().position(), TOO_FAR_AWAY)) {
                 anyAngry = true;
             }
@@ -98,7 +98,7 @@ public class KillEndermanTask extends ResourceTask {
         }
 
         // Kill the angry one
-        for (Enderman entity : mod.getEntityTracker().getTrackedEntities(Enderman.class)) {
+        for (EnderMan entity : mod.getEntityTracker().getTrackedEntities(EnderMan.class)) {
 
             if (belowNetherRoof.test(entity) && entity.isCreepy() && entity.position().closerThan(mod.getPlayer().position(), TOO_FAR_AWAY)) {
                 return new KillEntityTask(entity);
@@ -124,7 +124,7 @@ public class KillEndermanTask extends ResourceTask {
         }
 
         // Attack the closest one
-        return new KillEntitiesTask(belowNetherRoof, Enderman.class);
+        return new KillEntitiesTask(belowNetherRoof, EnderMan.class);
     }
 
     /** An enderman's melee damage at the world's difficulty (vanilla: 7 on normal, x1.5 hard, easy 4.5). */

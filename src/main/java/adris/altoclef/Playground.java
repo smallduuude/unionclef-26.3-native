@@ -342,7 +342,7 @@ public class Playground {
             }
             case "killender":
                 mod.runUserTask(new adris.altoclef.tasks.entity.KillEntitiesTask(
-                        e -> true, net.minecraft.world.entity.monster.Enderman.class));
+                        e -> true, net.minecraft.world.entity.monster.EnderMan.class));
                 break;
             case "killhostile": {
                 // ASK FOR THE HOSTILES LIST, NOT FOR A SUPERCLASS.

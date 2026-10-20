@@ -446,10 +446,10 @@ public class ItemHelper {
      * {@code <Doing stuff in [furnace] container> Getting Fuel -> <Collect Fuel: x2.0> -> <Mine And
      * Collect: [[coal]]> -> Wander for Infinity blocks} — while the pack held {@code coal 8}.
      *
-     * <p>1.21.11 did not delete the data, it MOVED it: fuels are a registry hanging off the world
-     * ({@code World.getFuelRegistry()}), which is strictly better than the old static map because a
-     * datapack can change what burns. So ask the game rather than hardcoding a table — the values
-     * are then right by construction, including modded and datapack fuels.
+     * <p>26.2 kept the data and moved it onto the world as {@code Level.fuelValues()}, which is
+     * strictly better than a static map because a datapack can change what burns. So ask the game
+     * rather than hardcoding a table — the values are then right by construction, including
+     * modded and datapack fuels.
      *
      * <p>The re-read on an empty map matters: this is called from tracker code that can run before
      * the client has a world, and caching the empty answer once would reproduce the very bug this
@@ -481,75 +481,30 @@ public class ItemHelper {
      * (what the mod plans against), and a live {@code ConstantValue} is preferred when present.
      */
     private static int resolveBurnTicks(ItemStack stack) {
-        net.minecraft.world.item.component.CookingFuel fuel =
-                stack.get(net.minecraft.core.component.DataComponents.COOKING_FUEL);
-        if (fuel == null) {
+        net.minecraft.world.level.block.entity.FuelValues values = currentFuelValues();
+        if (values == null) {
             return -1;
         }
-        var resolvable = fuel.burnTime();
-        if (resolvable instanceof net.minecraft.world.level.storage.loot.providers.number.ints.ResolvableInt.Constant c) {
-            return c.value();
-        }
-        if (resolvable instanceof net.minecraft.world.level.storage.loot.providers.number.ints.ResolvableInt.Reference ref) {
-            Integer base = COOKING_BASE_TICKS.get(ref.key());
-            if (base != null) {
-                return base;
-            }
-            net.minecraft.client.multiplayer.ClientLevel level = net.minecraft.client.Minecraft.getInstance().level;
-            if (level != null) {
-                try {
-                    var lookup = level.registryAccess()
-                            .lookupOrThrow(net.minecraft.core.registries.Registries.CONTEXT_INT_PROVIDER);
-                    var holder = lookup.get(ref.key());
-                    if (holder.isPresent()
-                            && holder.get().value()
-                            instanceof net.minecraft.world.level.storage.loot.providers.number.ints.ConstantValue cv) {
-                        return cv.value();
-                    }
-                } catch (Exception ignored) {
-                    // fall through to 0
-                }
-            }
-            return 0;
-        }
-        return 0;
+        return values.isFuel(stack) ? values.burnDuration(stack) : -1;
     }
 
-    /**
-     * Vanilla furnace base burn times (ticks) per {@code cooking/*} provider, mirroring
-     * {@code ContextIntProviders.bootstrap}. Used because the client cannot evaluate the
-     * {@code ResolvableInt} references (see {@link #resolveBurnTicks}).
-     */
-    private static final java.util.Map<net.minecraft.resources.ResourceKey<
-            net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProvider>, Integer>
-            COOKING_BASE_TICKS = buildCookingBaseTicks();
-
-    private static java.util.Map<net.minecraft.resources.ResourceKey<
-            net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProvider>, Integer>
-            buildCookingBaseTicks() {
-        java.util.Map<net.minecraft.resources.ResourceKey<
-                net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProvider>, Integer> m =
-                new java.util.HashMap<>();
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_BAMBOO, 50);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_WOOL_SLABS, 50);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_WOOL_CARPETS, 67);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_DRY_PLANTS, 100);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_WOOD_ITEMS_EXTRA_SMALL, 100);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_WOOL, 100);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_WOOD_SLABS, 150);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_WOOD_ITEMS_LARGE, 200);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_ROOTS, 300);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_WOOD_BLOCKS, 300);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_WOOD_ITEMS_SMALL, 300);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_HANGING_SIGNS, 800);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_BOATS, 1200);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_COAL, 1600);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_BLAZE_ROD, 2400);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_DRIED_KELP_BLOCK, 4001);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_COAL_BLOCK, 16000);
-        m.put(net.minecraft.world.level.storage.loot.providers.number.ints.ContextIntProviders.COOKING_TIME_LAVA_BUCKET, 20000);
-        return m;
+    private static net.minecraft.world.level.block.entity.FuelValues currentFuelValues() {
+        net.minecraft.client.multiplayer.ClientLevel level = net.minecraft.client.Minecraft.getInstance().level;
+        if (level != null) {
+            return level.fuelValues();
+        }
+        net.minecraft.world.level.block.entity.FuelValues vanilla = vanillaFuelValues;
+        if (vanilla == null) {
+            vanilla = net.minecraft.world.level.block.entity.FuelValues.vanillaBurnTimes(
+                    net.minecraft.data.registries.VanillaRegistries.createLookup(),
+                    net.minecraft.world.flag.FeatureFlags.VANILLA_SET);
+            vanillaFuelValues = vanilla;
+        }
+        return vanilla;
     }
+
+    /** Vanilla fallback, built once for the pre-world window and then reused. */
+    private static volatile net.minecraft.world.level.block.entity.FuelValues vanillaFuelValues;
 
     public static double getFuelAmount(Item... items) {
         double total = 0;

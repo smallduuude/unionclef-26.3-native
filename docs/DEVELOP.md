@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - **JDK 25** — the build targets Java 25 and the game runs on it.
-- A **Fabric 26.3** profile if you want to run the built jar in a real launcher (optional;
+- A **Fabric 26.2** profile if you want to run the built jar in a real launcher (optional;
   `runClient` launches a dev client for you).
 
 ## Get the code and build
@@ -20,7 +20,7 @@ Every build after that is much faster.
 Output — the distributable, remapped mod jar:
 
 ```
-build/libs/unionclef-<mod_version>+26.3.jar
+build/libs/unionclef-<mod_version>+26.2.jar
 ```
 
 ## Run a dev client
@@ -80,7 +80,7 @@ switching JDK or Loom version:
 
 ### Out of memory when launching the real game
 
-Minecraft 26.3 plus a modpack wants a few GB. If the launcher reports low memory, close other
+Minecraft 26.2 plus a modpack wants a few GB. If the launcher reports low memory, close other
 applications or lower the instance's allocated RAM.
 
 ## Releasing

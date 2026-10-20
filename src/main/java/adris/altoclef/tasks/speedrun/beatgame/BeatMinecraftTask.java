@@ -44,7 +44,7 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.entity.monster.Enderman;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.monster.Silverfish;
@@ -2165,12 +2165,12 @@ public class BeatMinecraftTask extends Task {
             return new TradeWithPiglinsTask(32, Items.ENDER_PEARL, count);
         }
 
-        boolean endermanFound = mod.getEntityTracker().entityFound(Enderman.class);
+        boolean endermanFound = mod.getEntityTracker().entityFound(EnderMan.class);
         boolean pearlDropped = mod.getEntityTracker().itemDropped(Items.ENDER_PEARL);
 
         // Check if we have found an Enderman or Ender Pearl and have enough Twisting Vines.
         if (endermanFound || pearlDropped) {
-            Optional<Entity> toKill = mod.getEntityTracker().getClosestEntity(Enderman.class);
+            Optional<Entity> toKill = mod.getEntityTracker().getClosestEntity(EnderMan.class);
             if (toKill.isPresent() && mod.getEntityTracker().isEntityReachable(toKill.get())) {
                 return new KillEndermanTask(count);
             }

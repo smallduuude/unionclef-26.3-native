@@ -280,10 +280,10 @@ public class SignShopTask extends Task {
     public static String[] readSignLines(Level world, BlockPos pos) {
         BlockEntity be = world.getBlockEntity(pos);
         if (!(be instanceof SignBlockEntity sign)) return null;
-        SignText text = sign.getText(net.minecraft.world.level.block.entity.SignTextSlot.FRONT);
+        SignText text = sign.getText(true);
         String[] lines = new String[4];
         for (int i = 0; i < 4; i++) {
-            lines[i] = text.getMessages(false).get(i).getString().trim();
+            lines[i] = text.getMessages(false)[i].getString().trim();
         }
         return lines;
     }

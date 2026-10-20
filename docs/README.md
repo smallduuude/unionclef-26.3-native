@@ -1,6 +1,6 @@
 # UnionClef documentation
 
-UnionClef is a chat- and GUI-driven automation bot for **Minecraft 26.3** (Fabric, Java 25).
+UnionClef is a chat- and GUI-driven automation bot for **Minecraft 26.2** (Fabric, Java 25).
 Start with the [project README](../README.md) for installation and usage.
 
 ## Guides
@@ -20,13 +20,15 @@ Start with the [project README](../README.md) for installation and usage.
 - [features/MCP_SERVER.md](features/MCP_SERVER.md) — the LAN control surface (Model Context Protocol)
 - [features/AGENT_PY4J_LEVERS.md](features/AGENT_PY4J_LEVERS.md) — the catalog of levers an external
   agent drives the bot with
-- [features/ITEM_BLOCK_COVERAGE.md](features/ITEM_BLOCK_COVERAGE.md) — how much of the 26.3 registry
+- [features/ITEM_BLOCK_COVERAGE.md](features/ITEM_BLOCK_COVERAGE.md) — how much of the item registry
   UnionClef can reach, and how to extend it
 
 ## Release notes
 
 Newest first. One file per version, named after `mod_version`.
 
+- [0.97.0-26.2](releases/0.97.0-26.2.md) — the 0.97.0 feature set ported to Minecraft 26.2
+  (bundled Baritone 1.19.0, 26.2 fuel registry)
 - [0.97.0](releases/0.97.0.md) — Baritone as the movement engine, every task routed, camera/cost
   fixes, generic craft chains, command cleanup, GPL-3.0
 - [0.96.1](releases/0.96.1.md) — mining and water fixes

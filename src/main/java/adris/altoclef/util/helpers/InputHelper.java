@@ -6,6 +6,7 @@ import net.minecraft.client.Minecraft;
 public class InputHelper {
 
     public static boolean isKeyPressed(int code) {
-        return InputConstants.isKeyDown(code); // TODO [1.21.11] isKeyPressed(long, int) → isKeyPressed(Window, int)
+        // 26.2 takes the window explicitly; 26.3 drops it and reads the global window.
+        return InputConstants.isKeyDown(Minecraft.getInstance().getWindow(), code);
     }
 }

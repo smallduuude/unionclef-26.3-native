@@ -18,7 +18,7 @@ public class AltoclefClient implements ClientModInitializer {
 
     /** Default: O. Rebindable in Options &gt; Controls &gt; Miscellaneous. */
     public static final KeyMapping OPEN_SETTINGS = KeyMappingHelper.registerKeyMapping(
-            new KeyMapping("key.unionclef.settings", InputConstants.Type.KEYBOARD, InputConstants.KEY_K, KeyMapping.Category.MISC));
+            new KeyMapping("key.unionclef.settings", InputConstants.Type.KEYSYM, InputConstants.KEY_K, KeyMapping.Category.MISC));
 
     @Override
     public void onInitializeClient() {

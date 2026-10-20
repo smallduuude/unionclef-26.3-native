@@ -26,7 +26,7 @@
     "cloth-config": ">=26.2",
     "fabric-key-mapping-api-v1": "*",
     "tungsten": "*",
-    "baritone": ">=1.20.0"
+    "baritone": ">=1.19.0"
   },
   "entrypoints": {
     "main": [

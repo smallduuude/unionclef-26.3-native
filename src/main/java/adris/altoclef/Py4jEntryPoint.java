@@ -2093,7 +2093,7 @@ public class Py4jEntryPoint {
             net.minecraft.world.entity.Entity target = ehr.getEntity();
             var res = client.gameMode.interact(
                     client.player, target, new net.minecraft.world.phys.EntityHitResult(target), net.minecraft.world.InteractionHand.MAIN_HAND);
-            client.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+            client.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND, false);
             out.put("ok", true);
             out.put("result", res.toString());
             out.put("entityType", target.getType().toString());
@@ -2158,7 +2158,7 @@ public class Py4jEntryPoint {
             int before = client.player.getMainHandItem().getCount();
             var res = client.gameMode.useItemOn(
                     client.player, net.minecraft.world.InteractionHand.MAIN_HAND, bhr);
-            client.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+            client.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND, false);
             out.put("ok", true);
             out.put("result", res.toString());
             out.put("target", bhr.getBlockPos().toShortString());

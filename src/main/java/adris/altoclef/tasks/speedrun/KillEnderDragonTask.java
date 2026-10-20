@@ -30,7 +30,7 @@ import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
 import net.minecraft.world.entity.boss.enderdragon.phases.DragonPhaseInstance;
 import net.minecraft.world.entity.boss.enderdragon.phases.EnderDragonPhase;
-import net.minecraft.world.entity.monster.Enderman;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
@@ -72,7 +72,7 @@ public class KillEnderDragonTask extends Task {
 
         mod.getBehaviour().push();
         // Don't forcefield endermen.
-        mod.getBehaviour().addForceFieldExclusion(entity -> entity instanceof Enderman || entity instanceof EnderDragon || entity instanceof EnderDragonPart);
+        mod.getBehaviour().addForceFieldExclusion(entity -> entity instanceof EnderMan || entity instanceof EnderDragon || entity instanceof EnderDragonPart);
         mod.getBehaviour().setPreferredStairs(true);
     }
 

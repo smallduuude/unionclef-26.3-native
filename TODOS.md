@@ -1,7 +1,8 @@
 # TODOS
 
-Forward-looking work for the UnionClef 26.3 native port. Newest thinking at the top of each section;
-nothing here is a bug report, and everything here is *not done*.
+Forward-looking work for the UnionClef native port. `main` is the 26.3 build; branch `26.2` is the
+same feature set built for 26.2. Newest thinking at the top of each section; nothing here is a bug
+report, and everything here is *not done*.
 
 > **Note on the old TODOS.md.** Code comments across this tree reference `TODOS.md` by ID — `C7.3`
 > (MCP server binds `0.0.0.0` with only a bearer token and wildcard CORS), `C7.5`
@@ -27,6 +28,26 @@ nothing here is a bug report, and everything here is *not done*.
       file nobody is downloading, which is worse than having no link at all. This is now a required
       step in `docs/RELEASE.md`.
 - [ ] *(optional)* `CONTRIBUTING.md`. Not required for a release.
+
+### The 26.2 build
+
+Branch `26.2` carries the same 0.97.0 feature set on **Minecraft 26.2**: Fabric API
+`0.161.0+26.2`, Cloth Config `26.2.155`, bundled **Baritone 1.19.0**. The mod version is unchanged;
+the `+26.2` suffix identifies the build, and `v0.97.0-26.2` is its tag (the 26.3 release keeps
+`v0.97.0`).
+
+- [x] ~~Port the 26.3-only API uses~~ — done: `Level.fuelValues()` replaces the `cooking_fuel`
+      component (with a vanilla fallback before a world exists), plus `EnderMan`, `KEYSYM`,
+      `isKeyDown(Window, int)`, `VanillaRegistries.createLookup()`, `getText(boolean)`,
+      `SwingSource.CLIENT` and the two-argument `swing`. `gradlew clean build` passes.
+- [ ] **Playtest the 26.2 jar.** It compiles and packages against the 26.2 client jar, but runtime
+      behaviour on 26.2 is unverified — the same alpha rule as 26.3.
+- [ ] **VirusTotal scan for `unionclef-0.97.0+26.2.jar`.** The README says plainly that this build
+      has not been uploaded; the 26.3 scan does not cover it.
+
+```
+SHA-256  293aca05add26188383e0874f193607ca0b0fa63c82c56921a4a9d3b78aeb697
+```
 
 ## 2. Verification — the biggest gap by far
 

@@ -266,7 +266,7 @@ public class PlaceBlockNearbyTask extends Task {
             assert Minecraft.getInstance().gameMode != null;
             if (Minecraft.getInstance().gameMode.useItemOn(mod.getPlayer(),hand, (BlockHitResult) mouseOver) == InteractionResult.SUCCESS &&
                     mod.getPlayer().isShiftKeyDown()) {
-                mod.getPlayer().swing(hand, SwingAnimation.DEFAULT, false);
+                mod.getPlayer().swing(hand, false);
                 justPlaced = targetPlace;
                 Debug.logMessage("PRESSED");
                 return true;

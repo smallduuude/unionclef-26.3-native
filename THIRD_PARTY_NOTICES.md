@@ -18,7 +18,7 @@ licences require.
 | **Py4j** | BSD-3-Clause | <https://www.py4j.org/> |
 | **Cloth Config** (`cloth-config-fabric`) | LGPL-3.0 | <https://github.com/shedaniel/cloth-config> |
 
-Baritone ships as a **Fabric nested JAR** at `META-INF/jars/baritone-api-fabric-1.20.0.jar`, exactly
+Baritone ships as a **Fabric nested JAR** at `META-INF/jars/baritone-api-fabric-1.19.0.jar`, exactly
 as release-published and unmodified. LGPL-3.0 section 4 asks that a combined work carry a copy of the
 GNU GPL and of the LGPL, and give notice that the library is used — hence `META-INF/LICENSE` (GPL-3.0)
 and `META-INF/licenses/LGPL-3.0.txt` inside this jar, and this table. Section 4(d) asks that the user

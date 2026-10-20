@@ -39,7 +39,7 @@ import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.boss.wither.WitherBoss;
 import net.minecraft.world.entity.monster.Blaze;
 import net.minecraft.world.entity.monster.Creeper;
-import net.minecraft.world.entity.monster.Enderman;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.entity.monster.Ghast;
 import net.minecraft.world.entity.monster.cubemob.MagmaCube;
 import net.minecraft.world.entity.monster.cubemob.Slime;
@@ -592,7 +592,7 @@ public class MobDefenseChain extends SingleTaskChain {
     private static int getDangerousnessScore(List<LivingEntity> toDealWithList) {
         int numberOfProblematicEntities = toDealWithList.size();
         for (LivingEntity toDealWith : toDealWithList) {
-            if (toDealWith instanceof Enderman || toDealWith instanceof Slime || toDealWith instanceof Blaze) {
+            if (toDealWith instanceof EnderMan || toDealWith instanceof Slime || toDealWith instanceof Blaze) {
 
                 numberOfProblematicEntities += 1;
             } else if (toDealWith instanceof Drowned
@@ -1137,7 +1137,7 @@ public class MobDefenseChain extends SingleTaskChain {
                     }
                     // Under a finished enderman shelter the shelter task fights endermen from where it
                     // stands; chasing one here would walk the body out from under the roof.
-                    if (hostile instanceof Enderman
+                    if (hostile instanceof EnderMan
                             && adris.altoclef.tasks.entity.EndermanShelterTask.holding()) {
                         continue;
                     }

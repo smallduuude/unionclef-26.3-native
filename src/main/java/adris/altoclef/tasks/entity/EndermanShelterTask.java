@@ -10,7 +10,7 @@ import kaptainwutax.tungsten.path.RouteHazards;
 import kaptainwutax.tungsten.task.PillarTask;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.monster.Enderman;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
@@ -152,8 +152,8 @@ public class EndermanShelterTask extends Task {
         }
         if (relocate) {
             // An unused pillar: walk to within 16 of the nearest enderman, then build again there.
-            Enderman near = null;
-            for (Enderman e : mod.getEntityTracker().getTrackedEntities(Enderman.class)) {
+            EnderMan near = null;
+            for (EnderMan e : mod.getEntityTracker().getTrackedEntities(EnderMan.class)) {
                 if (e.isAlive() && accept.test(e) && (near == null
                         || e.distanceToSqr(mod.getPlayer()) < near.distanceToSqr(mod.getPlayer()))) near = e;
             }
@@ -201,7 +201,7 @@ public class EndermanShelterTask extends Task {
         if (base == null) {
             // Standing still is the one wrong answer: fight as before and look again later.
             setDebugState("No site for a pillar here: fighting on the ground");
-            return new KillEntitiesTask(accept, Enderman.class);
+            return new KillEntitiesTask(accept, EnderMan.class);
         }
         if (!feet.equals(base)) {
             setDebugState("Going to the pillar site " + base.toShortString());
@@ -242,10 +242,10 @@ public class EndermanShelterTask extends Task {
             relocate = true;
             return null;
         }
-        Enderman angry = null;
-        Enderman calm = null;
+        EnderMan angry = null;
+        EnderMan calm = null;
         double angryD = Double.MAX_VALUE, calmD = Double.MAX_VALUE;
-        for (Enderman e : mod.getEntityTracker().getTrackedEntities(Enderman.class)) {
+        for (EnderMan e : mod.getEntityTracker().getTrackedEntities(EnderMan.class)) {
             if (!e.isAlive() || !accept.test(e)) continue;
             double d = e.distanceToSqr(mod.getPlayer());
             if (e.isCreepy()) {

@@ -1,8 +1,14 @@
-# 26.3 item coverage — what UnionClef can reach, and how
+# Item coverage — what UnionClef can reach, and how
 
 Measured, not claimed. Every number below was produced by reading the **26.3 client jar itself**
 (`~/.gradle/caches/fabric-loom/26.3/minecraft-client.jar`) and comparing it against this mod's
 source, so it can be re-run and it degrades honestly when the mod changes.
+
+> **Scope of this audit.** The measurement is against 26.3, where these chains were built. The 26.2
+> build ships the same chains over the 26.2 registry; items that exist only in 26.3 (for example
+> `poplar`) are absent from that registry and so cannot be reached — that is not a missing chain.
+> Re-run the same script against the 26.2 jar (point it at the `26.2` loom cache) to reproduce the
+> 26.2 numbers.
 
 ## How the measurement works
 

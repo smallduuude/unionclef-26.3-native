@@ -13,6 +13,11 @@
 **A chat-driven automation bot for Minecraft 26.2 (Fabric).** Type `@help` in chat and a
 computer plays the game for you — mining, crafting, fighting, exploring, and beating the game.
 
+> **Two builds, same version.** This README describes the **26.2** build. For **Minecraft 26.3**,
+> use the [`v0.97.0` release](https://github.com/smallduuude/unionclef-26.3-native/releases/tag/v0.97.0)
+> and the `main` branch — the feature set is identical; only the game, Fabric API, Cloth Config and
+> bundled Baritone versions differ.
+
 UnionClef is the union of two things:
 
 - **altoclef** — the task/command brain. You talk to it in chat; it decomposes what you asked

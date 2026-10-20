@@ -219,16 +219,16 @@ public class TungstenMod implements ClientModInitializer {
         //$$ ));
 		//#else
 		pauseKeyBinding = KeyMappingHelper.registerKeyMapping(new KeyMapping(
-		    "key.tungsten.pause", InputConstants.Type.KEYBOARD, InputConstants.KEY_P,
+		    "key.tungsten.pause", InputConstants.Type.KEYSYM, InputConstants.KEY_P,
 		    net.minecraft.client.KeyMapping.Category.MISC));
 		runKeyBinding = KeyMappingHelper.registerKeyMapping(new KeyMapping(
-		    "key.tungsten.run", InputConstants.Type.KEYBOARD, InputConstants.KEY_G,
+		    "key.tungsten.run", InputConstants.Type.KEYSYM, InputConstants.KEY_G,
 		    net.minecraft.client.KeyMapping.Category.MISC));
 		runBlockSearchKeyBinding = KeyMappingHelper.registerKeyMapping(new KeyMapping(
-		    "key.tungsten.run_block_search", InputConstants.Type.KEYBOARD, InputConstants.KEY_J,
+		    "key.tungsten.run_block_search", InputConstants.Type.KEYSYM, InputConstants.KEY_J,
 		    net.minecraft.client.KeyMapping.Category.MISC));
 		createGoalKeyBinding = KeyMappingHelper.registerKeyMapping(new KeyMapping(
-		    "key.tungsten.create_goal", InputConstants.Type.KEYBOARD, InputConstants.KEY_H,
+		    "key.tungsten.create_goal", InputConstants.Type.KEYSYM, InputConstants.KEY_H,
 		    net.minecraft.client.KeyMapping.Category.MISC));
 		//#endif
         _commandExecutor = new CommandExecutor(this);

@@ -523,7 +523,7 @@ public class TriggerBot {
         if (kaptainwutax.tungsten.combat.AttackTiming.isCrit(player)) { critHits++; lifetimeCrits++; }
         lifetimeHits++;
         mc.gameMode.attack(player, target);
-        player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+        player.swing(InteractionHand.MAIN_HAND, false);
         clickedThisCycle = true;
         totalHits++;
         ticksSinceLastHit = 0;

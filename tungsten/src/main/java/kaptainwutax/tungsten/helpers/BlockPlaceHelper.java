@@ -108,7 +108,7 @@ public final class BlockPlaceHelper {
         rightClickTimer = RIGHT_CLICK_SPEED - BASE_PLACE_DELAY;
         for (InteractionHand hand : InteractionHand.values()) {
             if (mc.gameMode.useItemOn(mc.player, hand, hit) == InteractionResult.SUCCESS) {
-                mc.player.swing(hand, SwingAnimation.DEFAULT, false);
+                mc.player.swing(hand, false);
                 gatedThrough++;
                 return true;
             }

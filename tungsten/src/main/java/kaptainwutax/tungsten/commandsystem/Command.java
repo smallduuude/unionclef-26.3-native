@@ -17,7 +17,7 @@ import net.minecraft.network.chat.Component;
 
 public abstract class Command {
 
-	protected static final CommandBuildContext REGISTRY_ACCESS = Commands.createValidationContext(VanillaRegistries.createWorldLookup());
+	protected static final CommandBuildContext REGISTRY_ACCESS = Commands.createValidationContext(VanillaRegistries.createLookup());
     protected static final int SINGLE_SUCCESS = com.mojang.brigadier.Command.SINGLE_SUCCESS;
     protected final static SimpleCommandExceptionType INCORRECT_USE = new SimpleCommandExceptionType(Component.literal("Incorrect command use!"));
     

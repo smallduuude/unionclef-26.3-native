@@ -50,7 +50,7 @@ public final class CombatPrimitives {
     /** Deliver a melee attack right now (no gate — combine with canHit). */
     public static void attack(LocalPlayer player, Entity target) {
         Minecraft.getInstance().gameMode.attack(player, target);
-        player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+        player.swing(InteractionHand.MAIN_HAND, false);
     }
 
     /** Raise the shield for N ticks (shield in hand is the brain's job). */

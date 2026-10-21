@@ -44,5 +44,10 @@
   },
   "mixins": [
     "altoclef.mixins.json"
+  ],
+  "jars": [
+    {
+      "file": "META-INF/jars/baritone-api-fabric-1.19.0.jar"
+    }
   ]
 }

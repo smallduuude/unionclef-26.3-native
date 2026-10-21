@@ -57,7 +57,10 @@ build/libs/unionclef-<mod_version>+26.2.jar
    worse than no link: it invites a user to verify a file they are not downloading.
 
 6. **Verify.** Download the uploaded asset and confirm its `fabric.mod.json` reports the right
-   version and `license`, then install it in a test instance and launch.
+   version and `license`, **and that its `jars` array lists the bundled Baritone jar**
+   (`META-INF/jars/baritone-api-fabric-<version>.jar`). Then install it in a test instance
+   **with no standalone Baritone in `mods/`** and launch — that is what catches a nested jar that
+   is present but undeclared.
 
 ## What ships in the jar
 
@@ -77,9 +80,10 @@ The jar is a self-contained Fabric jar-in-jar bundle — users install **one fil
 Baritone is **both required and bundled**: `fabric.mod.json` declares it under `depends`, and the jar
 provides it, so a user who would never go and find it still gets the best movement engine. It is added
 to the jar by `processResources` rather than Loom's `include` (which needs a module component, not a
-file), and needs no remapping because it is Baritone's **released** jar — already built for production
-Fabric. A player who has their own Baritone in `mods/` keeps it: Fabric Loader resolves one version per
-mod id.
+file), **and it is declared in `fabric.mod.json`'s `jars` array — Fabric Loader discovers nested jars
+only from that array, not by scanning `META-INF/jars`.** It needs no remapping because it is
+Baritone's **released** jar — already built for production Fabric. A player who has their own
+Baritone in `mods/` keeps it: Fabric Loader resolves one version per mod id.
 
 ## License
 

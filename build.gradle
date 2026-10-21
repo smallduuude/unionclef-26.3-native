@@ -77,12 +77,15 @@ dependencies {
     // the best version and ours is simply a floor.
     //
     // Bundled by processResources, NOT by Loom's `include`: `include` demands a module component and
-    // refuses a raw file ("not a module component and has no capabilities"). A Fabric nested jar is
-    // simply a jar at META-INF/jars/<name>.jar, so writing it there is the same thing. The one extra
-    // thing `include` would do is REMAP, and that is unnecessary here: this is Baritone's RELEASED
-    // jar, already built for production Fabric (intermediary), which is why it loads from `mods/`
-    // for everyone else. It is also not on the compile classpath — altoclef reaches Baritone through
-    // reflection on its public API (see adris.altoclef.control.BaritoneBridge).
+    // refuses a raw file ("not a module component and has no capabilities"). The jar is written to
+    // META-INF/jars/<name>.jar, and — this part is NOT optional — it is declared in the `jars` array
+    // of fabric.mod.json. Fabric Loader discovers nested jars from that array; a jar that is only
+    // present in META-INF/jars is invisible, and the game then fails at launch with "requires
+    // baritone, which is missing". Loom merges its own `include` entries into the same array at build
+    // time, so the hand-written entry sits alongside them. The one thing `include` would add is
+    // REMAP, which is unnecessary: this is Baritone's RELEASED jar, already built for production
+    // Fabric (intermediary). It is also not on the compile classpath — altoclef reaches Baritone
+    // through reflection on its public API (see adris.altoclef.control.BaritoneBridge).
 }
 
 processResources {

@@ -46,7 +46,7 @@ the `+26.2` suffix identifies the build, and `v0.97.0-26.2` is its tag (the 26.3
       has not been uploaded; the 26.3 scan does not cover it.
 
 ```
-SHA-256  293aca05add26188383e0874f193607ca0b0fa63c82c56921a4a9d3b78aeb697
+SHA-256  cdfda2a5da6fc45e95b6e89fff84866afaec070db5d310ed0edd225a5fdc782e
 ```
 
 ## 2. Verification — the biggest gap by far

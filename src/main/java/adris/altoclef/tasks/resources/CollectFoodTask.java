@@ -1,0 +1,671 @@
+package adris.altoclef.tasks.resources;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.TaskCatalogue;
+import adris.altoclef.multiversion.item.ItemVer;
+import adris.altoclef.tasks.CraftInInventoryTask;
+import adris.altoclef.tasks.DoToClosestBlockTask;
+import adris.altoclef.tasks.construction.DestroyBlockTask;
+import adris.altoclef.tasks.container.CraftInTableTask;
+import adris.altoclef.tasks.container.SmeltInSmokerTask;
+import adris.altoclef.tasks.movement.DefaultGoToDimensionTask;
+import adris.altoclef.tasks.movement.GetToBlockTask;
+import adris.altoclef.tasks.movement.PickupDroppedItemTask;
+import adris.altoclef.tasks.movement.TimeoutWanderTask;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.CraftingRecipe;
+import adris.altoclef.util.Dimension;
+import adris.altoclef.util.ItemTarget;
+import adris.altoclef.util.RecipeTarget;
+import adris.altoclef.util.SmeltTarget;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.helpers.WorldHelper;
+import adris.altoclef.util.slots.Slot;
+import adris.altoclef.util.slots.SmokerSlot;
+import adris.altoclef.util.time.TimerGame;
+import net.minecraft.world.level.block.*;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.animal.*;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.animal.chicken.Chicken;
+import net.minecraft.world.entity.animal.cow.Cow;
+import net.minecraft.world.entity.animal.pig.Pig;
+import net.minecraft.world.entity.animal.rabbit.Rabbit;
+import net.minecraft.world.entity.animal.sheep.Sheep;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.entity.monster.cubemob.Slime;
+import net.minecraft.world.entity.monster.hoglin.Hoglin;
+import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.SmokerMenu;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.BeetrootBlock;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.CarrotBlock;
+import net.minecraft.world.level.block.CropBlock;
+import net.minecraft.world.level.block.PotatoBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
+import kaptainwutax.tungsten.helpers.PlayerFit;
+
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Predicate;
+import net.minecraft.world.phys.Vec3;
+
+public class CollectFoodTask extends Task {
+
+
+    // Represents order of preferred mobs to least preferred
+    public static final CookableFoodTarget[] COOKABLE_FOODS = new CookableFoodTarget[]{
+            new CookableFoodTarget("beef", Cow.class),
+            new CookableFoodTarget("porkchop", Pig.class),
+            new CookableFoodTarget("chicken", Chicken.class),
+            new CookableFoodTarget("mutton", Sheep.class),
+            new CookableFoodTarget("rabbit", Rabbit.class),
+            // The Nether's only meat. Listed after the pig so the shared raw item still resolves
+            // to the same porkchop everywhere this table is read.
+            new CookableFoodTarget("porkchop", Hoglin.class)
+    };
+
+    public static final Item[] ITEMS_TO_PICK_UP = new Item[]{
+            Items.ENCHANTED_GOLDEN_APPLE,
+            Items.GOLDEN_APPLE,
+            Items.GOLDEN_CARROT,
+            Items.BREAD,
+            Items.BAKED_POTATO
+    };
+
+    public static final CropTarget[] CROPS = new CropTarget[]{
+            new CropTarget(Items.WHEAT, Blocks.WHEAT),
+            new CropTarget(Items.CARROT, Blocks.CARROTS)
+    };
+
+    private final double unitsNeeded;
+    private final TimerGame checkNewOptionsTimer = new TimerGame(10);
+    // ⛔ FIXED 2026-09-05: was `private final ... = null`, which can never be reassigned, so the
+    // "keep on smelting" branch below and isFinished()'s smeltTask check were both permanently
+    // dead. Confirmed by comparing against the sibling CollectMeatTask.java, which implements the
+    // identical pattern correctly with a mutable field. See the smelting-loop restoration below.
+    private Task smeltTask = null;
+    private Task currentResourceTask = null;
+    private Task surfaceSearchTask;
+    private int surfaceSearchY;
+    /** When the current surface search began and how close it has got: it gets SURFACE_PATIENCE_MS
+     *  without closing in before it is dropped for the outward search. */
+    private long surfaceSearchSinceMs;
+    private double surfaceSearchBest;
+    private static final long SURFACE_PATIENCE_MS = 60_000;
+    public static volatile int surfaceSearchGivenUp;
+    private static final int SURFACE_SEARCH_RADIUS = 16;
+
+    public CollectFoodTask(double unitsNeeded) {
+        this.unitsNeeded = unitsNeeded;
+    }
+
+    /**
+     * Raw meat is worth its cooked value only where it can be cooked. The smoker needs a crafting
+     * table, logs and a furnace, which this task only gathers in the Overworld; in the Nether the
+     * meat is eaten raw, so crediting it as cooked would declare the target met while the real
+     * inventory score (what {@link #isFinished()} reads) stays short, and the task would never end.
+     */
+    private static boolean canCookHere() {
+        return WorldHelper.getCurrentDimension() == Dimension.OVERWORLD;
+    }
+
+    private static double getFoodPotential(ItemStack food) {
+        if (food == null) return 0;
+        int count = food.getCount();
+        if (count <= 0) return 0;
+        for (CookableFoodTarget cookable : COOKABLE_FOODS) {
+            if (food.getItem() == cookable.getRaw() && canCookHere()) {
+                assert ItemVer.getFoodComponent(cookable.getCooked()) != null;
+                return count * ItemVer.getFoodComponent(cookable.getCooked()).getHunger();
+            }
+        }
+
+        //bread logic
+        assert ItemVer.getFoodComponent( Items.BREAD) != null;
+
+        if (food.getItem().equals(Items.HAY_BLOCK)) {
+            return 3* ItemVer.getFoodComponent(Items.BREAD).getHunger()*count;
+        }
+        if (food.getItem().equals(Items.WHEAT)) {
+            return (double) (ItemVer.getFoodComponent(Items.BREAD).getHunger() * count) /3;
+        }
+
+        // We're just an ordinary item.
+        if (ItemVer.isFood(food.getItem())) {
+            assert ItemVer.getFoodComponent(food.getItem()) != null;
+            return count * ItemVer.getFoodComponent(food.getItem()).getHunger();
+        }
+        return 0;
+    }
+
+    // Gets the units of food if we were to convert all of our raw resources to food.
+    @SuppressWarnings("RedundantCast")
+    public static double calculateFoodPotential(AltoClef mod) {
+        double potentialFood = 0;
+        for (ItemStack food : mod.getItemStorage().getItemStacksPlayerInventory(true)) {
+            potentialFood += getFoodPotential(food);
+        }
+        int potentialBread = (int) (mod.getItemStorage().getItemCount(Items.WHEAT) / 3) + mod.getItemStorage().getItemCount(Items.HAY_BLOCK) * 3;
+        potentialFood += Objects.requireNonNull(ItemVer.getFoodComponent( Items.BREAD)).getHunger() * potentialBread;
+        // Check smelting
+        AbstractContainerMenu screen = mod.getPlayer().containerMenu;
+        if (screen instanceof SmokerMenu) {
+            potentialFood += getFoodPotential(StorageHelper.getItemStackInSlot(SmokerSlot.INPUT_SLOT_MATERIALS));
+            potentialFood += getFoodPotential(StorageHelper.getItemStackInSlot(SmokerSlot.OUTPUT_SLOT));
+        }
+        return potentialFood;
+    }
+
+    @Override
+    protected void onStart() {
+        surfaceSearchTask = null;
+        AltoClef mod = AltoClef.getInstance();
+
+        mod.getBehaviour().push();
+        // Collected food must survive inventory cleanup, but remain available to eat
+        // before the full collection target is reached. Inherited reservations remain.
+        mod.getBehaviour().addDiscardProtectedItems(ITEMS_TO_PICK_UP);
+        mod.getBehaviour().addDiscardProtectedItems(Items.SWEET_BERRIES);
+        mod.getBehaviour().addProtectedItems(Items.HAY_BLOCK);
+    }
+
+    @Override
+    protected Task onTick() {
+        AltoClef mod = AltoClef.getInstance();
+
+        blackListChickenJockeys(mod);
+
+        List<BlockPos> haysPos = mod.getBlockScanner().getKnownLocations(Blocks.HAY_BLOCK);
+        for (BlockPos HaysPos : haysPos) {
+            BlockPos haysUpPos = HaysPos.above();
+            if (mod.getWorld().getBlockState(haysUpPos).getBlock() == Blocks.CARVED_PUMPKIN) {
+                Debug.logMessage("Blacklisting pillage hay bales.");
+                mod.getBlockScanner().requestBlockUnreachable(HaysPos, 0);
+            }
+        }
+        // If we were previously smelting, keep on smelting.
+        if (smeltTask != null && smeltTask.isActive() && !smeltTask.isFinished()) {
+            // TODO: If we don't have cooking materials, cancel.
+            setDebugState("Cooking...");
+            return smeltTask;
+        } else {
+            smeltTask = null;
+        }
+
+        if (checkNewOptionsTimer.elapsed()) {
+            // Try a new resource task
+            checkNewOptionsTimer.reset();
+            currentResourceTask = null;
+        }
+
+        if (currentResourceTask != null && currentResourceTask.isActive() && !currentResourceTask.isFinished() && !currentResourceTask.thisOrChildAreTimedOut()) {
+            return currentResourceTask;
+        }
+
+        // Calculate potential
+        double potentialFood = calculateFoodPotential(mod);
+        if (potentialFood >= unitsNeeded) {
+            // Convert our raw foods
+            // PLAN:
+            // - If we have hay/wheat, make it into bread
+            // - If we have raw foods, smelt all of them
+
+            // Convert Hay+Wheat -> Bread.
+            // ⛔ A CRAFT TARGET OF 99999999 NEVER COMPLETES. ResourceTask.isFinished() compares the
+            // inventory count against the target, so an unreachable target means the craft task is
+            // never finished -- CollectFoodTask keeps returning it for ever, and once the wheat runs
+            // out the bot just sits at the table, times out, wanders and comes back, over and over
+            // ("it almost crafts the bread, then wanders off and keeps cycling that"). Target the
+            // amount we can actually make from the wheat we hold (and no more than we need), so the
+            // craft can end.
+            int wheatCount = mod.getItemStorage().getItemCount(Items.WHEAT);
+            if (wheatCount >= 3) {
+                setDebugState("Crafting Bread");
+                Item[] w = new Item[]{Items.WHEAT};
+                Item[] o = null;
+                int breadFromWheat = wheatCount / 3;
+                int breadHunger = Objects.requireNonNull(ItemVer.getFoodComponent(Items.BREAD)).getHunger();
+                int foodShortfall = Math.max(0, (int) Math.ceil(unitsNeeded) - StorageHelper.calculateInventoryFoodScore());
+                int breadNeeded = Math.max(1, (foodShortfall + breadHunger - 1) / breadHunger);
+                // ⛔ CraftInTableTask's count is an ABSOLUTE inventory target, not "how many to
+                // make". Passing just the number we are short made the task satisfied before it began
+                // (the bread already in the pack counted toward it), so it neither crafted nor
+                // completed. Add what is already held — the operator hit exactly this with 20 bread
+                // in the pack and a "craft 12" request.
+                int breadTarget = Math.min(breadFromWheat, breadNeeded)
+                        + mod.getItemStorage().getItemCount(Items.BREAD);
+                currentResourceTask = new CraftInTableTask(new RecipeTarget(Items.BREAD, breadTarget, CraftingRecipe.newShapedRecipe("bread", new Item[][]{w, w, w, o, o, o, o, o, o}, 1)), false, false);
+                return currentResourceTask;
+            }
+            int hayCount = mod.getItemStorage().getItemCount(Items.HAY_BLOCK);
+            if (hayCount >= 1) {
+                setDebugState("Crafting Wheat");
+                Item[] o = null;
+                // Each hay block yields 9 wheat; target that finite number, not "infinity".
+                currentResourceTask = new CraftInInventoryTask(new RecipeTarget(Items.WHEAT, hayCount * 9, CraftingRecipe.newShapedRecipe("wheat", new Item[][]{new Item[]{Items.HAY_BLOCK}, o, o, o}, 9)), false, false);
+                return currentResourceTask;
+            }
+            // Convert raw foods -> cooked foods
+            // ⛔ RESTORED 2026-09-05: this loop was commented out, which combined with the
+            // `smeltTask` field being `final = null` (also fixed) meant raw meat could never
+            // actually be cooked. calculateFoodPotential()/getFoodPotential() above credit raw
+            // meat with its COOKED hunger value on the assumption it will be smelted -- so once
+            // enough raw meat accumulated to satisfy `unitsNeeded` on paper, this task stopped
+            // gathering (potentialFood >= unitsNeeded) but isFinished() checks the REAL current
+            // score via StorageHelper.calculateInventoryFoodScore(), which does not credit raw
+            // meat at cooked value. With no live path to actually cook it, the task could neither
+            // progress (this branch had nothing to return past the two bread checks, falling
+            // through to `return new TimeoutWanderTask()`) nor finish. Restored to match the
+            // sibling CollectMeatTask.java's working implementation of the identical pattern.
+            for (CookableFoodTarget cookable : COOKABLE_FOODS) {
+                if (!canCookHere()) break;
+                int rawCount = mod.getItemStorage().getItemCount(cookable.getRaw());
+                if (rawCount > 0) {
+                    //Debug.logMessage("STARTING COOK OF " + cookable.getRaw().getTranslationKey());
+                    int toSmelt = rawCount + mod.getItemStorage().getItemCount(cookable.getCooked());
+                    smeltTask = adris.altoclef.tasks.container.CookFood.task(mod,
+                            new SmeltTarget(new ItemTarget(cookable.cookedFood, toSmelt), new ItemTarget(cookable.rawFood, rawCount)), true);
+                    return smeltTask;
+                }
+            }
+        } else {
+            // Pick up food items from ground
+            for (Item item : ITEMS_TO_PICK_UP) {
+                Task t = this.pickupTaskOrNull(mod, item);
+                if (t != null) {
+                    setDebugState("Picking up Food: " + item.getDescriptionId());
+                    currentResourceTask = t;
+                    return currentResourceTask;
+                }
+            }
+            // Pick up raw/cooked foods on ground
+            for (CookableFoodTarget cookable : COOKABLE_FOODS) {
+                Task t = this.pickupTaskOrNull(mod, cookable.getRaw(), 20);
+                if (t == null) t = this.pickupTaskOrNull(mod, cookable.getCooked(), 40);
+                if (t != null) {
+                    setDebugState("Picking up Cookable food");
+                    currentResourceTask = t;
+                    return currentResourceTask;
+                }
+            }
+            // Hay blocks
+            Task hayTaskBlock = this.pickupBlockTaskOrNull(mod, Blocks.HAY_BLOCK, Items.HAY_BLOCK, 300);
+            if (hayTaskBlock != null) {
+                setDebugState("Collecting Hay");
+                currentResourceTask = hayTaskBlock;
+                return currentResourceTask;
+            }
+            // Crops
+            for (CropTarget target : CROPS) {
+                // If crops are nearby. Do not replant cause we don't care.
+                Task t = pickupBlockTaskOrNull(mod, target.cropBlock, target.cropItem, (blockPos -> {
+                    BlockState s = mod.getWorld().getBlockState(blockPos);
+                    Block b = s.getBlock();
+                    if (b instanceof CropBlock) {
+                        boolean isWheat = !(b instanceof PotatoBlock || b instanceof CarrotBlock || b instanceof BeetrootBlock);
+                        if (isWheat) {
+                            // Chunk needs to be loaded for wheat maturity to be checked.
+                            if (!mod.getChunkTracker().isChunkLoaded(blockPos)) {
+                                return false;
+                            }
+                            // Prune if we're not mature/fully grown wheat.
+                            CropBlock crop = (CropBlock) b;
+                            return crop.isMaxAge(s);
+                        }
+                    }
+                    // Unbreakable.
+                    return WorldHelper.canBreak(blockPos);
+                    // We're not wheat so do NOT reject.
+                }), 96);
+                if (t != null) {
+                    setDebugState("Harvesting " + target.cropItem.getDescriptionId());
+                    currentResourceTask = t;
+                    return currentResourceTask;
+                }
+            }
+            // Cooked foods
+            double bestScore = 0;
+            Entity bestEntity = null;
+            Item bestRawFood = null;
+            Predicate<Entity> notBaby = entity -> entity instanceof LivingEntity livingEntity && !livingEntity.isBaby();
+
+            for (CookableFoodTarget cookable : COOKABLE_FOODS) {
+                if (!mod.getEntityTracker().entityFound(cookable.mobToKill)) continue;
+                Optional<Entity> nearest = mod.getEntityTracker().getClosestEntity(mod.getPlayer().position(),notBaby ,cookable.mobToKill);
+                if (nearest.isEmpty()) continue; // ?? This crashed once?
+                int hungerPerformance = cookable.getCookedUnits();
+                double sqDistance = nearest.get().distanceToSqr(mod.getPlayer());
+                double score = (double) 100 * hungerPerformance / (sqDistance);
+                if (cookable.isFish()) {
+                    score = 0;
+                }
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestEntity = nearest.get();
+                    bestRawFood = cookable.getRaw();
+                }
+            }
+            if (bestEntity != null) {
+                setDebugState("Killing " + bestEntity.getType().getDescriptionId());
+                currentResourceTask = killTaskOrNull(bestEntity, notBaby, bestRawFood);
+                return currentResourceTask;
+            }
+
+            // Sweet berries (separate from crops because they should have a lower priority than everything else cause they suck)
+            Task berryPickup = pickupBlockTaskOrNull(mod, Blocks.SWEET_BERRY_BUSH, Items.SWEET_BERRIES, 96);
+            if (berryPickup != null) {
+                setDebugState("Getting sweet berries (no better foods are present)");
+                currentResourceTask = berryPickup;
+                return currentResourceTask;
+            }
+        }
+
+        // Known food remains preferable, including food in a cave. With no option,
+        // explore a habitat where new food can appear instead of orbiting underground.
+        if (WorldHelper.getCurrentDimension() == Dimension.OVERWORLD) {
+            BlockPos feet = mod.getPlayer().blockPosition();
+            // Excavating an open shaft lowers its heightmap even while its floor is
+            // several blocks below the surrounding terrain. Keep the selected surface
+            // level until the body can step out, instead of treating open sky as arrival.
+            int top = surfaceSearchTask != null ? surfaceSearchY
+                    : mod.getWorld().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, feet.getX(), feet.getZ());
+            // ⛔ WATER OVERHEAD IS NOT A CEILING (full58 resume, 2026-10-01). The heightmap counts
+            // water as blocking, so a body swimming three blocks down in open water read as
+            // "underground" and was sent to a dry surface it never reached: 45 minutes at 4.8 health
+            // with nothing to eat. Underground means rock over the head.
+            boolean underCover = surfaceSearchTask != null || rockOverhead(mod, feet, top);
+            // And a surface search that stops closing in is given up for the outward search.
+            if (surfaceSearchTask != null) {
+                double d = mod.getPlayer().position().distanceTo(net.minecraft.world.phys.Vec3.atCenterOf(
+                        new BlockPos(feet.getX(), surfaceSearchY, feet.getZ())));
+                if (d < surfaceSearchBest - 2) {
+                    surfaceSearchBest = d;
+                    surfaceSearchSinceMs = System.currentTimeMillis();
+                } else if (System.currentTimeMillis() - surfaceSearchSinceMs > SURFACE_PATIENCE_MS) {
+                    surfaceSearchGivenUp++;
+                    surfaceSearchTask = null;
+                    underCover = false;
+                }
+            }
+            if (underCover && feet.getY() + 1 < top) {
+                // Release within one upward step of the selected surface: the original
+                // endpoint can float one block above its footing after excavation.
+                if (surfaceSearchTask != null && surfaceSearchTask.isActive() && !surfaceSearchTask.isFinished()) {
+                    setDebugState("Searching for food on the surface");
+                    return surfaceSearchTask;
+                }
+                BlockPos surface = closestDrySurface(mod, feet);
+                if (surface != null) {
+                    surfaceSearchTask = new GetToBlockTask(surface);
+                    surfaceSearchY = surface.getY();
+                    surfaceSearchSinceMs = System.currentTimeMillis();
+                    surfaceSearchBest = Double.POSITIVE_INFINITY;
+                    setDebugState("Searching for food on the surface");
+                    return surfaceSearchTask;
+                }
+            }
+        }
+        surfaceSearchTask = null;
+        // The Nether has no food to find by wandering: no animals, no crops, and hoglins only in
+        // crimson forests, which the checks above already take when one is in sight. Wandering
+        // there hungry is how a run once stood at 4 hearts and 6 food for as long as it lasted,
+        // unable to regenerate or to fight. Food lives in the Overworld, so go back for it.
+        if (WorldHelper.getCurrentDimension() == Dimension.NETHER) {
+            setDebugState("No food in sight in the Nether: going to the Overworld for it");
+            return new DefaultGoToDimensionTask(Dimension.OVERWORLD);
+        }
+        // Already exposed, outside the Overworld, or no loaded dry surface nearby.
+        setDebugState("Searching...");
+        // On the surface with nothing in sight: go somewhere else, not round in circles here
+        // (ExploreOutwardTask says why; full52 resume, 2026-09-29).
+        if (WorldHelper.getCurrentDimension() == Dimension.OVERWORLD) {
+            return new adris.altoclef.tasks.movement.ExploreOutwardTask();
+        }
+        return new TimeoutWanderTask();
+    }
+
+    /** A solid block between the head and the top of the column: rock, not water, overhead. */
+    private static boolean rockOverhead(AltoClef mod, BlockPos feet, int top) {
+        var world = mod.getWorld();
+        for (int y = feet.getY() + 2; y < top; y++) {
+            BlockPos p = new BlockPos(feet.getX(), y, feet.getZ());
+            if (!world.getBlockState(p).getCollisionShape(world, p).isEmpty()) return true;
+        }
+        return false;
+    }
+
+    /** Choose a loaded dry surface; ordinary navigation owns digging and construction. */
+    private static BlockPos closestDrySurface(AltoClef mod, BlockPos feet) {
+        var world = mod.getWorld();
+        BlockPos best = null;
+        double bestDistance = Double.POSITIVE_INFINITY;
+        for (int dx = -SURFACE_SEARCH_RADIUS; dx <= SURFACE_SEARCH_RADIUS; dx++) {
+            for (int dz = -SURFACE_SEARCH_RADIUS; dz <= SURFACE_SEARCH_RADIUS; dz++) {
+                int x = feet.getX() + dx, z = feet.getZ() + dz;
+                if (!mod.getChunkTracker().isChunkLoaded(new BlockPos(x, feet.getY(), z))) continue;
+                int top = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                double support = PlayerFit.supportTop(world, new BlockPos(x, top, z));
+                if (Double.isNaN(support) || !PlayerFit.bodyFits(world, x + 0.5, support, z + 0.5)) continue;
+                BlockPos candidate = new BlockPos(x, (int) Math.floor(support), z);
+                if (!world.getFluidState(candidate).isEmpty()
+                        || !world.getFluidState(candidate.below()).isEmpty()
+                        || !WorldHelper.canReach(candidate)) continue;
+                // The bottom of a 1x1 shaft has open sky above it and is no surface: full55 kept
+                // "reaching the surface" one cell over, at the foot of the shaft next to its own.
+                boolean walledIn = true;
+                for (net.minecraft.core.Direction d : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+                    BlockPos n = candidate.relative(d);
+                    if (world.getBlockState(n).getCollisionShape(world, n).isEmpty()) {
+                        walledIn = false;
+                        break;
+                    }
+                }
+                if (walledIn) continue;
+                double dy = support - mod.getPlayer().getY();
+                double distance = dx * dx + dz * dz + dy * dy;
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = candidate;
+                }
+            }
+        }
+        return best;
+    }
+
+    static void blackListChickenJockeys(AltoClef mod) {
+        if (mod.getEntityTracker().entityFound(Chicken.class)) {
+            Optional<Entity> chickens = mod.getEntityTracker().getClosestEntity(Chicken.class);
+            if (chickens.isPresent()) {
+                Iterable<Entity> entities = mod.getWorld().entitiesForRendering();
+                for (Entity entity : entities) {
+                    if (entity instanceof Monster || entity instanceof Slime) {
+                        if (chickens.get().hasPassenger(entity)) {
+                            if (mod.getEntityTracker().isEntityReachable(entity)) {
+                                Debug.logMessage("Blacklisting chicken jockey.");
+                                mod.getEntityTracker().requestEntityUnreachable(chickens.get());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Override
+    protected void onStop(Task interruptTask) {
+        AltoClef.getInstance().getBehaviour().pop();
+    }
+
+    @Override
+    public boolean isFinished() {
+        // ⛔ FIXED 2026-09-05: missing `&& smeltTask == null`, matching CollectMeatTask.isFinished().
+        // Without it, this could return true while a smelt was still in progress -- the potential
+        // score (which counts raw meat as its cooked value) can already satisfy unitsNeeded before
+        // the smoker has actually finished converting it.
+        return StorageHelper.calculateInventoryFoodScore() >= unitsNeeded && smeltTask == null;
+    }
+
+    @Override
+    protected boolean isEqual(Task other) {
+        if (other instanceof CollectFoodTask task) {
+            return task.unitsNeeded == unitsNeeded;
+        }
+        return false;
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "Collect " + unitsNeeded + " units of food.";
+    }
+
+    /**
+     * Returns a task that mines a block and picks up its output.
+     * Returns null if task cannot reasonably run.
+     */
+    private Task pickupBlockTaskOrNull(AltoClef mod, Block blockToCheck, Item itemToGrab, Predicate<BlockPos> accept, double maxRange) {
+        Predicate<BlockPos> acceptPlus = (blockPos) -> {
+            if (!WorldHelper.canBreak(blockPos)) return false;
+            return accept.test(blockPos);
+        };
+        Optional<BlockPos> nearestBlock = mod.getBlockScanner().getNearestBlock(mod.getPlayer().position(), acceptPlus, blockToCheck);
+
+        if (nearestBlock.isPresent() && !nearestBlock.get().closerToCenterThan(mod.getPlayer().position(), maxRange)) {
+            nearestBlock = Optional.empty();
+        }
+
+        Optional<ItemEntity> nearestDrop = Optional.empty();
+        if (mod.getEntityTracker().itemDropped(itemToGrab)) {
+            nearestDrop = mod.getEntityTracker().getClosestItemDrop(mod.getPlayer().position(), itemToGrab);
+        }
+
+        if (nearestDrop.isPresent()) {
+            return pickupTaskOrNull(mod,itemToGrab);
+        }
+        if (nearestBlock.isPresent()) {
+            return new DoToClosestBlockTask(DestroyBlockTask::new, acceptPlus, blockToCheck);
+        }
+
+        return null;
+    }
+
+    private Task pickupBlockTaskOrNull(AltoClef mod, Block blockToCheck, Item itemToGrab, double maxRange) {
+        return pickupBlockTaskOrNull(mod, blockToCheck, itemToGrab, toAccept -> true, maxRange);
+    }
+
+    private Task killTaskOrNull(Entity entity, Predicate<Entity> entityPredicate, Item itemToGrab) {
+        return new KillAndLootTask(entity.getClass(), entityPredicate, new ItemTarget(itemToGrab, 1));
+    }
+
+    /**
+     * Returns a task that picks up a dropped item.
+     * Returns null if task cannot reasonably run.
+     */
+    private Task pickupTaskOrNull(AltoClef mod, Item itemToGrab, double maxRange) {
+        Optional<ItemEntity> nearestDrop = Optional.empty();
+        if (mod.getEntityTracker().itemDropped(itemToGrab)) {
+            nearestDrop = mod.getEntityTracker().getClosestItemDrop(mod.getPlayer().position(), itemToGrab);
+        }
+        if (nearestDrop.isPresent()) {
+            if (nearestDrop.get().closerThan(mod.getPlayer(), maxRange)) {
+                if (mod.getItemStorage().getSlotsThatCanFitInPlayerInventory(nearestDrop.get().getItem(), false).isEmpty()) {
+                    Optional<Slot> slot = StorageHelper.getGarbageSlot(mod);
+
+                    // tf am I supposed to do if its empty
+                    if (slot.isPresent()) {
+                        ItemStack stack = StorageHelper.getItemStackInSlot(slot.get());
+                        if (ItemVer.isFood(stack.getItem())) {
+                            // calculate priority, if the item laying on the ground has lower priority than the one we are gonna throw out because of it
+                            // dont pick it up, otherwise we would get stuck in an infinite loop
+                            int inventoryCost = ItemVer.getFoodComponent(stack.getItem()).getHunger() * stack.getCount();
+
+                            double hunger = 0;
+                            if (ItemVer.isFood(itemToGrab)) {
+                                hunger = ItemVer.getFoodComponent(itemToGrab).getHunger();
+                            } else if (itemToGrab.equals(Items.WHEAT)) {
+                                hunger += ItemVer.getFoodComponent(Items.BREAD).getHunger()/3d;
+                            } else {
+                                mod.log("unknown food item: "+itemToGrab);
+                            }
+                            int groundCost = (int) (hunger * nearestDrop.get().getItem().getCount());
+
+                            if (inventoryCost > groundCost) return null;
+                        }
+                    }
+                }
+                return new PickupDroppedItemTask(new ItemTarget(itemToGrab), true);
+            }
+        }
+        return null;
+    }
+
+    private Task pickupTaskOrNull(AltoClef mod, Item itemToGrab) {
+        return pickupTaskOrNull(mod, itemToGrab, Double.POSITIVE_INFINITY);
+    }
+
+    @SuppressWarnings("rawtypes")
+    public static class CookableFoodTarget {
+        public String rawFood;
+        public String cookedFood;
+        public Class mobToKill;
+
+        public CookableFoodTarget(String rawFood, String cookedFood, Class mobToKill) {
+            this.rawFood = rawFood;
+            this.cookedFood = cookedFood;
+            this.mobToKill = mobToKill;
+        }
+
+        public CookableFoodTarget(String rawFood, Class mobToKill) {
+            this(rawFood, "cooked_" + rawFood, mobToKill);
+        }
+
+        public Item getRaw() {
+            return Objects.requireNonNull(TaskCatalogue.getItemMatches(rawFood))[0];
+        }
+
+        public Item getCooked() {
+            return Objects.requireNonNull(TaskCatalogue.getItemMatches(cookedFood))[0];
+        }
+
+        public int getCookedUnits() {
+            assert ItemVer.getFoodComponent(getCooked()) != null;
+            return ItemVer.getFoodComponent(getCooked()).getHunger();
+        }
+
+        public boolean isFish() {
+            return false;
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static class CookableFoodTargetFish extends CookableFoodTarget {
+
+        public CookableFoodTargetFish(String rawFood, Class mobToKill) {
+            super(rawFood, mobToKill);
+        }
+
+        @Override
+        public boolean isFish() {
+            return true;
+        }
+    }
+
+    public static class CropTarget {
+        public Item cropItem;
+        public Block cropBlock;
+
+        public CropTarget(Item cropItem, Block cropBlock) {
+            this.cropItem = cropItem;
+            this.cropBlock = cropBlock;
+        }
+    }
+}

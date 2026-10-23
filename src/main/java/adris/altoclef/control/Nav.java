@@ -1,0 +1,661 @@
+package adris.altoclef.control;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.util.goals.AltoGoal;
+import net.minecraft.world.phys.Vec3;
+
+/**
+ * The one place altoclef talks to a pathfinder.
+ *
+ * <h2>Why this exists</h2>
+ *
+ * G-0 is "stop depending on baritone", and after the goal TYPE (see {@link AltoGoal}) the second
+ * thing holding the two together is the ENGINE, reached through {@code mod.getClientBaritone()}.
+ * Counted across src/main that is about sixty calls in thirty files, and almost all of them say one
+ * of four things: stop navigating, are we navigating, is it safe to interrupt, go here.
+ *
+ * <p>Scattered like that the dependency cannot be removed — every task would have to be edited on
+ * the day the engine changes. Behind this facade it can: the tasks state intent, and WHICH engine
+ * serves it is decided here, in one file. When the legacy half goes, it goes from this file only.
+ *
+ * <h2>What it deliberately does not do</h2>
+ *
+ * It does not change behaviour. Each method does exactly what the call sites do today, including
+ * which engine they address — a sweep that quietly alters semantics cannot be measured, and the
+ * cancel calls in particular are load-bearing in ways that need their own pass (today
+ * {@link #cancel()} stops the legacy engine and leaves a tungsten walk running, because that is
+ * what the call sites currently do; the stuck-handler in CustomBaritoneGoalTask calls it every time
+ * the progress checker trips, and stopping tungsten there would abort a healthy leg).
+ *
+ * <p>It is null-safe throughout, which the raw calls were not: {@code getClientBaritone()} returns
+ * null when the engine did not initialise, and a task that cancels pathing on that path threw.
+ */
+public final class Nav {
+
+    private Nav() {
+    }
+
+    // engine() REMOVED (G-0, 2026-08-24): there is no second engine to return.
+
+    /** Stop navigating. Safe to call when nothing is. */
+    public static void cancel() {
+        // G-0: tungsten is the only engine now. Cancelling means stopping tungsten.
+        // ⛔ THIS WAS A NO-OP AND MUST STAY ONE. Same trap as Nav.pause(), which cost every
+        // pickup course before it was caught: the line here addressed the LEGACY engine, and that
+        // engine had not been pathing for months, so the call did nothing at all.
+        //
+        // G-0 replaced it with TungstenHelper.stop(), which turns 35 call sites of Nav.cancel()
+        // into 35 places that kill the live pathfinder. The worst of them is inside
+        // driveTungstenPrimary itself:
+        //
+        //     if (!busy && pf != null) { pf.find(...); }   // kick the async search
+        //     Nav.cancel();                                // and immediately stop it
+        //
+        // The search is started and killed on the same tick, every tick. That is the stall the
+        // repro reproduces: pdEnter=1921, pdWalking=0, mqStarted=0, and 135 completed breaks
+        // without a single step.
+        //
+        // Cancelling tungsten deliberately is what TungstenHelper.stop() is FOR, and the places
+        // that mean it call it directly.
+    }
+
+    /** Times {@link #cancelAll} ran, and times it found a route still running. Read as navStop. */
+    public static volatile int navStopped, navStoppedLive;
+
+    /**
+     * Stop navigating on EVERY engine, because there is no goal any more.
+     *
+     * <h2>Why this is a second method and not a stronger {@link #cancel()}</h2>
+     *
+     * They answer different questions, and this file's own header says so: {@code cancel()} means
+     * "abandon this attempt" and is called by the stuck-handler every time the progress checker
+     * trips, so tearing tungsten down inside it would abort a healthy leg. This one means "there is
+     * nothing left to walk to", which is true in exactly two places -- the user cancelled
+     * everything, or the task finished and the runner was switched off.
+     *
+     * <h2>What it was for</h2>
+     *
+     * A search in flight outlives the task that asked for it. Traced on mine_stone: the task ended
+     * at 29.5 s with its eight cobblestone gathered, and two seconds later a route arrived --
+     * {@code MovementQueue: 8 movement(s) 0,-63,0 -> 0,-55,0} -- and the bot spent every block it
+     * had just mined building a tower out of its own pit. It then stood on top of that tower for
+     * the remaining 84 seconds, with an empty pack, while the course read the pack.
+     *
+     * <p>Neither existing stop covered it. {@code AltoClef.stopTasks()} cancels the CHAIN and never
+     * speaks to tungsten at all, and tungsten's own {@code ;stop} is a separate command the bot
+     * never issues to itself. So between "the job is done" and "something is walking me" there was
+     * no connection in either direction.
+     *
+     * <h2>Deliberately navigation only</h2>
+     *
+     * {@code TungstenMod.resetAllState()} exists and is the hard reset -- but it also stops the
+     * punk task, the bow and the aim, and clears every key. That is right on a disconnect and wrong
+     * here: the agent drives tungsten primitives DIRECTLY over py4j (that is the whole design), so
+     * an altoclef task ending must not silently kill a shot the agent lined up. What ends when the
+     * goal ends is the route: the navigator (which cascades to the movement queue), the waypoint
+     * walker, the physics search and its executor, and the two building manoeuvres that only ever
+     * exist to serve a route.
+     */
+    public static void cancelAll() {
+        // There is no goal on EITHER engine now, so Baritone is stopped here too -- and before the
+        // tungsten-only config gate below, which must not decide whether Baritone is left walking.
+        if (BaritoneBridge.selected()) {
+            BaritoneBridge.cancel();
+        }
+        if (!kaptainwutax.tungsten.TungstenConfig.get().navStopOnTaskEnd) {
+            return;
+        }
+        navStopped++;
+        // COUNT THE BUG, NOT JUST THE CALL. A counter that only says "the teardown ran" cannot
+        // tell a fix from a no-op; this half says something was ACTUALLY still navigating when the
+        // goal stopped existing, which is the defect itself and the mechanism gate for the A/B.
+        //
+        // NOT isPathing(): that asks whether a route is being FOLLOWED, and the defect starts one
+        // step earlier -- a SEARCH still running, whose result arrives after the task is gone. The
+        // traced instance had exactly that shape (the route landed two seconds after "task
+        // FINISHED"), so isPathing() would have read false at the moment of teardown and reported
+        // the bug as absent. It also routes through TungstenHelper.isActive(), which returns false
+        // outright when its own `active` flag is down, whatever the engines are doing. Ask the
+        // engines.
+        try {
+            if (isPathing()
+                    || kaptainwutax.tungsten.TungstenModDataContainer.PATHFINDER.active.get()
+                    || kaptainwutax.tungsten.TungstenModDataContainer.isExecutorRunning()
+                    || kaptainwutax.tungsten.path.movements.MovementQueue.isRunning()) {
+                navStoppedLive++;
+            }
+        } catch (Exception ignored) {
+            // an instrument must never be the thing that breaks a stop
+        }
+        cancel();
+        try {
+            // ONE implementation, in tungsten, shared with `;stop` and with the disconnect reset.
+            // Listing the engines here instead would be a fourth teardown that drifts out of step
+            // with the other three -- which is precisely the defect this method exists to fix.
+            kaptainwutax.tungsten.TungstenMod.stopNavigation();
+        } catch (Exception e) {
+            adris.altoclef.Debug.logMessage("Nav.cancelAll: " + e);
+        }
+    }
+
+    /**
+     * Is a route being followed right now?
+     *
+     * <h2>This answered for the wrong engine, in about thirty-five gates</h2>
+     *
+     * It asked the LEGACY engine, which never paths now, so it said NO permanently -- and twenty
+     * files gate real behaviour on it: DestroyBlockTask will not mine while pathing,
+     * PlaceBlockTask will not place, the interaction-fix chain will not touch the inventory, the
+     * unstuck chain will not intervene. Every one of those guards has been open since the engine
+     * swap, which means those tasks have been acting on the body WHILE tungsten was walking it.
+     * That is the same shape as the pre-equip chain and hasBaritoneGoal, and it is the largest
+     * instance of it.
+     *
+     * <p>Answering for whichever engine is driving is exactly what this facade exists to do: the
+     * question is "is the body committed to a route", and tungsten's helper, its movement queue and
+     * its walker are the three things that commit it. That change is written and ready --
+     *
+     * <pre>
+     *   if (TungstenHelper.isActive() || MovementQueue.isRunning() || BlockPathWalker.isRunning())
+     *       return true;
+     * </pre>
+     *
+     * -- and it is IN now, with an A/B behind it rather than a hope. It was parked for an evening
+     * because it flips about thirty-five gates in twenty files and the stand's numbers were being
+     * eaten by another project's load; what unparked it was noticing that the bot clears its rung
+     * even at 10 fps, so a matched pair of samples is possible after all. Baseline arm, three runs
+     * on the build without it: one starved-INVALID, then wood at 198.2s and 175.3s. Arm with it in:
+     * two starved-INVALID and one valid run that cleared wood in 43.3s.
+     *
+     * <p>What that pair does and does not say. It does NOT establish an improvement -- one valid
+     * sample against two, on a bench whose same-build spread runs from 21s to 280s. It does settle
+     * the question this was parked for: closing thirty-five gates does not stop the bot clearing
+     * its rung, and the one run that measured the bot rather than the machine was the fastest of
+     * the five. Absence of breakage is what was in doubt, and it is answered.
+     */
+    public static boolean isPathing() {
+        // The engine the player chose answers here, not a fixed one: when Baritone drives, every
+        // gate that asks "is the body committed to a route" must see Baritone's route.
+        if (BaritoneBridge.selected() && BaritoneBridge.isPathing()) return true;
+        if (adris.altoclef.util.helpers.TungstenHelper.isActive()
+                || kaptainwutax.tungsten.path.movements.MovementQueue.isRunning()
+                || kaptainwutax.tungsten.task.BlockPathWalker.isRunning()) {
+            return true;
+        }
+        return kaptainwutax.tungsten.TungstenModDataContainer.PATHFINDER.active.get();
+    }
+
+    /** Times {@link #isExecutingRoute} said no while {@link #isPathing} said yes. Read as navSearchOnly. */
+    public static volatile int navSearchOnly;
+
+    /**
+     * Which of {@link #isPathing()}'s five primitive sources was true, sampled on a STALLED tick.
+     *
+     * <p>Read as {@code stallWhy=lock/search/exec/queue/walker} against {@code wanderDenied=d/t}.
+     * The counters are independent, not a partition: more than one source can hold at once, so
+     * they are five yes/no tallies over the same denominator, and they can sum past it.
+     *
+     * <h2>The question these exist to answer</h2>
+     *
+     * The wander holds the tick for thousands of ticks, covers half a block, and on 83-94% of
+     * those ticks {@link #isPathing()} says a route is being followed while the body does not
+     * move. That much is measured across six runs. What was never asked is WHICH of the five
+     * things {@code isPathing()} ORs together is the one saying yes, and the five have entirely
+     * different meanings:
+     *
+     * <ul>
+     *   <li>{@code lock} -- {@code TungstenHelper.isLocked()}, which is deliberately true BETWEEN
+     *       path segments, so it reports "pathing" while nothing at all is running;
+     *   <li>{@code search} -- the pathfinder is searching and has not produced a route;
+     *   <li>{@code exec} -- the executor is running a route;
+     *   <li>{@code queue} / {@code walker} -- the two drives that actually press keys.
+     * </ul>
+     *
+     * A stall concentrated in {@code lock} or {@code search} is a stall in which NOTHING is
+     * driving the body and the flag merely says otherwise; one concentrated in {@code queue} or
+     * {@code walker} is a drive that holds the body and fails to move it. Those need opposite
+     * fixes, and no measurement in this repository separates them.
+     *
+     * <p>⛔ SAMPLED AT THE DENIAL, NOT AT THE CALL. Nav's earlier {@link #navSearchOnly} counts
+     * ticks on which somebody happened to CALL {@code isExecutingRoute}, which makes it a tally of
+     * a code path rather than of the state -- the same blinding that made four counters in this
+     * session read zero for conditions that were occurring. This one is incremented from the
+     * wander's own stall branch, so its denominator is a stalled tick by construction.
+     */
+    public static volatile int stallWhyLock, stallWhySearch, stallWhyExec, stallWhyQueue, stallWhyWalker;
+
+    /**
+     * WHAT the executor is doing on a stalled tick, when it is the thing reporting "running".
+     *
+     * <p>Read as {@code stallExec=break/place/replay/armed/idxStuck}. Sampled only from
+     * {@link #noteStallSources()}, so the denominator is {@code stallWhyExec} -- a stalled tick on
+     * which the executor claimed to be running.
+     *
+     * <h2>Why this is the question left standing</h2>
+     *
+     * The lock was measured on 100.0% of stalled ticks and dropping the IDLE half of it did not
+     * shorten the stall (idleLockIsNotALock, rejected). What that A/B left behind is sharper: in
+     * its fix arms the stalled lock was executing 49/67/84% of the time while
+     * {@code MovementQueue.isRunning()} and {@code BlockPathWalker.isRunning()} read ZERO in all
+     * six runs of both arms. So a drive holds the body and never steps it.
+     *
+     * <p>{@code PathExecutor.isRunning()} is a STATE -- "a path exists and the replay has not run
+     * off its end" -- and an executor whose tick index never advances satisfies it for ever. These
+     * five separate the shapes that state can hide:
+     *
+     * <ul>
+     *   <li>{@code break} / {@code place} -- mining a wall or bridging a gap, which legitimately
+     *       hold the body still and run with an EMPTY path;
+     *   <li>{@code replay} -- neither, so an actual path replay that is producing no queue steps;
+     *   <li>{@code armed} -- spliced and waiting for the walker to reach its root;
+     *   <li>{@code idxStuck} -- the replay index did not move since the previous stalled sample,
+     *       which distinguishes "advancing but not moving the body" from "not advancing at all".
+     * </ul>
+     *
+     * <p>⛔ These are shapes, not causes. Naming which one holds is the whole point of the pass;
+     * the previous two passes each asserted a cause from a co-occurrence and were refuted.
+     */
+    public static volatile int stallExecBreak, stallExecPlace, stallExecReplay,
+            stallExecArmed, stallExecIdxStuck;
+
+    /**
+     * Of the stalled ticks where the executor was mining or bridging, how many altoclef's progress
+     * checker could SEE as work. Read as {@code stallExecWork=seen/blind}.
+     *
+     * <p>blind dominating means the give-up machinery is scoring legitimate digging as a stall,
+     * and the dead-time attribution built on wanderResetDenied is overstated by that much.
+     */
+    public static volatile int stallExecWorkSeen, stallExecWorkBlind;
+
+    /**
+     * Of the stalled ticks holding a break queue, how many had the miner actually RUNNING.
+     * Read as {@code stallMiner=running/queuedOnly}.
+     *
+     * <p>{@code queuedOnly} dominating means stallExecWork's 0/11418 is bookkeeping, not a defect:
+     * the executor was walking to the wall with a plan in hand, and of course vanilla was not
+     * breaking. {@code running} dominating means the miner really was executing and still broke
+     * nothing, which is the defect that figure was read as.
+     */
+    public static volatile int stallExecMining, stallExecQueuedOnly;
+
+    /** Stalled ticks that were BRIDGING, not mining. They can never satisfy isBreakingBlock(),
+     *  which is why stallExecWork must not sample them. @see #stallExecWorkSeen */
+    public static volatile int stallExecPlacingOnly;
+
+    /** Replay index seen at the previous stalled sample, to tell a stuck index from a moving one. */
+    private static int lastStallExecIdx = -1;
+
+    /** @see #stallExecBreak */
+    private static void noteStallExecShape() {
+        var exec = kaptainwutax.tungsten.TungstenModDataContainer.EXECUTOR;
+        if (exec == null) return;
+        boolean breaking = exec.isBreakingNow();
+        boolean placing = exec.isPlacingNow();
+        // IS THE MINER EVEN RUNNING? A queued plan is not a running miner: tickBreaking only
+        // executes once the replay finished its segment, so an executor still WALKING to the wall
+        // holds a break queue and presses nothing. That state is indistinguishable from a miner
+        // that cannot break, and stallExecWork read 0 seen / 11418 blind across ten runs -- a
+        // figure that is either a defect or this bookkeeping, and nothing so far separates them.
+        if (breaking && exec.isMiningNow()) stallExecMining++;
+        else if (breaking) stallExecQueuedOnly++;
+        // ⛔ ASK THE BREAKING QUESTION ONLY WHERE IT CAN BE ANSWERED. This used to sample on
+        // (breaking || placing) and then test isBreakingBlock(), which is FALSE during bridging by
+        // definition -- so every placing tick counted as "blind" whether or not anything was
+        // wrong. Caught by stallMiner reading 0/0 against stallExecWork 0/534 on a run whose
+        // stallExec was 0/534/4/0/529: not one of those ticks was mining. The earlier 0 of 11418
+        // therefore mixes a meaningful breaking subset with a placing subset that could never
+        // read anything else.
+        if (placing && !breaking) stallExecPlacingOnly++;
+        if (breaking) {
+            // CAN THE GIVE-UP MACHINERY SEE THIS WORK? MovementProgressChecker protects mining
+            // through mod.getControllerExtras().isBreakingBlock(), which is fed by a mixin on
+            // vanilla's updateBlockBreakingProgress. If tungsten's own break queue drives that
+            // vanilla call the checker sees it and the denial is harmless bookkeeping; if it does
+            // not, altoclef is scoring legitimate digging as a stall. The two readings send the
+            // next pass in opposite directions, so it is a counter and not an argument.
+            try {
+                if (adris.altoclef.AltoClef.getInstance().getControllerExtras().isBreakingBlock()) {
+                    stallExecWorkSeen++;
+                } else {
+                    stallExecWorkBlind++;
+                }
+            } catch (Throwable ignored) {
+                // an instrument must never be the thing that breaks a tick
+            }
+        }
+        if (breaking) stallExecBreak++;
+        if (placing) stallExecPlace++;
+        if (!breaking && !placing) stallExecReplay++;
+        if (exec.isArmedNow()) stallExecArmed++;
+        int idx = exec.tickIndexNow();
+        if (idx == lastStallExecIdx) stallExecIdxStuck++;
+        lastStallExecIdx = idx;
+    }
+
+    /**
+     * Tally the primitive sources of {@link #isPathing()} for one tick already known to be stalled.
+     *
+     * <p>Call ONLY from a site that has established the body is not moving; the counters mean
+     * nothing over a denominator of ordinary ticks.
+     */
+    public static void noteStallSources() {
+        try {
+            if (adris.altoclef.util.helpers.TungstenHelper.isLocked()) stallWhyLock++;
+            if (kaptainwutax.tungsten.TungstenModDataContainer.PATHFINDER.active.get()) stallWhySearch++;
+            if (kaptainwutax.tungsten.TungstenModDataContainer.isExecutorRunning()) {
+                stallWhyExec++;
+                noteStallExecShape();
+            }
+            if (kaptainwutax.tungsten.path.movements.MovementQueue.isRunning()) stallWhyQueue++;
+            if (kaptainwutax.tungsten.task.BlockPathWalker.isRunning()) stallWhyWalker++;
+        } catch (Throwable ignored) {
+            // An instrument must never be the reason a run dies.
+        }
+    }
+
+    /**
+     * Is a route being FOLLOWED right now -- as opposed to merely searched for?
+     *
+     * <h2>Why the distinction is worth a second method</h2>
+     *
+     * {@link #isPathing()} answers "is the body committed to a route", and it says YES while a
+     * SEARCH is running, because {@code TungstenHelper.isActive()} includes
+     * {@code PATHFINDER.active}. For most of its ~35 callers that is right: do not mine, place or
+     * open the inventory while navigation owns the body.
+     *
+     * <p>It is exactly wrong for a progress check. Both give-up paths in this codebase open with
+     *
+     * <pre>
+     *   if (Nav.isPathing()) { progressChecker.reset(); }
+     *   if (... &amp;&amp; !progressChecker.check(mod)) { blacklist the target; try something else; }
+     * </pre>
+     *
+     * and a search that fails and restarts keeps the first line true for ever, so the second can
+     * NEVER fire. The checker exists to notice "the engine is busy and the body is not moving", and
+     * it was being reset for precisely that reason.
+     *
+     * <p>Measured on mine_stone, in every failing trace: the bot stands on one spot for 50-90
+     * seconds of a 120-second run with the task reading {@code Approach entity item -- Tungsten
+     * pathfinding (29s left)}, the countdown restarting each time it expires. The drop is never
+     * blacklisted, the wander never starts, mining never resumes, and the run scores 0. The
+     * blacklist machinery below it is elaborate, correct, and unreachable -- three separate bugs
+     * were found and fixed INSIDE it on mine_diamond while this line kept the whole block dead.
+     *
+     * <p>Same silhouette as this repo's two most expensive defects: a gate whose {@code awake} half
+     * could never fail, and a dodge whose keys never reached the game. The capability is present and
+     * cannot execute.
+     */
+    public static boolean isExecutingRoute() {
+        boolean executing = kaptainwutax.tungsten.path.movements.MovementQueue.isRunning()
+                || kaptainwutax.tungsten.task.BlockPathWalker.isRunning()
+                || kaptainwutax.tungsten.TungstenModDataContainer.isExecutorRunning();
+        if (!executing && isPathing()) {
+            navSearchOnly++;
+        }
+        return executing;
+    }
+
+    /** Times the answer was NO because tungsten had the body in the air. Read as navUnsafeAir. */
+    public static volatile int navUnsafeAir;
+
+    /**
+     * Can navigation be interrupted at this instant without leaving the bot mid-air?
+     *
+     * <p>The name says what the question is FOR, and the legacy engine's answer no longer serves
+     * it: baritone never paths now, so it said "yes, safe" every single time. About ten callers
+     * treat this as a permission -- attack, place, break, take a screen -- and they have therefore
+     * been granted it unconditionally, including with the body half-way through a jump. The
+     * evidence is in the counters those callers keep: dteUnsafe has read 0 in every run all
+     * session, which is not a quiet code path, it is a condition that cannot occur.
+     *
+     * <p>What makes an interruption unsafe is unchanged in meaning: the body is committed to
+     * something that ends in the air. While tungsten is running a route and the player is off the
+     * ground, that is exactly the case, and it clears itself within a tick or two of landing -- so
+     * the cost of the honest answer is that an action waits for the feet, which is what the callers
+     * wanted when they asked.
+     */
+    public static boolean isSafeToCancel() {
+        boolean tungstenDriving = adris.altoclef.util.helpers.TungstenHelper.isActive()
+                || kaptainwutax.tungsten.path.movements.MovementQueue.isRunning()
+                || kaptainwutax.tungsten.task.BlockPathWalker.isRunning()
+                || (BaritoneBridge.selected() && BaritoneBridge.isPathing());
+        if (tungstenDriving) {
+            net.minecraft.client.player.LocalPlayer p =
+                    net.minecraft.client.Minecraft.getInstance().player;
+            // ⛔ A HOP IS NOT A FALL, AND THE BOT HOPS CONSTANTLY BY DESIGN.
+            //
+            // This used to refuse for ANY airborne tick while tungsten drove. The bot jumps for
+            // crits, jumps to rush a mob, and sprint-jumps to dodge arrows -- so "airborne" is its
+            // normal state in a fight, and this predicate gates AbstractDoToEntityTask's interact.
+            //
+            // Measured on mob_skeleton: dte=682/92/0/0/0/213 -- the gate was evaluated 682 times,
+            // the bot was IN RANGE on 92 of them, hungry/falling/mlg were all zero, and the
+            // interact still never fired ONCE (kaTung=0/0/0/0, and its first counter increments on
+            // the very first line of the kill tick). The bot spent whole runs beside a skeleton it
+            // was never allowed to hit.
+            //
+            // What the guard is for is cancelling a path mid-FALL, which is a real hazard. Ground
+            // within a couple of blocks means the bot is mid-hop, not mid-fall, so it keeps the
+            // protection where it matters and stops vetoing every jump.
+            // ⛔ KNOWN WEAKNESS, RECORDED NOT PATCHED: !isAir() IS NOT "GROUND".
+            // The loop below counts LAVA, water, tall grass, torches and flowers as something to
+            // land on. A bot falling toward lava two blocks down therefore reads groundClose=true
+            // and this returns "safe to cancel" -- permitting the interruption of exactly the fall
+            // the guard exists to protect. Same shape as the isDangerZone one-block-down bug, and
+            // the repo already has the right idiom: the trigger's line-of-sight raycast uses
+            // COLLIDERS precisely because tall grass has no collision shape.
+            // NOT a regression -- before this method was fixed the predicate returned "safe"
+            // unconditionally, so this is an incomplete improvement rather than a new hazard. The
+            // fix is a collision-shape test instead of !isAir(), plus treating lava as never
+            // ground; it wants a course that actually falls toward a hazard before it can be
+            // measured, which nav_hazard may already provide.
+            if (p != null && !p.onGround() && !p.isInWater()) {
+                boolean groundClose = false;
+                net.minecraft.core.BlockPos below = p.blockPosition();
+                boolean useCollision = kaptainwutax.tungsten.TungstenConfig.get()
+                        .navGroundCollisionCheck;
+                for (int d = 1; d <= 3 && !groundClose; d++) {
+                    net.minecraft.core.BlockPos gp = below.below(d);
+                    net.minecraft.world.level.block.state.BlockState st = p.level().getBlockState(gp);
+                    groundClose = useCollision
+                            ? !st.getCollisionShape(p.level(), gp).isEmpty()
+                            : !st.isAir();
+                }
+                if (!groundClose) {
+                    navUnsafeAir++;
+                    return false;
+                }
+            }
+        }
+        // Nothing else owns the body, so a cancel is always safe once the checks above pass.
+        return true;
+    }
+
+    /** Is there a goal set and being worked on? */
+    public static boolean hasGoal() {
+        return adris.altoclef.util.helpers.TungstenHelper.isActive()
+                || (BaritoneBridge.selected() && BaritoneBridge.hasGoal());
+    }
+
+    /** Forget the current goal. */
+    public static void clearGoal() {
+        // ⛔ THIS WAS A NO-OP AND MUST STAY ONE. Same trap as Nav.pause(), which cost every
+        // pickup course before it was caught: the line here addressed the LEGACY engine, and that
+        // engine had not been pathing for months, so the call did nothing at all.
+        //
+        // G-0 replaced it with TungstenHelper.stop(), which turns 35 call sites of Nav.cancel()
+        // into 35 places that kill the live pathfinder. The worst of them is inside
+        // driveTungstenPrimary itself:
+        //
+        //     if (!busy && pf != null) { pf.find(...); }   // kick the async search
+        //     Nav.cancel();                                // and immediately stop it
+        //
+        // The search is started and killed on the same tick, every tick. That is the stall the
+        // repro reproduces: pdEnter=1921, pdWalking=0, mqStarted=0, and 135 completed breaks
+        // without a single step.
+        //
+        // Cancelling tungsten deliberately is what TungstenHelper.stop() is FOR, and the places
+        // that mean it call it directly.
+    }
+
+
+    /**
+     * DOES THE BOT EVER SEE ORE? The one link missing from the ceiling chain, and it decides
+     * between two fixes that have nothing in common.
+     *
+     * <p>Measured: after stone tools the bot spends 97.4% of its samples above Y=60 (862 positions
+     * over 29 runs, median Y 82), and the ore tasks -- priority 1050, twice the stone toolset's 520
+     * -- never take over, because DistanceOrePriorityCalculator scores by distance to a KNOWN ore
+     * and there is none.
+     *
+     * <p>The convenient reading is "it never goes underground". That may be wrong: since 1.18 coal
+     * generates high as well, peaking near Y=95, and iron has a second band up there too. At a
+     * median of Y=82 there could be coal within a few blocks. So:
+     *
+     * <ul>
+     *   <li>ore SEEN and near -> the scanner is fine and something else refuses the task;
+     *   <li>ore seen but FAR -> it is a travel problem, not a descent problem;
+     *   <li>ore never seen at all -> the bot really must go down and find caves.
+     * </ul>
+     *
+     * <p>Three different fixes, one counter. Read oreSeen=coalTicks/ironTicks/samples and
+     * oreNear=coalDist/ironDist (nearest seen this run, -1 for never).
+     *
+     * <p>Sampled once a second; the scanner lookup is not free enough to do every tick.
+     */
+    public static volatile int oreSample, oreCoalSeen, oreIronSeen;
+    public static volatile double oreCoalNearest = -1, oreIronNearest = -1;
+    private static int oreTickCounter;
+
+    /** Called once per client tick from AltoClef.onClientTick. Reads only. */
+    public static void tickOreVisibility() {
+        try {
+            if ((oreTickCounter++ % 20) != 0) return;
+            AltoClef mod = AltoClef.getInstance();
+            if (mod == null || mod.getPlayer() == null || mod.getWorld() == null) return;
+            oreSample++;
+            var self = mod.getPlayer().position();
+            var coal = mod.getBlockScanner().getNearestBlock(
+                    net.minecraft.world.level.block.Blocks.COAL_ORE, net.minecraft.world.level.block.Blocks.DEEPSLATE_COAL_ORE);
+            if (coal.isPresent()) {
+                oreCoalSeen++;
+                double d = self.distanceTo(net.minecraft.world.phys.Vec3.atCenterOf(coal.get()));
+                if (oreCoalNearest < 0 || d < oreCoalNearest) oreCoalNearest = d;
+            }
+            var iron = mod.getBlockScanner().getNearestBlock(
+                    net.minecraft.world.level.block.Blocks.IRON_ORE, net.minecraft.world.level.block.Blocks.DEEPSLATE_IRON_ORE);
+            if (iron.isPresent()) {
+                oreIronSeen++;
+                double d = self.distanceTo(net.minecraft.world.phys.Vec3.atCenterOf(iron.get()));
+                if (oreIronNearest < 0 || d < oreIronNearest) oreIronNearest = d;
+            }
+        } catch (Throwable ignored) {
+            // an instrument must never be the thing that breaks a tick
+        }
+    }
+
+    /**
+     * legacyPathTicks / legacyOverlapTicks / exploreTicks and tickEngineOverlap REMOVED (G-0).
+     *
+     * <p>They existed to answer 'does the engine we are deleting still drive the body', and they
+     * answered it: 8558/18/9384, 8079/2134/8603, 7988/610/7952 -- the legacy engine executing a
+     * path for eight thousand ticks a run and exploring for nine thousand, up to 2134 of those
+     * ticks while the tungsten executor was driving too. That is what the operator kept seeing
+     * as freezing and as the bot looking one way while acting another.
+     *
+     * <p>The instrument did its job and the engine is gone, so both go.
+     */
+    public static volatile int navSearchOnlyUnused;
+
+    /**
+     * Is the bot wandering off to look for something it cannot see yet?
+     *
+     * <p>Exploring is the second-largest thing altoclef says to the engine after the four sentences
+     * above: 26 calls across the task tree, and 25 of them are these two questions -- am I
+     * exploring, and stop exploring. They belong here for the same reason the others do; the one
+     * remaining caller that actually STARTS an exploration passes a target and stays where it is
+     * until there is somewhere else to send it.
+     */
+    public static boolean isExploring() {
+        // G-0: exploration is tungsten's wander now; there is no legacy process to be inside.
+        return false;
+    }
+
+    /**
+     * Hold the current route for a moment without throwing it away.
+     *
+     * <p>Said by five places that need the body still for one action -- eating, a bucket, a screen.
+     * Cancelling would make them re-plan afterwards; pausing is the difference between "wait" and
+     * "forget where you were going".
+     */
+    public static void pause() {
+        // ⛔ THIS MUST STAY A NO-OP, AND MAKING IT DO SOMETHING BROKE SIX COURSES.
+        //
+        // It used to call the legacy requestPause(). With that engine long since not pathing, the
+        // call did NOTHING -- the note above isSafeToCancel says the same thing about its
+        // neighbour: "baritone never paths now, so it said yes, safe, every single time".
+        //
+        // G-0 replaced it with an active key release, which turned five callers from no-ops into
+        // five things that stop the body mid-approach. craft fell to 14 passes with every pickup
+        // course failing -- pickup_flat, pickup_ledge, pickup_pit -- plus mine_coal and
+        // mine_diamond, which pick their drops up too.
+        //
+        // Tungsten has no pause primitive and does not need one: a caller that wants the body still
+        // for one action releases its own keys. Restoring the no-op restores the behaviour every
+        // one of those callers was actually written against.
+    }
+
+    /** Drop everything, including any queued path. Stronger than {@link #cancel()}. */
+    public static void cancelEverything() {
+        // ⛔ THIS WAS A NO-OP AND MUST STAY ONE. Same trap as Nav.pause(), which cost every
+        // pickup course before it was caught: the line here addressed the LEGACY engine, and that
+        // engine had not been pathing for months, so the call did nothing at all.
+        //
+        // G-0 replaced it with TungstenHelper.stop(), which turns 35 call sites of Nav.cancel()
+        // into 35 places that kill the live pathfinder. The worst of them is inside
+        // driveTungstenPrimary itself:
+        //
+        //     if (!busy && pf != null) { pf.find(...); }   // kick the async search
+        //     Nav.cancel();                                // and immediately stop it
+        //
+        // The search is started and killed on the same tick, every tick. That is the stall the
+        // repro reproduces: pdEnter=1921, pdWalking=0, mqStarted=0, and 135 completed breaks
+        // without a single step.
+        //
+        // Cancelling tungsten deliberately is what TungstenHelper.stop() is FOR, and the places
+        // that mean it call it directly.
+    }
+
+    // isBuilding() / stopBuilding() USED TO LIVE HERE, and G-0a removed both.
+    //
+    // Their javadoc said "five of the eight builder calls are these two questions -- am I
+    // building, stop building -- asked by tasks that are about to take the body for something
+    // else", and that the third question, starting a build, still named the engine "because it
+    // hands over a schematic and there is nowhere else yet to hand it". There is now: the schematic
+    // was always 1x1x1, and tungsten's build queue takes that request directly.
+    //
+    // With the only starter gone, "am I building" could only answer false and "stop building" could
+    // only be a no-op, so both went, along with their two remaining call sites. Nothing in altoclef
+    // touches BuilderProcess any more.
+
+    /** Stop exploring. Safe to call when nothing is. */
+    public static void stopExploring() {
+        // ⛔ THIS WAS A NO-OP AND MUST STAY ONE. Same trap as Nav.pause(), which cost every
+        // pickup course before it was caught: the line here addressed the LEGACY engine, and that
+        // engine had not been pathing for months, so the call did nothing at all.
+        //
+        // G-0 replaced it with TungstenHelper.stop(), which turns 35 call sites of Nav.cancel()
+        // into 35 places that kill the live pathfinder. The worst of them is inside
+        // driveTungstenPrimary itself:
+        //
+        //     if (!busy && pf != null) { pf.find(...); }   // kick the async search
+        //     Nav.cancel();                                // and immediately stop it
+        //
+        // The search is started and killed on the same tick, every tick. That is the stall the
+        // repro reproduces: pdEnter=1921, pdWalking=0, mqStarted=0, and 135 completed breaks
+        // without a single step.
+        //
+        // Cancelling tungsten deliberately is what TungstenHelper.stop() is FOR, and the places
+        // that mean it call it directly.
+    }
+}

@@ -1,0 +1,48 @@
+# Gradle
+.gradle/
+build/
+*/build/
+*/bin/
+.classpath
+*/.classpath
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Java
+*.class
+*.jar
+*.war
+# ...EXCEPT the bundled Baritone, which must be committed: it is a hard dependency that ships
+# inside our jar (Fabric nested JAR), so a clone without it cannot build.
+!libs/baritone-api-fabric-*.jar
+
+# Runtime
+run/
+logs/
+
+# Python
+__pycache__/
+.lock
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+.python-version
+
+*.srchash
+
+# Test-run debris
+docs/traces/
+
+# Agent memory mounted into the workspace -- one original lives outside this repo.
+memory/
+
+*.log

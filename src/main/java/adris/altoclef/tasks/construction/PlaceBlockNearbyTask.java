@@ -1,0 +1,371 @@
+package adris.altoclef.tasks.construction;
+
+import adris.altoclef.control.Nav;
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.eventbus.EventBus;
+import adris.altoclef.eventbus.Subscription;
+import adris.altoclef.eventbus.events.BlockPlaceEvent;
+import adris.altoclef.multiversion.blockpos.BlockPosVer;
+import adris.altoclef.tasks.movement.TimeoutWanderTask;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.helpers.ItemHelper;
+import adris.altoclef.util.helpers.LookHelper;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.helpers.WorldHelper;
+import adris.altoclef.util.progresscheck.MovementProgressChecker;
+import adris.altoclef.util.time.TimerGame;
+import kaptainwutax.tungsten.path.movements.Input;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import org.apache.commons.lang3.ArrayUtils;
+
+import java.util.Arrays;
+import java.util.function.Predicate;
+import net.minecraft.world.item.component.SwingAnimation;
+
+/**
+ * Place a type of block nearby, anywhere.
+ * <p>
+ * Also known as the "bear strats" task.
+ */
+public class PlaceBlockNearbyTask extends Task {
+
+    private final Block[] toPlace;
+
+    private final MovementProgressChecker progressChecker = new MovementProgressChecker();
+    private final TimeoutWanderTask wander = new TimeoutWanderTask(5);
+
+    private final TimerGame _randomlookTimer = new TimerGame(0.25);
+    private final Predicate<BlockPos> _canPlaceHere;
+    private BlockPos justPlaced; // Where we JUST placed a block.
+    private BlockPos tryPlace;   // Where we should TRY placing a block.
+    // Oof, necesarry for the onBlockPlaced action.
+    private Subscription<BlockPlaceEvent> _onBlockPlaced;
+
+    public PlaceBlockNearbyTask(Predicate<BlockPos> canPlaceHere, Block... toPlace) {
+        this.toPlace = toPlace;
+        _canPlaceHere = canPlaceHere;
+    }
+
+    public PlaceBlockNearbyTask(Block... toPlace) {
+        this(blockPos -> true, toPlace);
+    }
+
+    @Override
+    protected void onStart() {
+        progressChecker.reset();
+        AltoClef.getInstance().getInputControls().release(Input.CLICK_RIGHT);
+
+        // Check for blocks being placed
+        _onBlockPlaced = EventBus.subscribe(BlockPlaceEvent.class, evt -> {
+            if (ArrayUtils.contains(toPlace, evt.blockState.getBlock())) {
+                stopPlacing();
+            }
+        });
+    }
+
+    /** Placement-attempt anatomy: ticks, nothing under the crosshair, refused, accepted. */
+    public static volatile int pnbTicks, pnbNoLook, pnbRefused, pnbOk;
+    /**
+     * WHICH EXIT THIS TASK TAKES. pnbNoLook read 4350 of 4353 ticks on a two-rung run, but
+     * that alone is not the defect: the crosshair path is only an opportunistic fast path and
+     * there is a deterministic one below it (locateClosePlacePos -> PlaceBlockTask). Two early
+     * returns sit in between, and the freeze dump shows <Wander for 5.0 blocks> as the live
+     * leaf -- so the question is whether control ever REACHES the deterministic path.
+     * Read as pnbExit=wander/progFail/locate/noSpot.
+     */
+    public static volatile int pnbWander, pnbProgFail, pnbLocate, pnbNoSpot;
+    /** Times no placeable cell existed and a wall cell was carved to make one (G27). */
+    public static volatile int pnbCarve;
+
+    @Override
+    protected Task onTick() {
+        AltoClef mod = AltoClef.getInstance();
+
+        // TODOS.md, the stall-detector-wipe pattern already fixed in TimeoutWanderTask/
+        // DestroyBlockTask: a mere search makes Nav.isPathing() true too, so resetting
+        // unconditionally could hide a genuine stall for as long as a search never resolves.
+        progressChecker.resetIfPathingWithGrace(mod, Nav.isPathing());
+        // Method:
+        // - If looking at placable block
+        //      Place immediately
+        // Find a spot to place
+        // - Prefer flat areas (open space, block below) closest to player
+        // -
+
+        // Close screen first
+        ItemStack cursorStack = StorageHelper.getItemStackInCursorSlot();
+        if (!cursorStack.isEmpty()) {
+           /* Optional<Slot> moveTo = mod.getItemStorage().getSlotThatCanFitInPlayerInventory(cursorStack, false);
+            if (moveTo.isPresent()) {
+                mod.getSlotHandler().clickSlot(moveTo.get(), 0, SlotActionType.PICKUP);
+                return null;
+            }
+            if (ItemHelper.canThrowAwayStack(mod, cursorStack)) {
+                mod.getSlotHandler().clickSlot(Slot.UNDEFINED, 0, SlotActionType.PICKUP);
+                return null;
+            }
+            Optional<Slot> garbage = StorageHelper.getGarbageSlot(mod);
+            // Try throwing away cursor slot if it's garbage
+            if (garbage.isPresent()) {
+                mod.getSlotHandler().clickSlot(garbage.get(), 0, SlotActionType.PICKUP);
+                return null;
+            }
+            mod.getSlotHandler().clickSlot(Slot.UNDEFINED, 0, SlotActionType.PICKUP);*/
+        } else {
+            StorageHelper.closeScreen();
+        }
+
+        // Try placing where we're looking right now.
+        BlockPos current = getCurrentlyLookingBlockPlace(mod);
+        // WHY DOES A CRAFTING TABLE NEVER GET PLACED? This task only places where the
+        // crosshair HAPPENS to point, and otherwise turns at random and wanders. Measured on
+        // the run that stalled at two rungs: placeCalled=1, inRange=0, clicked=0 with
+        // TimeoutWanderTask:255x2338. Split the two ways this can fail before changing it --
+        // nothing under the crosshair at all, versus something the predicate refuses.
+        pnbTicks++;
+        if (current == null) pnbNoLook++;
+        else if (!_canPlaceHere.test(current)) pnbRefused++;
+        else pnbOk++;
+        if (current != null && _canPlaceHere.test(current)) {
+            setDebugState("Placing since we can...");
+            if (mod.getSlotHandler().forceEquipItem(ItemHelper.blocksToItems(toPlace))) {
+                if (place(mod, current)) {
+                    return null;
+                }
+            }
+        }
+
+        // Wander while we can.
+        if (wander.isActive() && !wander.isFinished()) {
+            pnbWander++;
+            setDebugState("Wandering, will try to place again later.");
+            progressChecker.reset();
+            return wander;
+        }
+        // Fail check
+        if (!progressChecker.check(mod)) {
+            pnbProgFail++;
+            Debug.logMessage("Failed placing, wandering and trying again.");
+            LookHelper.randomOrientation();
+            if (tryPlace != null) {
+                mod.getBlockScanner().requestBlockUnreachable(tryPlace);
+                tryPlace = null;
+            }
+            return wander;
+        }
+
+        // Try to place at a particular spot.
+        pnbLocate++;
+        if (tryPlace == null || !WorldHelper.canReach(tryPlace)) {
+            tryPlace = locateClosePlacePos(mod);
+        }
+        if (tryPlace == null) pnbNoSpot++;
+        if (tryPlace != null) {
+            setDebugState("Trying to place at " + tryPlace);
+            justPlaced = tryPlace;
+            return new PlaceBlockTask(tryPlace, toPlace);
+        }
+        // NO FREE CELL? MAKE ONE. In a 1x1 pit every neighbour is stone and the only air cells are
+        // the two the body occupies -- which is how the 2026-09-11 playthrough spent six minutes
+        // trying to put a crafting table under its own feet (docs/BARITONE-GAPS.md G27). Baritone's
+        // answer to "nowhere to build" is to break something: carve a niche in a wall at foot
+        // level (a cell with a solid block under it, so the table has support), then place there.
+        if (kaptainwutax.tungsten.TungstenConfig.get().placeNearbyCarvesNiche) {
+            BlockPos niche = locateNicheToCarve(mod);
+            if (niche != null) {
+                pnbCarve++;
+                setDebugState("No free cell to place in — carving a niche at " + niche.toShortString());
+                return new DestroyBlockTask(niche);
+            }
+        }
+
+        // Look in random places to maybe get a random hit
+        if (_randomlookTimer.elapsed()) {
+            _randomlookTimer.reset();
+            LookHelper.randomOrientation();
+        }
+
+        setDebugState("Wandering until we randomly place or find a good place spot.");
+        return new TimeoutWanderTask();
+    }
+
+    @Override
+    protected void onStop(Task interruptTask) {
+        stopPlacing();
+        EventBus.unsubscribe(_onBlockPlaced);
+    }
+
+    @Override
+    protected boolean isEqual(Task other) {
+        if (other instanceof PlaceBlockNearbyTask task) {
+            return Arrays.equals(task.toPlace, toPlace);
+        }
+        return false;
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "Place " + Arrays.toString(toPlace) + " nearby";
+    }
+
+    @Override
+    public boolean isFinished() {
+        return justPlaced != null && ArrayUtils.contains(toPlace, AltoClef.getInstance().getWorld().getBlockState(justPlaced).getBlock());
+    }
+
+    public BlockPos getPlaced() {
+        return justPlaced;
+    }
+
+    private BlockPos getCurrentlyLookingBlockPlace(AltoClef mod) {
+        HitResult hit = Minecraft.getInstance().hitResult;
+        if (hit instanceof BlockHitResult bhit) {
+            BlockPos bpos = bhit.getBlockPos();//.subtract(bhit.getSide().getVector());
+            //Debug.logMessage("TEMP: A: " + bpos);
+            if (WorldHelper.canPlaceAgainst(bpos)) {
+                BlockPos placePos = bhit.getBlockPos().offset(bhit.getDirection().getUnitVec3i());
+                // Don't place inside the player -- or any other entity. isInsidePlayer is a
+                // two-block RADIUS, not a hitbox test; this asks whether the block would fit.
+                if (WorldHelper.wouldIntersectAnEntity(placePos, toPlace.length > 0 ? toPlace[0] : null)) {
+                    return null;
+                }
+                //Debug.logMessage("TEMP: B (actual): " + placePos);
+                if (WorldHelper.canPlace(placePos)) {
+                    return placePos;
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean blockEquipped() {
+        return StorageHelper.isEquipped(ItemHelper.blocksToItems(toPlace));
+    }
+
+    private boolean place(AltoClef mod, BlockPos targetPlace) {
+        if (!mod.getExtraBaritoneSettings().isInteractionPaused() && blockEquipped()) {
+            // Shift click just for 100% container security.
+            mod.getInputControls().hold(Input.SNEAK);
+
+            //mod.getInputControls().tryPress(Input.CLICK_RIGHT);
+            // This appears to work on servers...
+            // TODO: Helper lol
+            HitResult mouseOver = Minecraft.getInstance().hitResult;
+            if (mouseOver == null || mouseOver.getType() != HitResult.Type.BLOCK) {
+                return false;
+            }
+            InteractionHand hand = InteractionHand.MAIN_HAND;
+            assert Minecraft.getInstance().gameMode != null;
+            if (Minecraft.getInstance().gameMode.useItemOn(mod.getPlayer(),hand, (BlockHitResult) mouseOver) == InteractionResult.SUCCESS &&
+                    mod.getPlayer().isShiftKeyDown()) {
+                mod.getPlayer().swing(hand, false);
+                justPlaced = targetPlace;
+                Debug.logMessage("PRESSED");
+                return true;
+            }
+
+            //mod.getControllerExtras().mouseClickOverride(1, true);
+            //mod.getInputControls().hold(Input.CLICK_RIGHT);
+            return true;
+        }
+        return false;
+    }
+
+    private void stopPlacing() {
+        AltoClef.getInstance().getInputControls().release(Input.SNEAK);
+        //mod.getControllerExtras().mouseClickOverride(1, false);
+        // The duct-tape `Nav.stopBuilding()` that stood here is gone with G-0a: this task places
+        // through PlaceBlockTask, which now owns the tungsten build queue and clears its own cell
+        // in onStop. Clearing the shared queue from here as well would cancel whatever ELSE is
+        // building, which is not what a nearby-place giving up should mean.
+    }
+
+    private BlockPos locateClosePlacePos(AltoClef mod) {
+        int range = 7;
+        BlockPos best = null;
+        double smallestScore = Double.POSITIVE_INFINITY;
+        BlockPos start = mod.getPlayer().blockPosition().offset(-range,-range,-range);
+        BlockPos end = mod.getPlayer().blockPosition().offset(range,range,range);
+        net.minecraft.world.level.Level world = mod.getWorld();
+        Block wanted = toPlace.length > 0 ? toPlace[0] : null;
+        for (BlockPos blockPos : WorldHelper.scanRegion(start, end)) {
+            // A CANDIDATE IS A CELL THE BLOCK CAN GO INTO, FULL STOP (G27, 2026-09-11).
+            // This used to SCORE "solid" (+4) and "inside the player" (+3) and pick the lowest
+            // score, with distance as the main term -- so in a 1x1 pit, where every neighbour
+            // is stone, the bot's own feet cell (distance 0.6, air, floor under it) won by a
+            // mile and the placer was asked to put a crafting table INTO the body, forever.
+            // Three things make a cell placeable and none of them is a matter of degree:
+            //   1. it is replaceable (air, grass, snow layer...), never a solid block -- a solid
+            //      cell is CARVED first (locateNicheToCarve), it is not "placed into";
+            //   2. the block that would appear there fits -- it overlaps no entity's box, the
+            //      player's first of all;
+            //   3. there is a face to click: some neighbour a block can be placed against.
+            if (!world.getBlockState(blockPos).canBeReplaced()) {
+                continue;
+            }
+            // We can't place here as defined by user.
+            if (!_canPlaceHere.test(blockPos)) {
+                continue;
+            }
+            // We can't place here.
+            if (!WorldHelper.canReach(blockPos) || !WorldHelper.canPlace(blockPos)) {
+                continue;
+            }
+            if (WorldHelper.wouldIntersectAnEntity(blockPos, wanted)) {
+                continue;
+            }
+            if (!hasFaceToPlaceAgainst(blockPos)) {
+                continue;
+            }
+            boolean hasBelow = WorldHelper.isSolidBlock(blockPos.below());
+            double distSq = BlockPosVer.getSquaredDistance(blockPos,mod.getPlayer().position());
+
+            double score = distSq + (hasBelow ? 0 : 10);
+
+            if (score < smallestScore) {
+                best = blockPos;
+                smallestScore = score;
+            }
+        }
+
+        return best;
+    }
+
+    /** Vanilla needs a face to click: at least one neighbour a block can be placed against. */
+    private static boolean hasFaceToPlaceAgainst(BlockPos pos) {
+        for (net.minecraft.core.Direction d : net.minecraft.core.Direction.values()) {
+            if (WorldHelper.canPlaceAgainst(pos.relative(d))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The wall cell to break so that a placeable cell exists: a cardinal neighbour of the feet
+     * (foot level first, then head level) that is solid, breakable, allowed by the caller's
+     * predicate, and has a solid block under it -- once opened it is exactly what
+     * {@link #locateClosePlacePos} looks for. Null when the bot is not walled in, or nothing
+     * around it may be broken.
+     */
+    private BlockPos locateNicheToCarve(AltoClef mod) {
+        BlockPos feet = mod.getPlayer().blockPosition();
+        for (int dy = 0; dy <= 1; dy++) {
+            for (net.minecraft.core.Direction d : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+                BlockPos wall = feet.relative(d).above(dy);
+                if (!WorldHelper.isSolidBlock(wall)) continue;
+                if (!WorldHelper.canBreak(wall)) continue;
+                if (!_canPlaceHere.test(wall)) continue;
+                if (!WorldHelper.isSolidBlock(wall.below())) continue;
+                return wall;
+            }
+        }
+        return null;
+    }
+}

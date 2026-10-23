@@ -1,0 +1,342 @@
+package adris.altoclef.tasks;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.BotBehaviour;
+import adris.altoclef.multiversion.blockpos.BlockPosVer;
+import adris.altoclef.tasks.container.PickupFromContainerTask;
+import adris.altoclef.tasks.movement.DefaultGoToDimensionTask;
+import adris.altoclef.tasks.movement.PickupDroppedItemTask;
+import adris.altoclef.tasks.resources.MineAndCollectTask;
+import adris.altoclef.tasks.slot.EnsureFreePlayerCraftingGridTask;
+import adris.altoclef.tasks.slot.MoveInaccessibleItemToInventoryTask;
+import adris.altoclef.tasksystem.ITaskCanForce;
+import adris.altoclef.tasksystem.ITaskUsesCraftingGrid;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.trackers.storage.ContainerCache;
+import adris.altoclef.util.Dimension;
+import adris.altoclef.util.ItemTarget;
+import adris.altoclef.util.MiningRequirement;
+import adris.altoclef.util.helpers.ItemHelper;
+import adris.altoclef.util.helpers.StlHelper;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.helpers.WorldHelper;
+import adris.altoclef.util.slots.PlayerSlot;
+import adris.altoclef.util.slots.Slot;
+import org.apache.commons.lang3.ArrayUtils;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+
+/**
+ * The parent for all "collect an item" tasks.
+ * <p>
+ * If the target item is on the ground or in a chest, will grab from those sources first.
+ */
+public abstract class ResourceTask extends Task implements ITaskCanForce {
+
+    /** Pickup-gate accounting; read as rt=reached/avoided/dropped in placeStats. */
+    public static volatile int rtReached, rtAvoided, rtDropped;
+
+
+    protected final ItemTarget[] itemTargets;
+
+    private final PickupDroppedItemTask pickupTask;
+    /** Traced grid clears; see the note at the site. */
+    private static volatile int gridClearTrace = 0;
+    private final EnsureFreePlayerCraftingGridTask ensureFreeCraftingGridTask = new EnsureFreePlayerCraftingGridTask();
+    private ContainerCache currentContainer;
+    // Extra resource parameters
+    private Block[] mineIfPresent = null;
+    private boolean forceDimension = false;
+    private boolean allowContainers = false;
+    private Dimension targetDimension;
+    private BlockPos mineLastClosest = null;
+
+    public ResourceTask(ItemTarget[] itemTargets) {
+        this.itemTargets = itemTargets;
+        pickupTask = new PickupDroppedItemTask(this.itemTargets, true);
+    }
+
+    public ResourceTask(ItemTarget target) {
+        this(new ItemTarget[]{target});
+    }
+
+    public ResourceTask(Item item, int targetCount) {
+        this(new ItemTarget(item, targetCount));
+    }
+
+    @Override
+    public boolean isFinished() {
+        return StorageHelper.itemTargetsMetInventoryNoCursor(itemTargets);
+    }
+
+    @Override
+    public boolean shouldForce(Task interruptingCandidate) {
+        // We have an important item target in our cursor.
+        return StorageHelper.itemTargetsMetInventory(itemTargets) && !isFinished()
+                // This _should_ be redundant, but it'll be a guard just to make 100% sure.
+                && Arrays.stream(itemTargets).anyMatch(target -> target.matches(StorageHelper.getItemStackInCursorSlot().getItem()));
+    }
+
+    @Override
+    protected void onStart() {
+        BotBehaviour botBehaviour = AltoClef.getInstance().getBehaviour();
+
+        botBehaviour.push();
+        //removeThrowawayItems(_itemTargets);
+        botBehaviour.addProtectedItems(ItemTarget.getMatches(itemTargets));
+
+        onResourceStart(AltoClef.getInstance());
+    }
+
+    @Override
+    protected Task onTick() {
+        AltoClef mod = AltoClef.getInstance();
+
+        // If we have an item in an INACCESSIBLE inventory slot
+        // ONCE THE CLEARING TASK IS THE CURRENT CHILD, NOTHING BELOW CAN CLAIM THE GRID ANY MORE.
+        // The `|| ensureFreeCraftingGridTask.isActive()` clause made this self-sustaining: the
+        // moment the clearing task becomes the sub-task, the craft that owns the grid is no longer
+        // in the chain, thisOrChildSatisfies can never see its marker again, and the exemption is
+        // gone for good. Measured on craft_table: "CURSORBACK onResourceStop holding=oak_log
+        // interrupt=EnsureFreePlayerCraftingGridTask" on repeat, the mover picking an ingredient up
+        // and the parent taking it away, 1854 times, never a plank.
+        // thisOrChildSatisfies does walk the whole sub chain (Task.java:157-164), so the marker is
+        // seen while the craft is running -- which is exactly when this exemption has to hold.
+        if (!(thisOrChildSatisfies(task -> task instanceof ITaskUsesCraftingGrid))) {
+            for (ItemTarget target : itemTargets) {
+                if (StorageHelper.isItemInaccessibleToContainer(mod, target)) {
+                    setDebugState("Moving from SPECIAL inventory slot");
+                    return new MoveInaccessibleItemToInventoryTask(target);
+                }
+            }
+        }
+        // We have enough items COUNTING the cursor slot, we just need to move an item from our cursor.
+        if (StorageHelper.itemTargetsMetInventory(itemTargets) && Arrays.stream(itemTargets).anyMatch(target -> target.matches(StorageHelper.getItemStackInCursorSlot().getItem()))) {
+            setDebugState("Moving from cursor");
+            Optional<Slot> moveTo = mod.getItemStorage().getSlotThatCanFitInPlayerInventory(StorageHelper.getItemStackInCursorSlot(), false);
+            if (moveTo.isPresent()) {
+                mod.getSlotHandler().clickSlot(moveTo.get(), 0, ContainerInput.PICKUP);
+                return null;
+            }
+            if (ItemHelper.canThrowAwayStack(mod, StorageHelper.getItemStackInCursorSlot())) {
+                mod.getSlotHandler().clickSlot(Slot.UNDEFINED, 0, ContainerInput.PICKUP);
+                return null;
+            }
+            Optional<Slot> garbage = StorageHelper.getGarbageSlot(mod);
+            // Try throwing away cursor slot if it's garbage
+            if (garbage.isPresent()) {
+                mod.getSlotHandler().clickSlot(garbage.get(), 0, ContainerInput.PICKUP);
+                return null;
+            }
+            mod.getSlotHandler().clickSlot(Slot.UNDEFINED, 0, ContainerInput.PICKUP);
+            return null;
+        }
+
+        // WHY THE PICKUP GATE COUNTS ITSELF.
+        // pickup_pit: the main task is <Mine And Collect: [[diamond]]>, a ResourceTask, so THIS
+        // block should run and see the diamond lying eight blocks away. It never pursues it --
+        // idrop=0/0/0/0 says getClosestItemDrop is not called even once -- while the tracker holds
+        // that drop on every tick of the run (et=1246/1246). Four readings of this file failed to
+        // say which of the three gates below closes, so each one answers for itself now.
+        // Read as rt=reached/avoided/dropped.
+        rtReached++;
+        if (shouldAvoidPickingUp(mod)) rtAvoided++;
+        // WHICH task is asking, and what the tracker tells IT. rt=.../0 says no ResourceTask ever
+        // saw a drop, while the tracker held a diamond every tick and never blacklisted it. Those
+        // cannot both be true, so print the targets alongside the answer. Rate-limited hard: this
+        // runs ~13 times per game tick across the whole nest of resource tasks.
+        if (rtReached % 400 == 0) {
+            Debug.logMessage("RTGATE targets=" + java.util.Arrays.toString(itemTargets)
+                    + " avoid=" + shouldAvoidPickingUp(mod)
+                    + " dropped=" + mod.getEntityTracker().itemDropped(itemTargets));
+        }
+        if (!shouldAvoidPickingUp(mod)) {
+            // Check if items are on the floor. If so, pick em up.
+            if (mod.getEntityTracker().itemDropped(itemTargets)) {
+                rtDropped++;
+
+                // If we're picking up a pickaxe (we can't go far underground or mine much)
+                if (PickupDroppedItemTask.isIsGettingPickaxeFirst(mod)) {
+                    if (pickupTask.isCollectingPickaxeForThis()) {
+                        setDebugState("Picking up (pickaxe first!)");
+                        // Our pickup task is the one collecting the pickaxe, keep it going.
+                        return pickupTask;
+                    }
+                    // Only get items that are CLOSE to us.
+                    Optional<ItemEntity> closest = mod.getEntityTracker().getClosestItemDrop(mod.getPlayer().position(), itemTargets);
+                    if (closest.isPresent() && !closest.get().closerThan(mod.getPlayer(), 10)) {
+                        return onResourceTick(mod);
+                    }
+                }
+
+                double range = getPickupRange(mod);
+                Optional<ItemEntity> closest = mod.getEntityTracker().getClosestItemDrop(mod.getPlayer().position(), itemTargets);
+                if (range < 0 || (closest.isPresent() && closest.get().closerThan(mod.getPlayer(), range)) || (pickupTask.isActive() && !pickupTask.isFinished())) {
+                    setDebugState("Picking up");
+                    return pickupTask;
+                }
+            }
+        }
+
+        // Check for chests and grab resources from them.
+        if (currentContainer == null && allowContainers) {
+            List<ContainerCache> containersWithItem = mod.getItemStorage().getContainersWithItem(Arrays.stream(itemTargets).reduce(new Item[0], (items, target) -> ArrayUtils.addAll(items, target.getMatches()), ArrayUtils::addAll));
+            if (!containersWithItem.isEmpty()) {
+                ContainerCache closest = containersWithItem.stream().min(StlHelper.compareValues(container -> BlockPosVer.getSquaredDistance(container.getBlockPos(),mod.getPlayer().position()))).get();
+                if (closest.getBlockPos().closerToCenterThan(mod.getPlayer().position(), mod.getModSettings().getResourceChestLocateRange())) {
+                    currentContainer = closest;
+                }
+            }
+        }
+        if (currentContainer != null) {
+            Optional<ContainerCache> container = mod.getItemStorage().getContainerAtPosition(currentContainer.getBlockPos());
+            if (container.isPresent()) {
+                if (Arrays.stream(itemTargets).noneMatch(target -> container.get().hasItem(target.getMatches()))) {
+                    currentContainer = null;
+                } else {
+                    // We have a current chest, grab from it.
+                    setDebugState("Picking up from container");
+                    return new PickupFromContainerTask(currentContainer.getBlockPos(), itemTargets);
+                }
+            } else {
+                currentContainer = null;
+            }
+        }
+
+        // We may just mine if a block is found.
+        if (mineIfPresent != null) {
+            ArrayList<Block> satisfiedReqs = new ArrayList<>(Arrays.asList(mineIfPresent));
+            satisfiedReqs.removeIf(block -> !StorageHelper.miningRequirementMet(MiningRequirement.getMinimumRequirementForBlock(block)));
+            if (!satisfiedReqs.isEmpty()) {
+                if (mod.getBlockScanner().anyFound(satisfiedReqs.toArray(Block[]::new))) {
+                    Optional<BlockPos> closest = mod.getBlockScanner().getNearestBlock(mineIfPresent);
+                    if (closest.isPresent() && closest.get().closerToCenterThan(mod.getPlayer().position(), mod.getModSettings().getResourceMineRange())) {
+                        mineLastClosest = closest.get();
+                    }
+                    if (mineLastClosest != null) {
+                        if (mineLastClosest.closerToCenterThan(mod.getPlayer().position(), mod.getModSettings().getResourceMineRange() * 1.5 + 20)) {
+                            return new MineAndCollectTask(itemTargets, mineIfPresent, MiningRequirement.HAND);
+                        }
+                    }
+                }
+            }
+        }
+        // Make sure that items don't get stuck in the player crafting grid. May be an issue if a future task isn't a resource task.
+        if (StorageHelper.isPlayerInventoryOpen()) {
+            boolean claimed = thisOrChildSatisfies(task -> task instanceof ITaskUsesCraftingGrid);
+            if (!claimed) {
+                for (Slot slot : PlayerSlot.CRAFT_INPUT_SLOTS) {
+                    ItemStack inGrid = StorageHelper.getItemStackInSlot(slot);
+                    if (!inGrid.isEmpty()) {
+                        // THE LAST LINE OF THE HUNT. Every number says the placement WORKS and this
+                        // guard undoes it a tick later; what is missing is why the exemption is not
+                        // in force at that instant. Name the task that is clearing, what it is
+                        // after, the chain under it and the slot that tripped it.
+                        if (gridClearTrace < 10) {
+                            gridClearTrace++;
+                            adris.altoclef.Debug.logMessage("GRIDCLEAR by=" + getClass().getSimpleName()
+                                    + " for=" + java.util.Arrays.toString(itemTargets)
+                                    + " slotItem=" + inGrid.getItem()
+                                    + " chain=" + toString());
+                        }
+                        return ensureFreeCraftingGridTask;
+                    }
+                }
+            }
+        }
+        return onResourceTick(mod);
+    }
+
+    protected double getPickupRange(AltoClef mod) {
+        return mod.getModSettings().getResourcePickupRange();
+    }
+
+    @Override
+    protected void onStop(Task interruptTask) {
+        AltoClef.getInstance().getBehaviour().pop();
+        onResourceStop(AltoClef.getInstance(), interruptTask);
+    }
+
+    @Override
+    protected boolean isEqual(Task other) {
+        // Same target items
+        if (other instanceof ResourceTask t) {
+            if (!isEqualResource(t)) return false;
+            return Arrays.equals(t.itemTargets, itemTargets);
+        }
+        return false;
+    }
+
+    @Override
+    protected String toDebugString() {
+        StringBuilder result = new StringBuilder();
+        result.append(toDebugStringName()).append(": [");
+        int c = 0;
+        if (itemTargets != null) {
+            for (ItemTarget target : itemTargets) {
+                result.append(target != null ? target.toString() : "(null)");
+                if (++c != itemTargets.length) {
+                    result.append(", ");
+                }
+            }
+        }
+        result.append("]");
+        return result.toString();
+    }
+
+    protected boolean isInWrongDimension(AltoClef mod) {
+        if (forceDimension) {
+            return WorldHelper.getCurrentDimension() != targetDimension;
+        }
+        return false;
+    }
+
+    protected Task getToCorrectDimensionTask(AltoClef mod) {
+        return new DefaultGoToDimensionTask(targetDimension);
+    }
+
+    public ResourceTask mineIfPresent(Block[] toMine) {
+        mineIfPresent = toMine;
+        return this;
+    }
+
+    public ResourceTask forceDimension(Dimension dimension) {
+        forceDimension = true;
+        targetDimension = dimension;
+        return this;
+    }
+
+    public void setAllowContainers(boolean value) {
+        this.allowContainers = value;
+    }
+
+    public boolean getAllowContainers() {
+        return allowContainers;
+    }
+
+    protected abstract boolean shouldAvoidPickingUp(AltoClef mod);
+
+    protected abstract void onResourceStart(AltoClef mod);
+
+    protected abstract Task onResourceTick(AltoClef mod);
+
+    protected abstract void onResourceStop(AltoClef mod, Task interruptTask);
+
+    protected abstract boolean isEqualResource(ResourceTask other);
+
+    protected abstract String toDebugStringName();
+
+    public ItemTarget[] getItemTargets() {
+        return itemTargets;
+    }
+}

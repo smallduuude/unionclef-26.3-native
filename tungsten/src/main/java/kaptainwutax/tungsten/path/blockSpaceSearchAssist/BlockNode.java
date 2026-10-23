@@ -1,0 +1,1072 @@
+package kaptainwutax.tungsten.path.blockSpaceSearchAssist;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import kaptainwutax.tungsten.Debug;
+import kaptainwutax.tungsten.TungstenConfig;
+import kaptainwutax.tungsten.TungstenMod;
+import kaptainwutax.tungsten.TungstenModDataContainer;
+import kaptainwutax.tungsten.TungstenModRenderContainer;
+import kaptainwutax.tungsten.helpers.BlockShapeChecker;
+import kaptainwutax.tungsten.helpers.BlockStateChecker;
+import kaptainwutax.tungsten.helpers.DistanceCalculator;
+import kaptainwutax.tungsten.helpers.MovementHelper;
+import kaptainwutax.tungsten.helpers.blockPath.BlockPosShifter;
+import kaptainwutax.tungsten.helpers.movement.CornerJumpMovementHelper;
+import kaptainwutax.tungsten.helpers.movement.NeoMovementHelper;
+import kaptainwutax.tungsten.helpers.movement.StreightMovementHelper;
+import kaptainwutax.tungsten.helpers.render.RenderHelper;
+import kaptainwutax.tungsten.path.calculators.ActionCosts;
+import kaptainwutax.tungsten.render.Color;
+import kaptainwutax.tungsten.render.Cuboid;
+import kaptainwutax.tungsten.world.BetterBlockPos;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.Direction.Axis;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.LevelReader;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.CarpetBlock;
+import net.minecraft.world.level.block.CropBlock;
+import net.minecraft.world.level.block.DaylightDetectorBlock;
+import net.minecraft.world.level.block.LadderBlock;
+import net.minecraft.world.level.block.LanternBlock;
+import net.minecraft.world.level.block.SeaPickleBlock;
+import net.minecraft.world.level.block.SlabBlock;
+import net.minecraft.world.level.block.SlimeBlock;
+import net.minecraft.world.level.block.SnowLayerBlock;
+import net.minecraft.world.level.block.StairBlock;
+import net.minecraft.world.level.block.VineBlock;
+import net.minecraft.world.level.block.LilyPadBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.SlabType;
+import net.minecraft.world.level.pathfinder.Node;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
+
+public class BlockNode {
+	/** Three-block drops the block-space guard now allows. Proof this fired. */
+	public static volatile int blockFallHarmless = 0;
+	/** Descents kept and charged for rather than refused. Proof the price fired. */
+	/** Times the block-space fall guard was consulted, and times it refused. */
+	/** Smart-generator moves that passed / were refused by the shared validity gate. */
+	public static volatile int smartKept, smartDropped;
+
+	public static volatile int fallCheckRun, fallCheckRefused;
+
+	public static volatile int blockFallPriced = 0;
+	
+	private Player player;
+
+	/**
+	 * The position of this node
+	 */
+	public final int x;
+	public final int y;
+	public final int z;
+	
+
+	public Vec3 chachedPos = null;
+	public Vec3 chachedWithOffsetPos = null;
+	public BlockState chachedBlockState = null;
+	public BlockPos chachedBlockPos = null;
+	
+	public Boolean isDoingLongJump = null;
+	public boolean isDoingJump = false;
+
+	/**
+	 * Cached, should always be equal to goal.heuristic(pos)
+	 */
+	public double estimatedCostToGoal;
+
+	/**
+	 * Total cost of getting from start to here Mutable and changed by PathFinder
+	 */
+	public double cost;
+
+	/**
+	 * The price of the ONE move that produced this node — upstream's {@code res.cost}
+	 * (AStarPathFinder.java:120), which the relaxation adds to the parent's {@link #cost}.
+	 *
+	 * <p>It needs its own field because {@link #cost} is g, the total from the start, and the
+	 * two were being stored in the same place: the constructor below took the move's price as
+	 * an argument and dropped it on the floor, so every move {@code SmartMoves} and the blind
+	 * scan bothered to price arrived at the search worth exactly the same.
+	 */
+	public double actionCost;
+
+	/**
+	 * Should always be equal to estimatedCosttoGoal + cost Mutable and changed by
+	 * PathFinder
+	 */
+	public double combinedCost;
+
+	/**
+	 * In the graph search, what previous node contributed to the cost Mutable and
+	 * changed by PathFinder
+	 */
+	public BlockNode previous;
+
+	private boolean wasOnSlime;
+	private boolean wasOnLadder;
+	private boolean isDoingNeo = false;
+	private Direction neoSide;
+	private boolean isDoingCornerJump = false;
+
+	/** Blocks that must be mined to make this cell passable (top-down order).
+	 *  Set by tryPlanBreakThrough; consumed by PathFinder/PathExecutor. */
+	public java.util.List<BlockPos> toBreak = null;
+
+	public boolean hasBreaks() {
+		return toBreak != null && !toBreak.isEmpty();
+	}
+
+	/** Support blocks that must be PLACED to make this cell reachable (a bridge floor
+	 *  under a gap cell). Set by tryPlanPlaceThrough; consumed by PathFinder/PathExecutor
+	 *  — the exact mirror of toBreak. This is place-as-a-move as a FIRST-CLASS search move
+	 *  (not a reactive give-up): the block-space A* plans placing as part of the route. */
+	public java.util.List<BlockPos> toPlace = null;
+
+	public boolean hasPlaces() {
+		return toPlace != null && !toPlace.isEmpty();
+	}
+
+	/**
+	 * Where is this node in the array flattenization of the binary heap? Needed for
+	 * decrease-key operations.
+	 */
+	public int heapPosition;
+
+	public BlockNode(BlockPos pos, Goal goal, Player player, LevelReader world) {
+		this.player = player;
+		this.previous = null;
+		this.cost = ActionCosts.COST_INF;
+		this.actionCost = 0;   // no incoming move: this is a root
+		this.estimatedCostToGoal = goal.heuristic(pos.getX(), pos.getY(), pos.getZ());
+		if (Double.isNaN(estimatedCostToGoal)) {
+			throw new IllegalStateException(goal + " calculated implausible heuristic");
+		}
+		this.heapPosition = -1;
+		this.x = pos.getX();
+		this.y = pos.getY();
+		this.z = pos.getZ();
+		this.wasOnSlime = world.getBlockState(pos.below()).getBlock() instanceof SlimeBlock;
+		this.wasOnLadder = world.getBlockState(pos).getBlock() instanceof LadderBlock;
+	}
+
+	public BlockNode(int x, int y, int z, Goal goal, Player player) {
+		this.player = player;
+		this.previous = null;
+		this.cost = ActionCosts.COST_INF;
+		this.actionCost = 0;   // no incoming move: this is a root
+		this.estimatedCostToGoal = goal.heuristic(x, y, z);
+		if (Double.isNaN(estimatedCostToGoal)) {
+			throw new IllegalStateException(goal + " calculated implausible heuristic");
+		}
+		this.heapPosition = -1;
+		this.x = x;
+		this.y = y;
+		this.z = z;
+		this.wasOnSlime = player.level().getBlockState(new BlockPos(x, y - 1, z))
+				.getBlock() instanceof SlimeBlock;
+		this.wasOnLadder = player.level().getBlockState(new BlockPos(x, y, z)).getBlock() instanceof LadderBlock;
+	}
+
+	public BlockNode(int x, int y, int z, Goal goal, BlockNode parent, double cost, Player player) {
+		this.player = player;
+		this.previous = parent;
+		this.wasOnSlime = player.level().getBlockState(new BlockPos(x, y - 1, z))
+				.getBlock() instanceof SlimeBlock;
+		this.wasOnLadder = player.level().getBlockState(new BlockPos(x, y, z)).getBlock() instanceof LadderBlock;
+		// g is "infinity until relaxed" for EVERY node, the start included — upstream sets the
+		// start's to 0 by hand and nothing else (AStarPathFinder.java:55). This read
+		// `parent != null ? 0 : COST_INF`, i.e. every child was born already free, which the
+		// missing relaxation guard hid and which would otherwise make each child look like a
+		// zero-cost ride from the start. The move's own price goes to actionCost instead.
+		this.cost = ActionCosts.COST_INF;
+		this.actionCost = cost;
+		this.estimatedCostToGoal = goal.heuristic(x, y, z);
+		if (Double.isNaN(estimatedCostToGoal)) {
+			throw new IllegalStateException(goal + " calculated implausible heuristic");
+		}
+		this.heapPosition = -1;
+		this.x = x;
+		this.y = y;
+		this.z = z;
+	}
+
+	public boolean isOpen() {
+		return heapPosition != -1;
+	}
+
+	/**
+	 * TODO: Possibly reimplement hashCode and equals. They are necessary for this
+	 * class to function but they could be done better
+	 *
+	 * @return The hash code value for this {@link Node}
+	 */
+	@Override
+	public int hashCode() {
+		return (int) BetterBlockPos.longHash(x, y, z);
+	}
+
+	public Vec3 getPos() {
+		return getPos(false, TungstenModDataContainer.world);
+	}
+	
+
+	public Vec3 getPos(boolean shift) {
+		return getPos(shift, TungstenModDataContainer.world);
+	}
+	
+	public Vec3 getPos(LevelReader world) {
+		return getPos(false, world);
+	}
+
+	public Vec3 getPos(boolean shift, LevelReader world) {
+		if (!shift && chachedPos != null) return chachedPos;
+		if (shift) {
+			if (isDoingNeo && !(this.getBlockState(world).getBlock() instanceof LadderBlock)) {
+				chachedWithOffsetPos = BlockPosShifter.shiftForStraightNeo(this, neoSide);
+//				chachedWithOffsetPos = BlockPosShifter.getPosOnLadder(this, world);
+				return chachedWithOffsetPos;
+			}
+			if (chachedWithOffsetPos != null) return chachedWithOffsetPos;
+			if (isDoingNeo) {
+				chachedWithOffsetPos = BlockPosShifter.shiftForStraightNeo(this, neoSide);
+				return chachedWithOffsetPos;
+			}
+			if (BlockShapeChecker.getBlockHeight(this.getBlockPos().below(), world) > 1) {
+				chachedWithOffsetPos = BlockPosShifter.getPosOnLadder(this, world);
+				chachedWithOffsetPos = chachedWithOffsetPos.add(0, BlockShapeChecker.getBlockHeight(this.getBlockPos().below(), world)-1, 0);
+				if (isDoingNeo) chachedWithOffsetPos = BlockPosShifter.shiftForStraightNeo(this, neoSide);
+				return chachedWithOffsetPos;
+			}
+			if (BlockShapeChecker.getBlockHeight(this.getBlockPos(), world) > 0) {
+				chachedWithOffsetPos = BlockPosShifter.getPosOnLadder(this, world);
+				double blockVolume = BlockShapeChecker.getShapeVolume(this.getBlockPos(), world);
+				chachedWithOffsetPos = chachedWithOffsetPos.add(0, BlockShapeChecker.getBlockHeight(this.getBlockPos(), world), 0);
+				if (isDoingNeo) chachedWithOffsetPos = BlockPosShifter.shiftForStraightNeo(this, neoSide);
+				return chachedWithOffsetPos;
+			}
+			chachedWithOffsetPos = BlockPosShifter.getPosOnLadder(this, world);
+			if (isDoingNeo) chachedWithOffsetPos = BlockPosShifter.shiftForStraightNeo(this, neoSide);
+			return chachedWithOffsetPos;
+		}
+		chachedPos = new Vec3(x, y, z);
+		return chachedPos;
+	}
+
+	public boolean isDoingLongJump(LevelReader world) {
+		if (isDoingLongJump != null) return isDoingLongJump;
+		if (this.previous != null) {
+			double distance = DistanceCalculator.getHorizontalEuclideanDistance(this.previous.getPos(world), this.getPos(world));
+			if (distance >= 4 && distance < 6) {
+				isDoingLongJump = true;
+				return true;
+			}
+		}
+		isDoingLongJump = false;
+		return false;
+	}
+
+	public boolean isDoingNeo() {
+		return this.isDoingNeo;
+	}
+	
+	public Direction getNeoSide() {
+		return this.neoSide;
+	}
+
+	public boolean isDoingCornerJump() {
+		return this.isDoingCornerJump;
+	}
+
+	public BlockState getBlockState(LevelReader world) {
+		if (chachedBlockState != null) return chachedBlockState;
+		chachedBlockState = world.getBlockState(getBlockPos());
+		return chachedBlockState;
+	}
+
+	public BlockPos getBlockPos() {
+		if (chachedBlockPos != null) return chachedBlockPos;
+		chachedBlockPos = new BlockPos(x, y, z);
+		return chachedBlockPos;
+	}
+
+	// ⛔ FIXED 2026-09-04: missing null/type guards, both required by Object.equals()'s own
+	// contract ("x.equals(null) must return false", "must return false for an incompatible
+	// type") -- the old body threw NullPointerException on `equals(null)` and
+	// ClassCastException against any non-BlockNode argument instead of answering false. This
+	// class is stored in a HashSet (BlockSpacePathFinder's `closed`), so it is exactly the
+	// shape of bug that surfaces the moment any caller outside the search's own tight loop
+	// (List.contains(null), List.indexOf(null), a generic Set/Map utility) ever compares
+	// against it. Zero behavior change for two real BlockNodes -- only the previously-undefined
+	// null/wrong-type cases change from a crash to `false`.
+	@Override
+	public boolean equals(Object obj) {
+		if (this == obj) return true;
+		if (!(obj instanceof BlockNode)) return false;
+
+		final BlockNode other = (BlockNode) obj;
+
+		return x == other.x && y == other.y && z == other.z;
+	}
+
+	/** Times the smartMoves branch below was taken, and moves it produced. Read as sm=sel/moves.
+	 *  A swim fix was written into SmartMoves and changed the course numbers by NOTHING, digit for
+	 *  digit, twice -- which is what a code path that never runs looks like. Prove it runs. */
+	public static volatile int smSelected, smMoves;
+
+	public List<BlockNode> getChildren(LevelReader world, Goal goal, boolean generateDeep) {
+
+		// EXPERIMENTAL (#1.6.1): tungsten-native smart move generation — a handful of
+		// pre-validated Traverse/Ascend/Descend/Parkour neighbours instead of the blind
+		// r=8 scan, so the search routes stepped/gap terrain within its node budget.
+		// Flag-gated (default off) so course A keeps the proven blind-scan path.
+		if (TungstenConfig.get().smartMoves) {
+			smSelected++;
+			List<BlockNode> smart = new ArrayList<>();
+			java.util.List<SmartMoves.Move> generated = SmartMoves.generate(world, this.getBlockPos());
+			smMoves += generated.size();
+			for (SmartMoves.Move m : generated) {
+				BlockNode n = new BlockNode(m.dest.getX(), m.dest.getY(), m.dest.getZ(),
+						goal, this, m.cost, this.player);
+				n.isDoingJump = m.jump;
+				smart.add(n);
+			}
+			// The smart generator used to hand its moves straight to the search, skipping the
+			// validity gate below that every other generator passes. It grants itself drops of
+			// up to MAX_DESCEND=3, so the guide could contain a hop the physics leg cannot
+			// execute -- measured on the 1219 course as guide dy01=-3.1 with fallChk 0/0, i.e.
+			// the fall guard was never even consulted. Route both generators through one gate.
+			if (!TungstenConfig.get().smartMovesShareTheGuard) return smart;
+			smartKept = 0; smartDropped = 0;
+			List<BlockNode> smartOk = new java.util.ArrayList<>(smart.size());
+			for (BlockNode n : smart) {
+				boolean bad;
+				try { bad = shouldRemoveNode(world, n); }
+				catch (NullPointerException e) { bad = true; }
+				if (bad) smartDropped++; else { smartKept++; smartOk.add(n); }
+			}
+			// A gate that rejects EVERY move would strand the search with no guide at all,
+			// which is worse than an ambitious guide -- keep the raw set in that case.
+			return smartOk.isEmpty() ? smart : smartOk;
+		}
+
+		List<BlockNode> nodes = getNodesIn3DCircule(8, this, goal, generateDeep);
+//		nodes.removeIf((child) -> {
+//			return shouldRemoveNode(world, child);
+//		});
+
+		// ⛔ TODOS.md C3.2: this was an UNCONDITIONAL parallelStream() -- the implicit shared
+		// ForkJoinPool.commonPool(), used at NORM priority even though this whole search runs on
+		// a MIN_PRIORITY thread by design (BlockSpacePathFinder.java:48-51's own comment: "never
+		// win CPU against the client thread"). Node.java:327 already gates its own parallelStream
+		// on kaptainwutax.tungsten.TungstenConfig.enableParallelStreaming (default true, so no
+		// behavior change) -- this is the SAME gate applied here for consistency, so both entry
+		// points can be turned off together for the A/B this register entry calls for, rather
+		// than only one of the two. Not stand-verified this session (C8.1).
+		List<BlockNode> filtered =
+				(kaptainwutax.tungsten.TungstenConfig.get().enableParallelStreaming
+						? nodes.parallelStream() : nodes.stream())
+			        .filter(node -> {
+			            try { return !shouldRemoveNode(world, node); }
+			            catch (NullPointerException e) { return false; }
+			        })
+			        .collect(Collectors.toList());
+
+		// TODOS.md C3.3: this cleared the shared TEST render container (synchronized
+		// collection, contended across every ForkJoinPool search thread) on every single
+		// node expansion, with no corresponding write anywhere in this method -- vestigial
+		// debug leftover, not a real render reset. Removed rather than gated: there was
+		// nothing here for a gate to guard.
+
+		return filtered;
+
+	}
+
+	public static boolean wasCleared(LevelReader world, BlockPos start, BlockPos end) {
+		return wasCleared(world, start, end, null, null);
+	}
+
+	public static boolean wasCleared(LevelReader world, BlockPos start, BlockPos end, BlockNode startNode,
+			BlockNode endNode) {
+
+		boolean shouldRender = false;
+		boolean shouldSlow = false;
+		// TODOS.md C3.3: shouldRender is hardcoded false on this call -- StreightMovementHelper/
+		// CornerJumpMovementHelper never draw into TEST as a result of this call either way, so
+		// clearing it here (called per CANDIDATE CHILD, i.e. the hottest point in the search)
+		// bought nothing but lock contention on a synchronized collection across every
+		// ForkJoinPool search thread. Gated the same way the draws already are, so a future
+		// caller that does pass shouldRender=true still gets a fresh buffer first.
+		if (shouldRender) TungstenModRenderContainer.TEST.clear();
+
+
+		boolean isStreightPossible = StreightMovementHelper.isPossible(world, start, end, shouldRender, shouldSlow);
+		
+		if (isStreightPossible) return true;
+		if (endNode == null) return false;
+		
+		// When running bot in normal environment instead of parkour you need to turn on Neo and Corner jump checks to avoid cases where it can get stuck
+		boolean shouldCheckNeo = !start.closerThan(end, 1.2) && start.closerThan(end, 4.2) && true;
+		if (shouldCheckNeo) {
+			Direction neoDirection = NeoMovementHelper.getNeoDirection(world, start, end, shouldRender, shouldSlow);
+			if (neoDirection != null) {
+				endNode.isDoingNeo = true;
+				endNode.neoSide = neoDirection;
+				endNode.isDoingCornerJump = false;
+				return true;
+			}
+		}
+		boolean isCornerJumpPossible = CornerJumpMovementHelper.isPossible(world, start, end, shouldRender, shouldSlow);
+		if (isCornerJumpPossible) {
+			endNode.isDoingNeo = false;
+			endNode.isDoingCornerJump = true;
+			return true;
+		}
+
+		return false;
+	}
+
+	private List<BlockNode> getNodesIn3DCircule(int d, BlockNode parent, Goal goal, boolean generateDeep) {
+		ConcurrentLinkedQueue<BlockNode> nodes = new ConcurrentLinkedQueue<>();
+
+	    double g = 32.656;
+	    double v_sprint = 5.8;
+
+	    // On slime the bounce can carry the path upward. Fall height is cumulative
+	    // along the incoming block path.
+	    double slimeFall = getFallOntoSlimeHeight(parent);
+	    double yMax = slimeFall > 0
+	        ? MovementHelper.getSlimeBounceHeight(slimeFall) - 0.2
+	        : generateDeep ? 4 : 2;
+
+	    int distanceWanted = d;
+	    // Bounce levels are inclusive (floor+1) so the top reachable platform is generated;
+	    // normal levels keep the old exclusive ceil bound.
+	    int finalYMax = slimeFall > 0 ? (int) Math.floor(yMax) + 1 : (int) Math.ceil(yMax);
+
+        IntStream.range(generateDeep ? -64 : -4, finalYMax).parallel().forEach(py -> {
+            int localD;
+
+            if (py < 0 && py < -5) {
+                double t = Math.sqrt((2 * py * -1) / g);
+                localD = (int) Math.ceil(v_sprint * t);
+            } else {
+                localD = distanceWanted + 1;
+            }
+
+            // Center node
+            nodes.add(new BlockNode(this.x, this.y + py, this.z, goal, this, ActionCosts.WALK_ONE_BLOCK_COST, this.player));
+
+            for (int id = 1; id <= localD; id++) {
+                int px = id, pz = 0;
+                int dx = -1, dz = 1;
+                int n = id * 4;
+
+                for (int i = 0; i < n; i++) {
+                    if (px == id && dx > 0) dx = -1;
+                    else if (px == -id && dx < 0) dx = 1;
+
+                    if (pz == id && dz > 0) dz = -1;
+                    else if (pz == -id && dz < 0) dz = 1;
+
+                    px += dx;
+                    pz += dz;
+
+                    boolean isDoingJump = Math.abs(pz) > 1 || Math.abs(px) > 1;
+                    BlockNode newNode = new BlockNode(this.x + px, this.y + py, this.z + pz, goal, this,
+                            isDoingJump ? ActionCosts.WALK_ONE_BLOCK_COST + 6.5 : ActionCosts.WALK_ONE_BLOCK_COST, this.player);
+                    newNode.isDoingJump = isDoingJump;
+                    nodes.add(newNode);
+                }
+            }
+        });
+
+	    return new ArrayList<>(nodes);
+	}
+
+	private boolean shouldRemoveNode(LevelReader world, BlockNode child) {
+		if (TungstenModDataContainer.PATHFINDER.stop.get())
+			return true;
+
+		BlockState currentBlockState = world.getBlockState(getBlockPos());
+		BlockState currentBlockBelowState = world.getBlockState(getBlockPos().below());
+		BlockState childAboveState = world.getBlockState(child.getBlockPos().above());
+		BlockState childState = world.getBlockState(child.getBlockPos());
+		BlockState childBelowState = world.getBlockState(child.getBlockPos().below());
+		Block currentBlock = currentBlockState.getBlock();
+		Block childBlock = childState.getBlock();
+		Block childBelowBlock = childBelowState.getBlock();
+		boolean isAboveChildSolid = BlockShapeChecker.getShapeVolume(child.getBlockPos().above(), world) > 0;
+		boolean isAboveChildSolid2 = BlockShapeChecker.getShapeVolume(child.getBlockPos().above(2), world) > 0;
+		
+
+
+		// ViaVersion: reject nodes horizontally adjacent to anvils (collision differs on old servers)
+		if (TungstenConfig.get().avoidStuckAnvil && adjacentToAnvil(world, child)) {
+			return true;
+		}
+
+		// Break-through: an adjacent cell blocked only by breakable blocks is
+		// accepted with a mining plan instead of being pruned as a wall.
+		if (tryPlanBreakThrough(world, child)) {
+			return false;
+		}
+
+		// Place-through (bridge): an adjacent gap cell (body fits, no floor under it) is
+		// accepted with a place-plan instead of being pruned as a hole — place-as-a-move.
+		if (tryPlanPlaceThrough(world, child)) {
+			return false;
+		}
+
+		// Specific block checks
+		if (childState.is(Blocks.LAVA))
+			return true;
+		if (childBelowBlock instanceof LilyPadBlock)
+			return true;
+		if (childBelowBlock instanceof CarpetBlock)
+			return true;
+		if (childBelowBlock instanceof DaylightDetectorBlock)
+			return true;
+		if (childBlock instanceof StairBlock)
+			return true;
+		if (childBelowBlock instanceof SeaPickleBlock)
+			return true;
+		if (childBelowBlock instanceof CropBlock)
+			return true;
+		if (BlockShapeChecker.isBlockNormalCube(childState))
+			return true;
+		if (BlockStateChecker.isBottomSlab(childBelowState))
+			return true;
+		if (BlockStateChecker.isBottomSlab(childState) && BlockStateChecker.isTopSlab(childAboveState))
+			return true;
+		if (BlockStateChecker.isTopSlab(childBelowState) && BlockStateChecker.isBottomSlab(childAboveState))
+			return true;
+
+		if (isAboveChildSolid && BlockStateChecker.isBottomSlab(childState)) {
+			return true;
+		}
+		
+		
+        // A physics guide must not reintroduce a bank exit rejected by FastPlanner.
+        // These are standing-body strokes; no crawling pose is represented in BlockNode.
+        boolean fromWater = BlockStateChecker.isAnyWater(currentBlockState);
+        boolean toWater = BlockStateChecker.isAnyWater(childState);
+        if (fromWater || toWater) {
+            BlockPos from = getBlockPos(), to = child.getBlockPos();
+            int horizontal = Math.abs(to.getX() - from.getX()) + Math.abs(to.getZ() - from.getZ());
+            int rise = to.getY() - from.getY();
+            if (fromWater && toWater) {
+                return horizontal + Math.abs(rise) != 1
+                        || !kaptainwutax.tungsten.helpers.PlayerFit.bodyFits(world,
+                                to.getX() + 0.5, to.getY(), to.getZ() + 0.5);
+            }
+            if (fromWater) {
+                if (horizontal == 0 && rise == 1) {
+                    return !kaptainwutax.tungsten.helpers.PlayerFit.bodyFits(world,
+                            to.getX() + 0.5, to.getY(), to.getZ() + 0.5);
+                }
+                return horizontal != 1 || rise < 0 || rise > 1
+                        || !kaptainwutax.tungsten.helpers.PlayerFit.waterExitClear(world, from, to);
+            }
+            double departure = kaptainwutax.tungsten.helpers.PlayerFit.supportTop(world, from);
+            if (Double.isNaN(departure)) departure = from.getY();
+            return horizontal != 1 || rise > 0 || rise < -1
+                    || !kaptainwutax.tungsten.helpers.PlayerFit.descentClear(world,
+                            to.getX(), to.getZ(), Math.max(departure, to.getY()), to.getY());
+        }
+
+		// Check for air below
+		if (childBelowState.isAir() && !(childBlock instanceof LadderBlock) && !BlockStateChecker.isBottomSlab(childState)) {
+			if (BlockShapeChecker.getShapeVolume(child.getBlockPos(), world) == 0)
+				return true;
+		}
+
+		
+		double heightDiff = getJumpHeight(this.getPos(true).y, child.getPos(true).y); // positive is going up and negative is going down
+		double distance = DistanceCalculator.getHorizontalEuclideanDistance(getPos(true, world), child.getPos(true, world));
+//		if (BlockStateChecker.isAnyWater(currentBlockState)) {
+//			if (distance > 1) return true;
+//			if (!wasCleared(world, getBlockPos(), child.getBlockPos())) return true;
+//			return false;
+//		}
+		// Search for a path without fall damage
+		if (!TungstenModDataContainer.searchIgnoresFallDamage()) {
+			if (!BlockStateChecker.isAnyWater(childState)) {
+				// Same off-by-one as the physics guard: vanilla charges nothing for a three-block
+				// drop, and this refused it. Deeper falls stay refused.
+				double floor = TungstenModDataContainer.fallGuardAllowsHarmless() ? -3 : -2;
+				fallCheckRun++;   // does this guard run for the failing hop at all?
+				if (heightDiff < floor) {
+					// PRICED, NOT FORBIDDEN. A descent the guard would refuse is kept and charged for,
+					// so a bridge still wins where a bridge is the point and a drop wins where the
+					// alternative is standing still. Same edge the mining price goes on, below.
+					if (TungstenConfig.get().fallDepthPriced
+							&& heightDiff >= -TungstenConfig.get().fallDepthHardLimit) {
+						child.actionCost += (-heightDiff - 2) * TungstenConfig.get().fallCostPerBlock;
+						blockFallPriced++;
+					} else {
+						return true;
+					}
+				}
+				if (heightDiff < -2) blockFallHarmless++;
+			}
+		}
+
+		if (BlockStateChecker.isDoubleSlab(world, getBlockPos()) || childBelowBlock instanceof SnowLayerBlock)
+			return true;
+
+//        if (BlockStateChecker.isConnected(child.getBlockPos())) {
+//    		TungstenMod.TEST.add(new Cuboid(new Vec3d(child.getBlockPos().getX(), child.getBlockPos().getY(), child.getBlockPos().getZ()), new Vec3d(1.0D, 1.0D, 1.0D), Color.WHITE));
+//    		try {
+//    			Thread.sleep(250);
+//    		} catch (InterruptedException ignored) {}
+//        }
+
+		// Check for water
+//        if (isWater(childState) && wasCleared(world, getBlockPos(), child.getBlockPos())) return false;
+
+		// Vine checks
+		if ((childBelowBlock instanceof VineBlock || childBlock instanceof VineBlock)
+				&& wasCleared(world, getBlockPos(), child.getBlockPos()) && distance < 6.3 && heightDiff >= -1) {
+			return false;
+		}
+		if ((childBelowBlock instanceof VineBlock || childBlock instanceof VineBlock)
+				&& distance < 2.3 && heightDiff == 0) {
+			return false;
+		}
+
+		// Ladder checks
+		if ((childBlock instanceof LadderBlock || childBelowBlock instanceof LadderBlock) && distance > 5) 
+			return true;
+			
+		if ((childBlock instanceof LadderBlock || childBelowBlock instanceof LadderBlock) && heightDiff > 3) {
+			return true;
+		}
+		if (BlockStateChecker.isBottomSlab(currentBlockBelowState) && (childBlock instanceof LadderBlock || childBelowBlock instanceof LadderBlock) && heightDiff > 0) {
+			return true;
+		}
+		if ((currentBlock instanceof LadderBlock) && distance > 2.3) {
+			return true;
+		}
+		if ((childBelowBlock instanceof LadderBlock || childBlock instanceof LadderBlock) && distance > 6.3) {
+			return true;
+		}
+		if ((childBelowBlock instanceof LadderBlock && !(childState.isAir() || childBlock instanceof LadderBlock))) {
+			return true;
+		}
+		if ((childBelowBlock instanceof LadderBlock || childBlock instanceof LadderBlock) && distance < 1 && heightDiff >= -1) {
+			return false;
+		}
+		if ((childBelowBlock instanceof LadderBlock || childBlock instanceof LadderBlock)
+				&& wasCleared(world, getBlockPos(), child.getBlockPos(), this, child) && distance < 5.3 && heightDiff >= -1) {
+			return false;
+		}
+		if (childBlock instanceof LadderBlock) {
+			return false;
+		}
+		if (childBelowBlock instanceof LadderBlock) {
+			return false;
+		}
+
+
+		if (heightDiff >= -1 && heightDiff <= 0 && distance > 6.3) 
+			return true;
+
+		// General height and distance checks
+//        if (previous != null && (previous.y - y < 1 && wasOnSlime || (!wasOnSlime && child.y - y > 1))) return true;
+		if (distance >= 7)
+			return true;
+
+		// Slab checks
+//		if (BlockStateChecker.isBottomSlab(childState) != BlockStateChecker.isBottomSlab(currentBlockState))
+//			if (BlockStateChecker.isBottomSlab(childState) && this.getBlockPos().getY() != child.getBlockPos().getY())
+//				return true;
+//        if (isBottomSlab(childState) && !hasBiggerCollisionShapeThanAbove(world, child.getBlockPos())) return true;
+
+		boolean canStandOn = BlockShapeChecker.hasBiggerCollisionShapeThanAbove(world, child.getBlockPos().below());
+
+		// Collision shape and block exceptions
+		if (!BlockStateChecker.isBottomSlab(childState))
+		if (!canStandOn && (!(childBlock instanceof DaylightDetectorBlock) && !(childBlock instanceof CarpetBlock)
+				&& !(childBelowBlock instanceof SlabBlock) && !(childBelowBlock instanceof LanternBlock)
+				&& !(childBelowBlock == Blocks.SNOW))
+//                || (childBelowBlock instanceof StairsBlock)
+//                && !(childBelowBlock instanceof LanternBlock)
+//                && !(childBelowBlock == Blocks.SNOW)
+//                && getShapeVolume(childState.getCollisionShape(world, child.getBlockPos())) >= 1
+		) {
+			return true;
+		}
+
+		if (isJumpImpossible(world, child))
+			return true;
+
+		// TODO: Fix bottom slab under fence thing
+		if (!wasCleared(world, getBlockPos(), child.getBlockPos(), this, child)) {
+			return true;
+		}
+
+		// REAL BODY TEST (the last word). Everything above reasons about block
+		// CLASSES and XZ shape AREA, which cannot see height: a cell whose floor
+		// is a bottom slab with a ceiling two blocks up leaves 1.5 blocks of real
+		// clearance, and used to be accepted for a mere cost penalty — the plan
+		// then could not be executed by the physics engine and the bot stalled in
+		// front of it (user 2026-07-25). PlayerFit measures the actual 0.6x1.8
+		// body against actual collision shapes, so slabs/stairs/trapdoors/fences/
+		// carpets/snow count for exactly what they physically are.
+		if (!kaptainwutax.tungsten.helpers.PlayerFit.standable(world, child.getBlockPos()))
+			return true;
+		if (!kaptainwutax.tungsten.helpers.PlayerFit.corridorClear(world, getBlockPos(), child.getBlockPos()))
+			return true;
+
+		return false;
+	}
+	
+	/**
+	 * Break-through planning: if the only thing between this node and an
+	 * adjacent same-Y child is breakable blocks, accept the child and record
+	 * what must be mined (top-down). Cost grows with vanilla mining ticks so
+	 * cheap detours still win over slow mining.
+	 */
+	private boolean tryPlanBreakThrough(LevelReader world, BlockNode child) {
+		if (!TungstenConfig.get().allowBreak) return false;
+		int dx = child.x - this.x, dy = child.y - this.y, dz = child.z - this.z;
+		if (dy != 0 || Math.abs(dx) + Math.abs(dz) != 1) return false;
+		// needs solid footing on the other side of the wall
+		if (BlockShapeChecker.getShapeVolume(child.getBlockPos().below(), world) == 0) return false;
+
+		BlockPos feet = child.getBlockPos();
+		BlockPos head = feet.above();
+		double ticks = 0;
+		java.util.List<BlockPos> plan = new java.util.ArrayList<>();
+		for (BlockPos pos : new BlockPos[]{head, feet}) { // top first — break order matters
+			if (BlockShapeChecker.getShapeVolume(pos, world) == 0) continue; // already passable
+			double t = breakTicks(world, pos, world.getBlockState(pos));
+			if (t < 0) return false; // unbreakable wall — no plan
+			ticks += t;
+			plan.add(pos);
+		}
+		if (plan.isEmpty()) return false; // nothing blocking — normal pruning applies
+
+		// gravity blocks above the passage will fall into it — pay their cost
+		// up front (the executor re-mines whatever lands in the passage cells)
+		BlockPos above = head.above();
+		for (int i = 0; i < 5; i++) {
+			BlockState state = world.getBlockState(above);
+			if (!(state.getBlock() instanceof net.minecraft.world.level.block.FallingBlock)) break;
+			double t = breakTicks(world, above, state);
+			if (t < 0) return false;
+			ticks += t;
+			above = above.above();
+		}
+
+		child.toBreak = plan;
+		// The mining time is the price of THIS MOVE, so it goes on the edge, next to the
+		// walk/jump price the generator already put there. 0.15 ticks-of-mining per unit means
+		// one walk step per ~30 mining ticks — which is what this comment always claimed, and
+		// which only became true now that g accumulates: a walk step used to be worth the
+		// literal 1, so a 30-tick wall was priced at four and a half steps of detour, not one.
+		child.actionCost += ticks * 0.15 * TungstenConfig.get().breakCostMultiplier;
+		return true;
+	}
+
+	/**
+	 * Place-through planning — the exact mirror of tryPlanBreakThrough, for BRIDGING.
+	 * If an adjacent same-Y child cell is a GAP (body fits: cell + head clear, but there
+	 * is NO floor under it), accept the child and record the support block to PLACE. This
+	 * makes place-as-a-move a FIRST-CLASS search move: the block-space A* plans bridging
+	 * as part of the route (not a reactive 14s-stall give-up). The physics leg is then
+	 * truncated at the gap edge (like a wall) and PathExecutor.tickPlacing paves it, after
+	 * which the goto continuation re-searches the now-bridged world.
+	 *
+	 * Gated on allowPlace (altoclef sets it only when the bot actually has a block, so no
+	 * block == no place-move == no behaviour change). High cost so the search prefers
+	 * walking/parkour and only bridges when there is no cheaper route.
+	 */
+	private boolean tryPlanPlaceThrough(LevelReader world, BlockNode child) {
+		if (!TungstenConfig.get().planPlaceMoves || !TungstenConfig.get().allowPlace) return false;
+		// Only bridge TOWARD the goal. On open void every direction is a gap, so bridging
+		// everywhere explodes the search into node exhaustion — a place-move must make real
+		// progress (child strictly closer to the goal than the current cell).
+		if (child.estimatedCostToGoal >= this.estimatedCostToGoal) return false;
+		int dx = child.x - this.x, dy = child.y - this.y, dz = child.z - this.z;
+		if (dy != 0 || Math.abs(dx) + Math.abs(dz) != 1) return false;   // adjacent same-Y (bridge)
+		BlockPos feet = child.getBlockPos();
+		BlockPos support = feet.below();
+		if (BlockShapeChecker.getShapeVolume(feet, world) != 0) return false;        // cell blocked
+		if (BlockShapeChecker.getShapeVolume(feet.above(), world) != 0) return false;   // head blocked
+		if (BlockShapeChecker.getShapeVolume(support, world) != 0) return false;     // already floored -> normal move
+		// Must have a floor to place FROM (godbridge places against its side face). CHAINING:
+		// if THIS cell is itself a planned bridge cell, its floor (this.toPlace) will be paved,
+		// so the bot can stand on it and place the next — this lets ONE search plan a whole
+		// multi-cell bridge (without it the search explores endless 1-cell bridges and exhausts
+		// its node budget into a CPU spin on wide/open gaps).
+		BlockPos myFloor = this.getBlockPos().below();
+		boolean floorSolid = BlockShapeChecker.getShapeVolume(myFloor, world) != 0;
+		boolean floorPlanned = this.toPlace != null && this.toPlace.contains(myFloor);
+		if (!floorSolid && !floorPlanned) return false;
+		if (!kaptainwutax.tungsten.path.PlaceRules.canPlace(world, support)) return false;
+		// CAN WE ACTUALLY BUILD THIS? The new planner learned to ask (register C5.5: a route that
+		// plans placements the inventory cannot pay for is a route the bot physically cannot walk,
+		// and on an empty kit it produced climbs that were never once performed). This planner —
+		// the legacy engine's own, still live for routes the physics engine owns — never asked.
+		// Count the whole planned chain, not one block: a multi-cell bridge costs one block per cell.
+		int planned = this.toPlace == null ? 0 : this.toPlace.size();
+		if (planned + 1 > kaptainwutax.tungsten.path.fast.FastPlanner.countPlaceable(this.player)) {
+			return false;
+		}
+		child.toPlace = new java.util.ArrayList<>(java.util.List.of(support));
+		if (this.toPlace != null) child.toPlace.addAll(0, this.toPlace);
+		// THE PRICE OF A BRIDGE STEP IS UPSTREAM'S, NOT AN INVENTED ONE. This was 20.0 * 0.15 = 3.0,
+		// about a fifth of what a backplace really costs, so this planner priced bridging as almost
+		// free and preferred it over walking round. Baritone charges SNEAK_ONE_BLOCK_COST (15.385)
+		// because a backplace IS a sneak (MovementTraverse.cost:164), and FastPlanner was corrected
+		// to that same constant when place-as-a-move was made first class. One law, one number.
+		// It is charged to the EDGE now, so it is finally being compared against the real price of
+		// walking round (WALK_ONE_BLOCK_COST a step) instead of against the literal 1.
+		child.actionCost += ActionCosts.SNEAK_ONE_BLOCK_COST;
+		return true;
+	}
+
+	/** Vanilla mining duration in ticks, or -1 if breaking is not allowed
+	 *  (BreakRules: unbreakable, fluids, block entities, deny lists/zones,
+	 *  altoclef protection hook). */
+	private double breakTicks(LevelReader world, BlockPos pos, BlockState state) {
+		if (!kaptainwutax.tungsten.path.BreakRules.canBreak(world, pos, state)) return -1;
+		float delta = state.getDestroyProgress(this.player, world, pos);
+		if (delta <= 0) return -1;
+		if (delta >= 1) return 1;
+		return Math.ceil(1f / delta);
+	}
+
+	/**
+	 * Checks if the child node is horizontally adjacent to an anvil at a Y level
+	 * where the anvil collision would block the player. Nodes directly above
+	 * the anvil (standing on top) are allowed.
+	 */
+	private static boolean adjacentToAnvil(LevelReader world, BlockNode child) {
+		int cx = child.x, cy = child.y, cz = child.z;
+		// Check anvil at player body levels: cy (feet) and cy-1 (anvil below extends up)
+		for (int dy = -1; dy <= 0; dy++) {
+			int ay = cy + dy;
+			if (BlockStateChecker.isAnvil(world, new BlockPos(cx - 1, ay, cz))
+					|| BlockStateChecker.isAnvil(world, new BlockPos(cx + 1, ay, cz))
+					|| BlockStateChecker.isAnvil(world, new BlockPos(cx, ay, cz - 1))
+					|| BlockStateChecker.isAnvil(world, new BlockPos(cx, ay, cz + 1))) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Cumulative descent onto this node along the incoming block path.
+	 * 0 unless the node stands on slime and the path arrived from above.
+	 * Note: a jump in place on slime is NOT a boost — vanilla bounce apex from
+	 * a 1.25 jump is ~1.9, which lands nothing a normal jump can't reach.
+	 */
+	private static double getFallOntoSlimeHeight(BlockNode node) {
+		if (!node.wasOnSlime || node.previous == null) return 0;
+		int top = node.y;
+		BlockNode cur = node;
+		BlockNode p = node.previous;
+		while (p != null && p.y >= cur.y) {
+			top = Math.max(top, p.y);
+			cur = p;
+			p = p.previous;
+		}
+		return top - node.y;
+	}
+
+	/**
+	 * Returns jump height.
+	 *
+	 * <p>⛔ SIMPLIFIED 2026-09-04, DEAD BRANCHES REMOVED: the old body branched on
+	 * {@code to > from} and then ternaried on {@code diff > 0} inside each branch, but
+	 * {@code diff = to - from} makes {@code diff > 0} exactly equivalent to {@code to > from} --
+	 * so in the {@code to > from} branch {@code diff} is always positive (the {@code diff * -1}
+	 * arm can never run), and in the other branch {@code diff} is always {@code <= 0} (the
+	 * {@code diff * -1} arm there can never run either). Verified exhaustively (up/down/equal),
+	 * not by inspection alone: every input produces exactly {@code to - from}. Zero behavior
+	 * change; only the unreachable branches are gone.
+	 *
+	 * @param from
+	 * @param to
+	 * @return positive is going up and negative is going down
+	 */
+	public double getJumpHeight(double from, double to) {
+		return to - from;
+	}
+
+	private boolean isJumpImpossible(LevelReader world, BlockNode child) {
+		double heightDiff = getJumpHeight(this.getPos(true).y, child.getPos(true).y); // positive is going up and negative is going down
+		double distance = DistanceCalculator.getHorizontalEuclideanDistance(getPos(true, world), child.getPos(true, world));
+		
+		BlockState childBlockState = world.getBlockState(child.getBlockPos());
+		Block childBlock = childBlockState.getBlock();
+		BlockState belowChildBlockState = world.getBlockState(child.getBlockPos().below());
+		BlockState currentBlockState = world.getBlockState(getBlockPos().below());
+		Block belowChildBlock = belowChildBlockState.getBlock();
+        double closestBlockBelowHeight = BlockShapeChecker.getBlockHeight(child.getBlockPos().below(), world);
+		boolean isBlockBelowTall = closestBlockBelowHeight > 1.3;
+		// On slime the bounce reaches higher than a jump.
+		double slimeFall = getFallOntoSlimeHeight(this);
+		double maxUp = slimeFall > 0 ? MovementHelper.getSlimeBounceHeight(slimeFall) - 0.2 : 1.4;
+		if (heightDiff > maxUp && childBlock != Blocks.LADDER) return true;
+		// Bounce is mostly vertical — bounce-only children (above jump reach) must stay close.
+		if (slimeFall > 0 && heightDiff > 1.4 && distance > 4.0) return true;
+
+
+//    	if (world.getBlockState(child.getBlockPos().down()).getBlock() instanceof TrapdoorBlock) {
+//			System.out.println(!world.getBlockState(child.getBlockPos().down()).get(Properties.OPEN));
+//    	}
+		boolean isAboveChildSolid = BlockShapeChecker.getShapeVolume(child.getBlockPos().above(), world) > 0;
+		boolean isAboveChildSolid2 = BlockShapeChecker.getShapeVolume(child.getBlockPos().above(2), world) > 0;
+		boolean isAboveSolid2 = BlockShapeChecker.getShapeVolume(getBlockPos().above(2), world) > 0;
+		if (isAboveSolid2 && distance > 3) {
+			return true;
+		}
+		if (heightDiff > 0.6 && distance > 6.3 && childBlock != Blocks.LADDER) {
+			return true;
+		}
+
+		VoxelShape blockShape = belowChildBlockState.getCollisionShape(world, child.getBlockPos().below());
+		VoxelShape currentBlockShape = currentBlockState.getCollisionShape(world, getBlockPos().below());
+
+		double childBlockHeight = BlockShapeChecker.getBlockHeight(blockShape);
+		double currentBlockHeight = BlockShapeChecker.getBlockHeight(currentBlockShape);
+
+		double blockHeightDiff = currentBlockHeight - childBlockHeight; // Negative values means currentBlockHeight is
+																		// lower, and positive means currentBlockHeight
+		if (player.getFoodData().getFoodLevel() < 6) {
+
+			if (distance >= 4) return true;
+		}
+
+		if (BlockStateChecker.isBottomSlab(childBlockState) && isAboveChildSolid2  && distance > 2.3) {
+			return true;
+		}
+		
+		if (BlockStateChecker.isBottomSlab(currentBlockState) && childBlockHeight == 1 && heightDiff > 0.5) {
+			return true;
+		}
+		
+
+		if (BlockStateChecker.isAnyWater(currentBlockState)) {
+			if (distance >= 2) return true;
+			return false;
+		}
+		if (childBlockHeight == 1.5 && currentBlockHeight == 1.5 && heightDiff <= 1) {
+			if (distance <= 4) return false;
+		}
+
+		// Allow stepping DOWN from tall blocks (fences/walls) but not jumping UP onto higher ones
+		if (isBlockBelowTall && heightDiff > 0.5 && heightDiff > 0) return true;
+								
+		// VoxelShape-based checks
+		if (!Double.isInfinite(blockHeightDiff) && !Double.isNaN(blockHeightDiff)) {
+			
+			// Slab and ladder checks
+			if (heightDiff <= 0 && (BlockStateChecker.isBottomSlab(belowChildBlockState)
+					|| (!wasOnLadder && belowChildBlock instanceof LadderBlock)) && distance >= 4.5) {
+				return true;
+			}
+			if (belowChildBlock instanceof SlabBlock && belowChildBlockState.getValue(BlockStateProperties.SLAB_TYPE) == SlabType.TOP
+					&& !world.getBlockState(child.getBlockPos()).isAir()) {
+				return true;
+			}
+
+			if (BlockStateChecker.isClosedBottomTrapdoor(belowChildBlockState)) {
+				if (heightDiff <= 1 && distance <= 6.4) return false;
+				if (heightDiff == 2 && distance <= 4.4) return false;
+			}
+			
+			if (BlockStateChecker.isClosedBottomTrapdoor(currentBlockState)) {
+				if (heightDiff <= 0 && distance <= 6.4) return false;
+				if (heightDiff > 0 && BlockStateChecker.isTopSlab(belowChildBlockState)) return true;
+			}
+			
+			if (blockHeightDiff != 0) {
+				
+				
+				if (Math.abs(blockHeightDiff) > 0.5 && Math.abs(blockHeightDiff) <= 1.0) {
+					if (heightDiff > 0 && (blockShape.min(Axis.Y) == 0.0 && currentBlockHeight <= 1.0))
+						return true;
+					if (heightDiff == 2 && distance <= 5.3)
+						return false;
+					if (heightDiff >= 0 && distance <= 5.3)
+						return false;
+				}
+				
+				if (Math.abs(blockHeightDiff) <= 0.5 && (blockShape.min(Axis.Y) == 0.0 && childBlockHeight == 1.0)) {
+					if (heightDiff == 0 && distance <= 5.4)
+						return false;
+				}
+
+				if (Math.abs(blockHeightDiff) <= 0.5 && (blockShape.min(Axis.Y) == 0.0 || childBlockHeight > 1.0)) {
+					if (blockHeightDiff == 0.5 && heightDiff <= -1)
+						return true;
+					if (heightDiff == 0 && distance >= 4.4)
+						return true;
+					if (heightDiff <= 1 && distance <= 7.4)
+						return false;
+				}
+
+				if (Math.abs(blockHeightDiff) >= 0.5 && (blockShape.min(Axis.Y) == 0.0 || childBlockHeight > 1.0))
+					return true;
+				
+			}
+		}
+
+		if (slimeFall <= 0) {
+			// Basic height and distance checks
+			if (heightDiff >= 2)
+				return true;
+			if (heightDiff == 1 && distance > 5.24)
+				return true;
+			if (heightDiff == -1 && distance > 5.3)
+				return true;
+			if (heightDiff == -2 && distance > 6.2)
+				return true;
+			if (heightDiff == 1 && distance >= 4.5)
+				return true;
+			if ((heightDiff == 0) && distance >= 5.3)
+				return true;
+			if (heightDiff >= -3 && distance >= 6.3)
+				return true;
+			if (heightDiff < -2 && distance >= 6.3)
+				return true;
+
+			// Trapdoor checks
+			if (heightDiff == 1 && BlockStateChecker.isOpenTrapdoor(belowChildBlockState) && distance > 5)
+				return true;
+			if (heightDiff <= -2 && BlockStateChecker.isOpenTrapdoor(belowChildBlockState) && distance > 6)
+				return true;
+		}
+
+		// Large height drop
+		if (heightDiff > -1 && distance >= 6)
+			return true;
+
+		// Bottom slab checks
+		if (currentBlockHeight <= 0.5 && heightDiff > 0.5 && childBlockHeight > 0.5) {
+			return true;
+		}
+
+		return false;
+	}
+
+}

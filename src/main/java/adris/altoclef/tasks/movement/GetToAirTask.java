@@ -1,0 +1,188 @@
+package adris.altoclef.tasks.movement;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.control.Nav;
+import adris.altoclef.tasks.construction.DestroyBlockTask;
+import adris.altoclef.tasksystem.Task;
+import kaptainwutax.tungsten.helpers.PlayerFit;
+import kaptainwutax.tungsten.task.FastNavigator;
+import net.minecraft.core.BlockPos;
+import net.minecraft.tags.FluidTags;
+import net.minecraft.world.entity.Pose;
+import net.minecraft.world.level.LevelReader;
+import net.minecraft.world.phys.Vec3;
+
+/** Reach breathable air through the ordinary movement graph, then replenish oxygen. */
+public final class GetToAirTask extends Task {
+    private long nextSearchTick;
+    /** G100: how far up the column this dig-to-surface scan looks for the cap over the water. */
+    private static final int DIG_UP_SCAN = 12;
+    private DestroyBlockTask digUp;
+    private BlockPos digTarget;
+
+    @Override
+    protected void onStart() {
+        Nav.cancelAll();
+        nextSearchTick = 0;
+        digUp = null;
+    }
+
+    /** A standing body must fit and its eyes must be above any water in their cell. */
+    private static boolean canBreatheAt(LevelReader world, BlockPos pos, double eyeHeight) {
+        if (!PlayerFit.bodyFits(world, pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5)) return false;
+        if (!world.getFluidState(pos).is(FluidTags.WATER) && !PlayerFit.standable(world, pos)) return false;
+        Vec3 eye = new Vec3(pos.getX() + 0.5, pos.getY() + eyeHeight, pos.getZ() + 0.5);
+        BlockPos eyeCell = BlockPos.containing(eye);
+        var fluid = world.getFluidState(eyeCell);
+        return !fluid.is(FluidTags.WATER) || eye.y >= eyeCell.getY() + fluid.getHeight(world, eyeCell);
+    }
+
+    @Override
+    protected Task onTick() {
+        AltoClef mod = AltoClef.getInstance();
+        if (!mod.getPlayer().isUnderWater()) {
+            // Keep the recovered air pocket until oxygen is full. The survival
+            // chain's existing float input holds the head above the surface.
+            if (FastNavigator.isActive()) FastNavigator.stop();
+            setDebugState("Replenishing air");
+            return null;
+        }
+        var world = mod.getWorld();
+        // ⛔ WHEN THERE IS NO AIR TO SWIM TO, MAKE SOME (G100, 2026-09-18). The second 60-minute
+        // run drowned at y=0 mining diamonds: submerged in a flooded pocket capped by stone, this
+        // task searched for the nearest EXISTING breathable cell every 20 ticks, found none it
+        // could reach, did nothing, and the bot drowned (a zombie finished it). A player breaks
+        // straight up and surfaces. So: if the body's own column is capped by a breakable solid
+        // before air, dig that cap -- the same move as the reach-a-block miner, aimed up -- and
+        // the water then rises into the opened cell for the next swim-up. Only when the column is
+        // NOT diggable to air (bedrock, or air is only sideways) does it fall back to the lateral
+        // nearest-air search below.
+        BlockPos cap = cappedColumnDig(mod, world);
+        // ⛔ DIG ONLY IF IT IS QUICKER THAN SWIMMING (full56, 2026-09-29). With a cap over the head
+        // this always dug, even with air two blocks to the side: 20 s on one stone block at
+        // 463,35,-700 and the bot drowned. Under water and off the ground a block breaks 25 times
+        // slower (vanilla: x5 submerged without Aqua Affinity, x5 not on ground), which is what the
+        // plain mining estimate does not know. Compare the two and take the quicker.
+        if (cap != null) {
+            double digTicks = digTicksHere(mod, world, cap);
+            int swimSteps = stepsToBreathable(mod, world);
+            if (swimSteps >= 0 && swimSteps * SWIM_TICKS_PER_BLOCK < digTicks) {
+                if (digUp != null) adris.altoclef.Debug.logMessage(String.format(
+                        "GetToAir: swimming %d blocks rather than digging %.0f ticks", swimSteps, digTicks));
+                cap = null;
+                swimChosen++;
+            }
+        }
+        if (cap != null) {
+            if (digUp == null || !cap.equals(digTarget)) {
+                digUp = new DestroyBlockTask(cap);
+                digTarget = cap;
+                // Logged (not just a debug-state string) so the dig-to-surface can actually be
+                // measured -- a setDebugState line never reaches latest.log (G100).
+                adris.altoclef.Debug.logMessage("GetToAir: digging up to air, cap at " + cap.toShortString());
+            }
+            if (FastNavigator.isActive()) FastNavigator.stop();
+            setDebugState("Digging up to air at " + cap.toShortString());
+            return digUp;
+        }
+        digUp = null; digTarget = null;
+        long now = mod.getWorld().getGameTime();
+        if (!FastNavigator.isActive() && now >= nextSearchTick) {
+            double eyes = mod.getPlayer().getEyeHeight(Pose.STANDING);
+            FastNavigator.startNearest(pos -> canBreatheAt(world, pos, eyes));
+            // Rate-limit unsuccessful searches in a sealed or changing cavity.
+            nextSearchTick = now + 20;
+        }
+        setDebugState("Finding a reachable air pocket");
+        return null;
+    }
+
+    /**
+     * The block to break to open the body's own column upward to air, or null if the column
+     * already reaches air through water (swim up) or cannot be dug to air (break something else).
+     *
+     * <p>Scans up from the head: water cells are the way up and are passed through; the FIRST
+     * non-water cell decides. If it is air/breathable the column is already open (null -- swim). If
+     * it is a breakable solid it is the cap over the water and gets returned to dig. If it is
+     * unbreakable (bedrock) the column is a dead end and this returns null so the lateral search
+     * runs instead.
+     */
+    private static final double SWIM_TICKS_PER_BLOCK = 8;
+    private static final int SWIM_SEARCH_STEPS = 16;
+    public static volatile int swimChosen;
+
+    /** Ticks to break {@code cap} from here, with vanilla's penalties for water and for not
+     *  standing on the ground (Player.getBlockBreakingSpeed). */
+    private static double digTicksHere(AltoClef mod, LevelReader world, BlockPos cap) {
+        var p = mod.getPlayer();
+        double t = kaptainwutax.tungsten.path.movements.MovementHelperB.getRequiredMiningDurationTicks(
+                world, p, cap.getX(), cap.getY(), cap.getZ(), world.getBlockState(cap), false);
+        if (t >= 1_000_000) return t;
+        // x5 submerged (Aqua Affinity would lift it; the bot does not wear it)
+        if (p.isEyeInFluid(FluidTags.WATER)) t *= 5;
+        if (!p.onGround()) t *= 5;
+        return t;
+    }
+
+    /** Swim steps (through water and air, six directions) to the nearest cell the body can breathe
+     *  in, or -1 if none within SWIM_SEARCH_STEPS. */
+    private static int stepsToBreathable(AltoClef mod, LevelReader world) {
+        double eyes = mod.getPlayer().getEyeHeight(Pose.STANDING);
+        BlockPos start = mod.getPlayer().blockPosition();
+        java.util.ArrayDeque<BlockPos> q = new java.util.ArrayDeque<>();
+        java.util.Map<BlockPos, Integer> dist = new java.util.HashMap<>();
+        q.add(start);
+        dist.put(start, 0);
+        while (!q.isEmpty()) {
+            BlockPos c = q.poll();
+            int d = dist.get(c);
+            if (d > 0 && canBreatheAt(world, c, eyes)) return d;
+            if (d >= SWIM_SEARCH_STEPS) continue;
+            for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.values()) {
+                BlockPos n = c.relative(dir);
+                if (dist.containsKey(n)) continue;
+                if (!world.getBlockState(n).getCollisionShape(world, n).isEmpty()) continue;
+                dist.put(n, d + 1);
+                q.add(n);
+            }
+        }
+        return -1;
+    }
+
+    private static BlockPos cappedColumnDig(AltoClef mod, LevelReader world) {
+        BlockPos head = BlockPos.containing(mod.getPlayer().getEyePosition());
+        for (int i = 1; i <= DIG_UP_SCAN; i++) {
+            BlockPos c = head.above(i);
+            if (world.getFluidState(c).is(FluidTags.WATER)) continue;   // still water: keep rising
+            var state = world.getBlockState(c);
+            if (state.isAir()) return null;                              // open to air: just swim up
+            // A solid cell over the water: dig it if it is breakable (finite, non-negative
+            // hardness rules out bedrock), else the column is a dead end -- let the lateral
+            // search run instead.
+            float hardness = state.getDestroySpeed(world, c);
+            return hardness >= 0 ? c : null;
+        }
+        return null;                                                      // all water for 12: swim up
+    }
+
+    @Override
+    protected void onStop(Task interruptTask) {
+        Nav.cancelAll();
+    }
+
+    @Override
+    public boolean isFinished() {
+        var player = AltoClef.getInstance().getPlayer();
+        return player == null || (!player.isUnderWater() && player.getAirSupply() >= player.getMaxAirSupply());
+    }
+
+    @Override
+    protected boolean isEqual(Task other) {
+        return other instanceof GetToAirTask;
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "Reaching breathable air";
+    }
+}

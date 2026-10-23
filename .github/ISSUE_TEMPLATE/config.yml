@@ -1,0 +1,7 @@
+# Issue templates for UnionClef.
+# Blank issues are allowed too — a short free-form report is better than none.
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation & usage
+    url: https://github.com/smallduuude/unionclef-26.3-native
+    about: Commands, the GUI, settings and how to build from source.

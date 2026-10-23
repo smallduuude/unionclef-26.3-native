@@ -1,0 +1,147 @@
+package kaptainwutax.tungsten.commands.arguments;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.ConcurrentModificationException;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.mojang.brigadier.StringReader;
+import com.mojang.brigadier.arguments.ArgumentType;
+import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import com.mojang.brigadier.exceptions.DynamicCommandExceptionType;
+import com.mojang.brigadier.suggestion.Suggestions;
+import com.mojang.brigadier.suggestion.SuggestionsBuilder;
+
+import kaptainwutax.tungsten.TungstenMod;
+import kaptainwutax.tungsten.commandsystem.Arg;
+import kaptainwutax.tungsten.commandsystem.CommandException;
+import kaptainwutax.tungsten.path.targets.BlockTarget;
+import kaptainwutax.tungsten.path.targets.BlockTarget.BlockTargetCoordType;
+import kaptainwutax.tungsten.world.Dimension;
+import net.minecraft.commands.SharedSuggestionProvider;
+import net.minecraft.network.chat.Component;
+
+public class GotoTargetArgumentType implements ArgumentType<BlockTarget> {
+    private static final GotoTargetArgumentType INSTANCE = new GotoTargetArgumentType();
+    private static final Collection<String> EXAMPLES = List
+	    .of("[x y z dimension]/[x z dimension]/[y dimension]/[dimension]/[x y z]/[x z]/[y]");
+    static final DynamicCommandExceptionType INVALID_NUM_OF_COORD_ARGS = new DynamicCommandExceptionType(
+	    numbers -> Component.literal("Unexpected number of integers passed to coordinate: " + numbers));
+
+    public GotoTargetArgumentType() {
+    }
+
+    public static GotoTargetArgumentType create() {
+	return INSTANCE;
+    }
+
+    public static BlockTarget get(CommandContext<?> context) {
+	return context.getArgument("gotoTarget", BlockTarget.class);
+    }
+
+    @Override
+    public BlockTarget parse(StringReader reader) throws CommandSyntaxException {
+	reader.skipWhitespace();
+//	        if (!reader.canRead()) {
+//	            throw INVALID_NUM_OF_COORD_ARGS.create("");
+//	        }
+	final String text = reader.getRemaining();
+	reader.setCursor(reader.getTotalLength());
+	String[] parts = text.split(" ");
+	List<Integer> numbers = new ArrayList<>();
+	Dimension dimension = null;
+	for (String part : parts) {
+	    try {
+		int num = Integer.parseInt(part);
+		numbers.add(num);
+	    } catch (NumberFormatException e) {
+		try {
+		    dimension = (Dimension) Arg.parseEnum(part, Dimension.class);
+		} catch (CommandException e1) {
+		    // ⛔ FIXED 2026-09-05: this used to `return null` on a bad token (not a number, not
+		    // a Dimension name). ArgumentType.parse() must return a value or throw -- brigadier
+		    // callers, and GotoCommand right after GotoTargetArgumentType.get(), dereference the
+		    // result unconditionally (target.getVec3d()). Returning null pushed a
+		    // NullPointerException into GotoCommand's try/catch instead of the clean
+		    // "invalid argument" syntax error brigadier already has a mechanism for.
+		    throw CommandSyntaxException.BUILT_IN_EXCEPTIONS.literalIncorrect()
+		        .createWithContext(reader, part);
+		}
+		break;
+	    }
+	}
+	int x = 0, y = 0, z = 0;
+	BlockTarget.BlockTargetCoordType coordType;
+	switch (numbers.size()) {
+	case 0 -> coordType = BlockTargetCoordType.NONE;
+	case 1 -> {
+	    y = numbers.get(0);
+	    coordType = BlockTargetCoordType.Y;
+	}
+	case 2 -> {
+	    x = numbers.get(0);
+	    z = numbers.get(1);
+	    coordType = BlockTargetCoordType.XZ;
+	}
+	case 3 -> {
+	    x = numbers.get(0);
+	    y = numbers.get(1);
+	    z = numbers.get(2);
+	    coordType = BlockTargetCoordType.XYZ;
+	}
+	default -> throw INVALID_NUM_OF_COORD_ARGS.create(numbers.size());
+	}
+	;
+
+	return new BlockTarget(x, y, z, dimension, coordType);
+    }
+
+    @Override
+    public <S> CompletableFuture<Suggestions> listSuggestions(CommandContext<S> context, SuggestionsBuilder builder) {
+	// [x y z dimension]/[x z dimension]/[y dimension]/[dimension]/[x y z]/[x z]/[y]
+	try {
+	    List<String> suggestions = new ArrayList<String>();
+
+	    String remaining = builder.getRemaining();
+
+	    Pattern pattern = Pattern.compile("^(\\d+ \\d+ \\d+)|(\\d+ \\d+)|(\\d+)", Pattern.CASE_INSENSITIVE);
+	    Matcher matcher = pattern.matcher(remaining);
+	    matcher.find();
+
+	    if (!matcher.hasMatch()) {
+		int x = TungstenMod.mc.player.getBlockX();
+		int y = TungstenMod.mc.player.getBlockY();
+		int z = TungstenMod.mc.player.getBlockZ();
+		suggestions.add(x + " " + y + " " + z);
+		suggestions.add(x + " " + z);
+		suggestions.add(y + "");
+
+		for (String string : List.copyOf(suggestions)) {
+		    for (Dimension dimension : Dimension.values()) {
+			suggestions.add(string + " " + dimension.toString());
+			suggestions.add(dimension.toString());
+		    }
+		}
+	    } else if (matcher.hasMatch()) {
+		String addon = matcher.group();
+		suggestions.add(addon);
+		for (Dimension dimension : Dimension.values()) {
+		    suggestions.add(addon + " " + dimension.toString());
+		}
+	    }
+
+	    return SharedSuggestionProvider.suggest(suggestions, builder);
+	} catch (ConcurrentModificationException e) {
+	    return SharedSuggestionProvider.suggest(new ArrayList<String>(), builder);
+	}
+    }
+
+    @Override
+    public Collection<String> getExamples() {
+	return EXAMPLES;
+    }
+}

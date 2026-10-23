@@ -1,0 +1,162 @@
+package kaptainwutax.tungsten.combat;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.LevelReader;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
+
+/**
+ * Checks terrain safety: void, edges, fall height.
+ */
+public final class VoidDetector {
+
+    private static final int MAX_SCAN_DEPTH = 30;
+
+    private VoidDetector() {}
+
+    /** True if there is at least one solid block below pos within scan depth. */
+    public static boolean isSafe(Vec3 pos, LevelReader world) {
+        return fallHeight(pos, world) < MAX_SCAN_DEPTH;
+    }
+
+    /**
+     * How many blocks would you fall from this position before hitting ground?
+     * Returns MAX_SCAN_DEPTH if void (no ground found).
+     */
+    public static int fallHeight(Vec3 pos, LevelReader world) {
+        int x = Mth.floor(pos.x);
+        int z = Mth.floor(pos.z);
+        int startY = Mth.floor(pos.y);
+        int bottomY = world.getMinY();
+
+        for (int dy = 0; dy < MAX_SCAN_DEPTH; dy++) {
+            int y = startY - dy;
+            if (y < bottomY) return MAX_SCAN_DEPTH; // void
+            BlockPos bp = new BlockPos(x, y, z);
+            BlockState state = world.getBlockState(bp);
+            // ⛔ LAVA BELOW IS AS LETHAL AS THE VOID (G108 nether stage, 2026-09-21). Lava has no
+            // collision shape, so this scan used to fall straight THROUGH a lava pool to the stone
+            // under it: a two-block pool read as a three-block drop -- "safe" -- and not one piece of
+            // the void machinery engaged at a lava edge. Measured with the lava-entry instrument on the
+            // nether stage: the bot entered lava with hurtTime=10, onGround=0, horizontal speed 0,
+            // forward NOT pressed, stage NARROW_BATTLE -- an Enderman hit knocked it off a narrow ledge
+            // into the lava below. Three clamps on the bot's OWN steps could not touch that; what
+            // protects a body from being pushed off an edge is exactly what this primitive already
+            // drives for the void: the direction-specific steering veto, sneak at the edge, NARROW_BATTLE
+            // repositioning, and "toward-island input kept under knockback". Making lava count as the
+            // drop gives lava edges all of it, unchanged. The planner does not consult this class, so
+            // pathfinder-driven work beside lava (the obsidian flood placing water) is unaffected.
+            if (state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA)) return MAX_SCAN_DEPTH;
+            if (!state.getCollisionShape(world, bp).isEmpty()) return dy;
+        }
+        return MAX_SCAN_DEPTH;
+    }
+
+    /**
+     * Returns a 0-1 edge proximity score. 0 = safe (solid all around), 1 = surrounded by void.
+     * Checks 8 neighbors at feet level.
+     */
+    public static double edgeScore(Vec3 pos, LevelReader world) {
+        int x = Mth.floor(pos.x);
+        int y = Mth.floor(pos.y) - 1;
+        int z = Mth.floor(pos.z);
+        int bottomY = world.getMinY();
+
+        if (y < bottomY) return 1.0;
+
+        int unsafeCount = 0;
+        int[][] offsets = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+        for (int[] off : offsets) {
+            if (!hasGroundAt(x + off[0], y, z + off[1], world, bottomY)) {
+                unsafeCount++;
+            }
+        }
+        return unsafeCount / 8.0;
+    }
+
+    /**
+     * Would advancing horizontally from {@code pos} in direction (dx,dz) step off
+     * a drop deeper than {@code maxSafeFall}, while {@code pos} itself is on safe
+     * ground? Samples a few short distances ahead at feet level.
+     *
+     * This is the core void-safety primitive for FREE-FORM movement (combat aura,
+     * LEAP) — it keeps the bot on bridges/islands by refusing forward motion that
+     * leaves solid ground. Pathfinder moves are NOT gated by this (the block-space
+     * search already routes over solid cells and may descend deliberately).
+     *
+     * @return true if a step ahead lands over a serious drop (caller should not advance)
+     */
+    public static boolean edgeAhead(Vec3 pos, double dx, double dz, LevelReader world, int maxSafeFall) {
+        return edgeAhead(pos, dx, dz, world, maxSafeFall, 1.35);
+    }
+
+    /**
+     * Like {@link #edgeAhead(Vec3, double, double, LevelReader, int)} but samples out
+     * to {@code maxDist} blocks — pass a speed-scaled distance so a sprinting bot
+     * sees the rim while it still has room to stop (fixed 1.35 was overshot by
+     * sprint momentum ~0.28/tick).
+     */
+    public static boolean edgeAhead(Vec3 pos, double dx, double dz, LevelReader world,
+                                    int maxSafeFall, double maxDist) {
+        double len = Math.sqrt(dx * dx + dz * dz);
+        if (len < 1e-4) return false;
+        dx /= len; dz /= len;
+        // If we're already over a drop (mid-parkour/descent), this guard doesn't apply.
+        if (fallHeight(pos, world) > maxSafeFall) return false;
+        int steps = Math.max(2, (int) Math.ceil(maxDist / 0.45));
+        for (int i = 1; i <= steps; i++) {
+            double d = maxDist * i / steps;
+            Vec3 ahead = new Vec3(pos.x + dx * d, pos.y, pos.z + dz * d);
+            if (fallHeight(ahead, world) > maxSafeFall) return true;
+        }
+        return false;
+    }
+
+    /** True if any cell within Chebyshev {@code radius} of pos (feet level) drops
+     *  more than {@code maxSafeFall} — a wider "am I near a ledge" test used to
+     *  cut sprint/jump before momentum builds toward the rim. */
+    public static boolean voidWithin(Vec3 pos, LevelReader world, int radius, int maxSafeFall) {
+        int cx = Mth.floor(pos.x), cz = Mth.floor(pos.z);
+        int y = Mth.floor(pos.y);
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (dx == 0 && dz == 0) continue;
+                if (fallHeight(new Vec3(cx + dx + 0.5, y, cz + dz + 0.5), world) > maxSafeFall) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasGroundAt(int x, int startY, int z, LevelReader world, int bottomY) {
+        for (int dy = 0; dy <= 2; dy++) {
+            int y = startY - dy;
+            if (y < bottomY) return false;
+            BlockPos bp = new BlockPos(x, y, z);
+            if (!world.getBlockState(bp).getCollisionShape(world, bp).isEmpty()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Like edgeScore but counts neighbor as unsafe if fall > maxSafeFall blocks.
+     * Used for NARROW_BATTLE detection where 5+ block drops are dangerous, not just void.
+     */
+    public static double edgeScoreWithFallThreshold(Vec3 pos, LevelReader world, int maxSafeFall) {
+        int x = Mth.floor(pos.x);
+        int y = Mth.floor(pos.y);
+        int z = Mth.floor(pos.z);
+
+        int unsafeCount = 0;
+        int[][] offsets = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+        for (int[] off : offsets) {
+            int fall = fallHeight(new Vec3(x + off[0] + 0.5, y, z + off[1] + 0.5), world);
+            if (fall > maxSafeFall) {
+                unsafeCount++;
+            }
+        }
+        return unsafeCount / 8.0;
+    }
+}

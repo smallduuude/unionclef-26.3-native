@@ -1,0 +1,402 @@
+package adris.altoclef.tasks;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.tasks.slot.MoveItemToSlotFromInventoryTask;
+import adris.altoclef.tasks.slot.ReceiveCraftingOutputSlotTask;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.ItemTarget;
+import adris.altoclef.util.RecipeTarget;
+import adris.altoclef.util.helpers.ItemHelper;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.slots.CraftingTableSlot;
+import adris.altoclef.util.slots.PlayerSlot;
+import adris.altoclef.util.slots.Slot;
+import java.util.Optional;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+/**
+ * Assuming a crafting screen is open, crafts a recipe.
+ * <p>
+ * Not useful for custom tasks.
+ */
+/*
+ * IMPLEMENTS ITaskUsesCraftingGrid, AND THAT ONE WORD IS THE WHOLE BUG.
+ *
+ * ResourceTask.onTick (line ~98) asks "does anything under me claim the crafting grid?" and, if
+ * nothing does, treats an item in the CURSOR that matches its targets as a stray to be put away --
+ * "Moving from cursor", click, back in the pack. The marker interface is how a craft says "that
+ * item in my hand is mine, I am mid-placement".
+ *
+ * CraftGenericWithRecipeBooksTask declares it. This task -- the MANUAL one, which became the
+ * default when the recipe book was turned off because servers disable it -- did not. So every time
+ * the mover picked an ingredient up, the parent took it away again, and the craft could never place
+ * a single item.
+ *
+ * The evidence, in the order it was found: mc=1854/0/0/0/0 (asking for a move every tick and
+ * nothing else), the click trace showing pick-up-from-36 then straight back into 36, no
+ * MOVEMISMATCH line (so the ingredient was correct all along), and finally
+ * "CURSORBACK onResourceStop holding=minecraft:oak_log interrupt=EnsureFreePlayerCraftingGridTask",
+ * which named both the hand that returned it and the task that interrupted the craft.
+ */
+public class CraftGenericManuallyTask extends Task implements adris.altoclef.tasksystem.ITaskUsesCraftingGrid {
+
+    /**
+     * WHERE A MANUAL CRAFT ACTUALLY GOES. Read as mc=fill/short/out/wait/invalid.
+     *
+     * <p>This task had no counters at all, and it is where the playthrough now stops: two identical
+     * chain snapshots at the end of a run, six levels deep, ending at "Getting planks x 2" with the
+     * logs already in the pack. The bot is at a TABLE, planks are a 2x2 recipe, so the route is the
+     * big-grid branch and the 2x2-into-3x3 slot mapping. Which of the five things below it does
+     * every tick decides what to read next, and nothing currently said.
+     *
+     * <p>FIRST READING, and it names the component: <b>mc=1051/0/0/0/0</b>. Every single tick took
+     * the "Moving item to slot..." branch and returned a MoveItemToSlotFromInventoryTask -- 1051 of
+     * them, about fifty seconds of solid loop -- while mcShort, mcFromOutput, mcWait and
+     * mcInvalidSlot all stayed at zero, and ciGrid stayed 0 as well, meaning nothing ever landed in
+     * the grid. So the slot never becomes satisfied because the item never arrives: this task is
+     * asking correctly and MoveItemToSlotFromInventoryTask is not delivering. That is the next
+     * thing to read -- not this loop, and not the recipe mapping.
+     */
+    public static volatile int mcFilled, mcShort, mcFromOutput, mcWait, mcInvalidSlot;
+
+    /**
+     * Ticks where the ingredient this slot wants was already in the cursor, mid-move. Read as
+     * mcFlight. Zero on a build without the fix below is not proof of anything; a NON-zero reading
+     * is proof that the carousel condition really does occur.
+     */
+    public static volatile int mcInFlight;
+
+    /** Ticks the tail KEPT a cursor because a grid slot still wanted it. Read as mcKept. */
+    public static volatile int mcKeptCursor;
+
+    /**
+     * Times the slot being filled CHANGED from one tick to the next while the cursor was full.
+     *
+     * <p>The hypothesis every measurement so far fits, and the one thing never tested. This loop
+     * returns a mover for the FIRST unsatisfied slot. When that slot's ingredient is already in the
+     * cursor -- in flight, picked up last tick -- {@code hasItemInventoryOnly} is false for it, so
+     * the guard above takes its {@code continue} and the loop hands back a mover for a LATER slot
+     * instead. The new mover finds the wrong item held, puts it away, and the old slot is unfilled
+     * again next tick.
+     *
+     * <p>That is exactly what the capture shows: MOVEMISMATCH holding=planks want=[stick] on slot
+     * 4, mcFilled=3080 against ciReceive=25, and CURSORBACK returning stick, planks and log by
+     * turns. mcInFlight is the guard meant to stop it and fired on only 73 of those 3080 ticks.
+     *
+     * <p>Non-zero here means the craft is switching targets underneath its own mover, and the fix
+     * is to hold the slot until the move completes rather than to keep the cursor.
+     */
+    public static volatile int mcSlotSwitched;
+
+    private int lastAskedSlot = -1;
+
+    /**
+     * Does any UNSATISFIED slot of this recipe still want {@code held}?
+     *
+     * <p>Asked of the recipe rather than of the grid, so it is true exactly when putting the item
+     * back would undo work the next tick has to redo.
+     */
+    private boolean slotStillWants(Item held, int requiredPerSlot, boolean bigCrafting) {
+        return firstSlotWanting(held, requiredPerSlot, bigCrafting) >= 0;
+    }
+
+    /** Index of the first UNSATISFIED slot that wants {@code held}, or -1. */
+    private int firstSlotWanting(Item held, int requiredPerSlot, boolean bigCrafting) {
+        try {
+            for (int i = 0; i < target.getRecipe().getSlotCount(); ++i) {
+                ItemTarget want = target.getRecipe().getSlot(i);
+                if (want == null || want.isEmpty() || !want.matches(held)) continue;
+                Slot slot = bigCrafting
+                        ? CraftingTableSlot.getInputSlot(i, target.getRecipe().isBig())
+                        : PlayerSlot.getCraftInputSlot(i);
+                ItemStack there = StorageHelper.getItemStackInSlot(slot);
+                boolean satisfied = want.matches(there.getItem()) && there.getCount() >= requiredPerSlot;
+                if (!satisfied) return i;
+            }
+        } catch (Exception ignored) {
+            // a guard must never be the thing that breaks a craft
+        }
+        return -1;
+    }
+
+    private final RecipeTarget target;
+
+    public CraftGenericManuallyTask(RecipeTarget target) {
+        this.target = target;
+    }
+
+    /**
+     * How many of each ingredient to put in every grid slot for this craft.
+     *
+     * <p>The batch size is normally "enough to hit the target count in one grid", but it must be
+     * capped twice. A grid slot holds at most one stack (64). And it can never be more than we can
+     * actually supply — some callers ask for "as much as possible" by passing a huge target count
+     * ({@code CollectFoodTask} asks for {@code BREAD x 99999999}), which used to make this number
+     * 99,999,999, so no slot could ever be satisfied, the grid never filled, and the craft stood
+     * still forever: the reported "has a stack and a half of wheat but will not make bread".
+     *
+     * <p>The supply of an ingredient is divided across the slots that want it, so an earlier slot
+     * cannot take the whole stack and starve the slots after it (which is how a partial supply used
+     * to deadlock too). Supply counts the player's inventory, the cursor and the open grid, so the
+     * number is stable while items are mid-move and only falls when a craft actually consumes them.
+     */
+    private int computeRequiredPerSlot() {
+        int batch = (int) Math.ceil((double) target.getTargetCount() / target.getRecipe().outputCount());
+        int result = Math.min(batch, 64);
+        for (int i = 0; i < target.getRecipe().getSlotCount(); ++i) {
+            ItemTarget want = target.getRecipe().getSlot(i);
+            if (want == null || want.isEmpty()) continue;
+            int slotsWanting = 0;
+            for (int j = 0; j < target.getRecipe().getSlotCount(); ++j) {
+                ItemTarget other = target.getRecipe().getSlot(j);
+                if (other != null && !other.isEmpty() && other.equals(want)) ++slotsWanting;
+            }
+            if (slotsWanting == 0) continue;
+            int supply = AltoClef.getInstance().getItemStorage().getItemCount(want.getMatches());
+            result = Math.min(result, Math.max(1, supply / slotsWanting));
+        }
+        return Math.max(1, result);
+    }
+
+    @Override
+    protected void onStart() {
+
+    }
+
+    @Override
+    protected Task onTick() {
+        AltoClef mod = AltoClef.getInstance();
+
+        boolean bigCrafting = StorageHelper.isBigCraftingOpen();
+
+        if (!bigCrafting && !StorageHelper.isPlayerInventoryOpen()) {
+            // Make sure we're not in another screen before we craft,
+            // otherwise crafting won't work
+            ItemStack cursorStack = StorageHelper.getItemStackInCursorSlot();
+            if (!cursorStack.isEmpty()) {
+                Optional<Slot> moveTo = mod.getItemStorage().getSlotThatCanFitInPlayerInventory(cursorStack, false);
+                if (moveTo.isPresent()) {
+                    mod.getSlotHandler().clickSlot(moveTo.get(), 0, ContainerInput.PICKUP);
+                    return null;
+                }
+                if (ItemHelper.canThrowAwayStack(mod, cursorStack)) {
+                    mod.getSlotHandler().clickSlot(Slot.UNDEFINED, 0, ContainerInput.PICKUP);
+                    return null;
+                }
+                Optional<Slot> garbage = StorageHelper.getGarbageSlot(mod);
+                // Try throwing away cursor slot if it's garbage
+                if (garbage.isPresent()) {
+                    mod.getSlotHandler().clickSlot(garbage.get(), 0, ContainerInput.PICKUP);
+                    return null;
+                }
+                mod.getSlotHandler().clickSlot(Slot.UNDEFINED, 0, ContainerInput.PICKUP);
+            } else {
+                StorageHelper.closeScreen();
+            }
+            // Just to be safe
+        }
+
+        Slot outputSlot = bigCrafting ? CraftingTableSlot.OUTPUT_SLOT : PlayerSlot.CRAFT_OUTPUT_SLOT;
+
+        // How many of each ingredient go in every grid slot (capped to one stack and to what we can
+        // actually supply -- see computeRequiredPerSlot).
+        int requiredPerSlot = computeRequiredPerSlot();
+
+        // ⛔ FINISH THE MOVE THAT IS ALREADY IN FLIGHT BEFORE PICKING A DIFFERENT SLOT.
+        //
+        // The loop below hands a mover to the FIRST unsatisfied slot. When that slot's ingredient
+        // is already in the CURSOR -- picked up last tick, halfway to the grid --
+        // hasItemInventoryOnly is false for it, the guard inside takes its `continue`, and a LATER
+        // slot gets the mover instead. That mover finds the wrong item held, puts it away, and the
+        // first slot is empty again next tick. Round and round.
+        //
+        // Every reading of the stalled playthrough fits that and nothing else: mcFilled=3080
+        // against ciReceive=25, MOVEMISMATCH holding=planks want=[stick] on slot 4, and CURSORBACK
+        // handing back stick, planks and log by turns. mcInFlight is the guard meant to prevent it
+        // and fired on 73 of those 3080 ticks -- it catches the case only when the loop happens to
+        // reach the right slot first, which is precisely what goes wrong.
+        //
+        // So ask the question the other way round: not "which slot is unsatisfied" but "does what
+        // I am already holding belong somewhere". If it does, put it THERE and finish the move.
+        // Keeping the cursor instead was tried and measured no benefit (9-minute A/B, off arm went
+        // deeper), because that fixes the symptom while the target keeps moving.
+        if (kaptainwutax.tungsten.TungstenConfig.get().craftFinishMoveInFlight) {
+            ItemStack held = StorageHelper.getItemStackInCursorSlot();
+            if (!held.isEmpty()) {
+                int wants = firstSlotWanting(held.getItem(), requiredPerSlot, bigCrafting);
+                if (wants >= 0) {
+                    Slot dest = bigCrafting
+                            ? CraftingTableSlot.getInputSlot(wants, target.getRecipe().isBig())
+                            : PlayerSlot.getCraftInputSlot(wants);
+                    mcFilled++;
+                    mcInFlight++;
+                    setDebugState("Finishing the move already in flight...");
+                    return new MoveItemToSlotFromInventoryTask(
+                            new ItemTarget(target.getRecipe().getSlot(wants), requiredPerSlot), dest);
+                }
+            }
+        }
+
+        // For each slot in table
+        for (int craftSlot = 0; craftSlot < target.getRecipe().getSlotCount(); ++craftSlot) {
+            ItemTarget toFill = target.getRecipe().getSlot(craftSlot);
+            Slot currentCraftSlot;
+            if (bigCrafting) {
+                // Craft in table
+                currentCraftSlot = CraftingTableSlot.getInputSlot(craftSlot, target.getRecipe().isBig());
+            } else {
+                // Craft in window
+                currentCraftSlot = PlayerSlot.getCraftInputSlot(craftSlot);
+            }
+            ItemStack present = StorageHelper.getItemStackInSlot(currentCraftSlot);
+            if (toFill == null || toFill.isEmpty()) {
+                if (present.getItem() != Items.AIR) {
+                    // Move this item OUT if it should be empty
+                    setDebugState("Found INVALID slot");
+                    mcInvalidSlot++;
+                    mod.getSlotHandler().clickSlot(currentCraftSlot, 0, ContainerInput.PICKUP);
+                }
+            } else {
+                boolean correctItem = toFill.matches(present.getItem());
+                boolean isSatisfied = correctItem && present.getCount() >= requiredPerSlot;
+                if (!isSatisfied) {
+                    // ASK ABOUT THE INGREDIENT WE NEED, NOT ABOUT WHATEVER IS SITTING THERE.
+                    // The question this guard means to ask is "have we run out, so should we take
+                    // what the grid already made instead" -- and it asked it about `present`, the
+                    // stack IN the craft slot. For a slot still to be filled `present` is AIR, so
+                    // it asked whether the inventory contains AIR.
+                    //
+                    // That answer is not even stable: hasItem checks the CURSOR first
+                    // (InventorySubTracker.java:76-79), and an empty cursor is an ItemStack whose
+                    // item is AIR. So with an empty cursor it said "yes, we have air", the guard
+                    // fell through and the slot got filled -- crafting worked by accident. The
+                    // moment the bot is holding anything, the same call says no, every slot is
+                    // skipped by the `continue` below, and with an empty output the tail of this
+                    // method waits. Nothing fills, nothing comes out, and it never recovers,
+                    // because clearing the cursor is gated on the output NOT stacking with it and
+                    // an empty output stacks with everything.
+                    // Measured on the playthrough: 1856 ticks inside this task with the materials
+                    // in the pack, ciReceive=0, ciGrid=0 -- the grid empty because the ingredients
+                    // never went in.
+                    // THE STACK IN FLIGHT LIVES IN THE CURSOR, AND THIS QUESTION COULD NOT SEE IT.
+                    // Filling a slot takes two ticks: the mover picks the ingredient UP into the
+                    // cursor, and puts it DOWN on the next one. Between those two ticks the item is
+                    // in neither the pack nor the grid. So when the stack being moved is the last of
+                    // its kind, this guard reads "we have run out", takes the `continue` below, the
+                    // loop ends with nothing returned -- which drops the mover mid-move -- and the
+                    // tail of this method, finding a cursor that does not stack with an empty
+                    // output, puts the ingredient back in the pack. Next tick it is in the pack
+                    // again, the mover picks it up again, and the craft rides that carousel forever.
+                    // Measured on the smelt course, from the tag on that tail:
+                    //   90x CURSORBACK manualTail holding=minecraft:oak_log
+                    //   30x CURSORBACK manualTail holding=minecraft:stick
+                    //   30x CURSORBACK manualTail holding=minecraft:oak_planks
+                    // Note what this does NOT go back to: `hasItem`, which checks the cursor FIRST
+                    // and reports an empty cursor as AIR, is the bug the comment above describes.
+                    // Asking whether the cursor holds THIS INGREDIENT is a different question and
+                    // has no such hole -- toFill is non-empty here, so an empty cursor never matches.
+                    boolean inFlight = toFill.matches(StorageHelper.getItemStackInCursorSlot().getItem());
+                    if (inFlight) {
+                        mcInFlight++;
+                    }
+                    if (!inFlight && !mod.getItemStorage().hasItemInventoryOnly(toFill.getMatches())) {
+                        if (!StorageHelper.getItemStackInSlot(outputSlot).isEmpty()) {
+                            setDebugState("NO MORE to fit: grabbing from output.");
+                            mcFromOutput++;
+                            return new ReceiveCraftingOutputSlotTask(outputSlot, target.getTargetCount());
+                        } else {
+                            // Move on to the NEXT slot, we can't fill this one anymore.
+                            mcShort++;
+                            continue;
+                        }
+                    }
+
+                    setDebugState("Moving item to slot...");
+                    mcFilled++;
+                    if (lastAskedSlot != -1 && lastAskedSlot != craftSlot
+                            && !StorageHelper.getItemStackInCursorSlot().isEmpty()) {
+                        mcSlotSwitched++;
+                    }
+                    lastAskedSlot = craftSlot;
+                    return new MoveItemToSlotFromInventoryTask(new ItemTarget(toFill, requiredPerSlot), currentCraftSlot);
+                }
+                // We could be OVER satisfied
+                boolean oversatisfies = present.getCount() > requiredPerSlot;
+                if (oversatisfies) {
+                    setDebugState("OVER SATISFIED slot! Right clicking slot to extract half and spread it out more.");
+                    mod.getSlotHandler().clickSlot(currentCraftSlot, 0, ContainerInput.PICKUP);
+                }
+            }
+        }
+
+        // Ensure our cursor is empty/can receive our item
+        ItemStack cursor = StorageHelper.getItemStackInCursorSlot();
+        if (!ItemHelper.canStackTogether(StorageHelper.getItemStackInSlot(outputSlot), cursor)) {
+            // ⛔ DO NOT PUT BACK AN INGREDIENT A SLOT IS STILL WAITING FOR. That is the carousel
+            // this class already describes: the mover picks the ingredient up, the loop above ends
+            // without returning, and this tail posts it straight back to the pack -- so next tick
+            // it is picked up again, for ever.
+            //
+            // Measured on a 14-minute playthrough that reached wood tools and then did nothing for
+            // ten minutes: mc=3080/0/0/2/0 (it FILLS, three thousand times), ciReceive=25, and the
+            // tag below firing with the exact ingredient the grid wanted --
+            //     15x CURSORBACK manualTail holding=minecraft:stick
+            //     10x CURSORBACK manualTail holding=minecraft:dark_oak_planks
+            // while MOVEMISMATCH reported holding=planks want=[stick] on the same slot.
+            //
+            // Keeping it costs nothing: the next tick's fill places it, and the guard only skips a
+            // DUMP -- it never clicks, so it cannot strand the cursor somewhere new. If no slot
+            // wants it the old behaviour runs unchanged.
+            if (!cursor.isEmpty() && kaptainwutax.tungsten.TungstenConfig.get().craftKeepWantedCursor
+                    && slotStillWants(cursor.getItem(), requiredPerSlot, bigCrafting)) {
+                mcKeptCursor++;
+                setDebugState("Holding an ingredient a slot still wants");
+                return null;
+            }
+            // The twin of the tag in CraftInInventoryTask.onResourceStop -- see the note there.
+            // Diagnostic dump for the crafting-cursor churn: gate it behind verboseDebugLogging
+            // (default off) like the rest of the debug logs. It fires every tick the cursor holds
+            // an ingredient, so ungated it floods the chat overlay -- the operator saw it as
+            // "CURSORBACK manualTail holding=..." spam on a playthrough clip (G22, 2026-09-10).
+            if (!cursor.isEmpty() && kaptainwutax.tungsten.TungstenConfig.get().verboseDebugLogging) {
+                adris.altoclef.Debug.logMessage("CURSORBACK manualTail holding=" + cursor.getItem());
+            }
+            Optional<Slot> toFit = mod.getItemStorage().getSlotThatCanFitInPlayerInventory(cursor, false).or(() -> StorageHelper.getGarbageSlot(mod));
+            if (toFit.isPresent()) {
+                mod.getSlotHandler().clickSlot(toFit.get(), 0, ContainerInput.PICKUP);
+            } else {
+                // Eh screw it
+                mod.getSlotHandler().clickSlot(Slot.UNDEFINED, 0, ContainerInput.PICKUP);
+            }
+        }
+
+        if (!StorageHelper.getItemStackInSlot(outputSlot).isEmpty()) {
+            return new ReceiveCraftingOutputSlotTask(outputSlot, target.getTargetCount());
+        } else {
+            // Wait
+            mcWait++;
+            return null;
+        }
+    }
+
+    @Override
+    protected void onStop(Task interruptTask) {
+
+    }
+
+    @Override
+    protected boolean isEqual(Task other) {
+        if (other instanceof CraftGenericManuallyTask task) {
+            return task.target.equals(target);
+        }
+        return false;
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "Crafting: " + target;
+    }
+}

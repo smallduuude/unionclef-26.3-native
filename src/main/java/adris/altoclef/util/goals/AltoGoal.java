@@ -1,0 +1,662 @@
+package adris.altoclef.util.goals;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.Vec3;
+
+/**
+ * Where the bot is trying to get to, owned by altoclef rather than by a pathfinder.
+ *
+ * <h2>Why this exists</h2>
+ *
+ * G-0 is "stop depending on baritone", and the thing that actually holds altoclef to it is not an
+ * algorithm — it is a TYPE. Counted across src/main: {@code baritone.api.pathing.goals.Goal} in 23
+ * files, plus GoalNear, GoalBlock, GoalYLevel, GoalXZ and GoalRunAway in a dozen more. Every task
+ * that wants to walk somewhere names a baritone class to say so, which is why the dependency
+ * cannot be removed file by file.
+ *
+ * <p>A goal only ever answers two questions, and neither of them needs a pathfinder:
+ * <ul>
+ *   <li>WHERE should the bot head? — {@link #target()}, which is what the tungsten drive already
+ *       reduces every baritone goal to (see {@code CustomBaritoneGoalTask.goalToVec}, a chain of
+ *       instanceof over six goal classes that exists purely to recover this vector);</li>
+ *   <li>ARE WE THERE? — {@link #reached(BlockPos)}.</li>
+ * </ul>
+ *
+ * <p>With those two the drive needs no knowledge of goal classes at all, and a task can be moved
+ * over one at a time while everything still compiles — the migration is mechanical rather than a
+ * flag day.
+ *
+ * <p>The shapes are RECORDS rather than anonymous classes on purpose: while the legacy baritone
+ * fallback is still wired up, one adapter has to translate a goal back into baritone's vocabulary,
+ * and it can only do that if the shape is still visible. They also compare and print sensibly,
+ * which the drive's debug lines rely on.
+ */
+public interface AltoGoal {
+
+    /**
+     * The point to head for, in world coordinates.
+     *
+     * <p>Null for a region goal such as FleeLive: its drive uses a condition search rather than
+     * guessing a representative point. Other goals may return null when no target is available.
+     */
+    Vec3 target();
+
+    /**
+     * Is this position good enough to call the goal met?
+     *
+     * <p>The default is the honest general case: the same block. Goals with a radius, a Y-level or
+     * a keep-away rule override it, and that is the ONLY place tolerance lives — a caller never has
+     * to guess what "close enough" meant for a particular goal.
+     */
+    default boolean reached(BlockPos pos) {
+        Vec3 t = target();
+        return t != null
+                && pos.getX() == (int) Math.floor(t.x)
+                && pos.getY() == (int) Math.floor(t.y)
+                && pos.getZ() == (int) Math.floor(t.z);
+    }
+
+    /** A goal that is simply a block. */
+    record Block(BlockPos pos) implements AltoGoal {
+        @Override
+        public Vec3 target() {
+            return new Vec3(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5);
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            return at.getX() == pos.getX() && at.getY() == pos.getY() && at.getZ() == pos.getZ();
+        }
+
+        @Override
+        public String toString() {
+            return "block(" + pos.getX() + "," + pos.getY() + "," + pos.getZ() + ")";
+        }
+    }
+
+    /**
+     * Any of several exact feet cells. The planner chooses a reachable destination;
+     * there is no representative point to snap onto unrelated ground.
+     * Port of baritone/src/main/java/baritone/api/pathing/goals/GoalComposite.java:43-61 (any goal,
+     * minimum heuristic). Cells are immutable because the planner reads them on its worker.
+     */
+    final class AnyBlock implements AltoGoal {
+        private final java.util.Set<BlockPos> cells;
+
+        public AnyBlock(java.util.Collection<BlockPos> positions) {
+            java.util.Set<BlockPos> copy = new java.util.HashSet<>();
+            for (BlockPos pos : positions) copy.add(pos.immutable());
+            if (copy.isEmpty()) throw new IllegalArgumentException("No destination cells");
+            cells = java.util.Set.copyOf(copy);
+        }
+
+        public java.util.Set<BlockPos> cells() { return cells; }
+
+        @Override
+        public Vec3 target() { return null; }
+
+        @Override
+        public boolean reached(BlockPos at) { return cells.contains(at); }
+
+        /** Same point estimate as ordinary Tungsten routes, minimized across destinations. */
+        public double remaining(int x, int y, int z) {
+            double result = Double.POSITIVE_INFINITY;
+            for (BlockPos cell : cells) result = Math.min(result,
+                    kaptainwutax.tungsten.path.fast.FastPlanner.pointEstimate(x, y, z, cell));
+            return result;
+        }
+
+        @Override
+        public String toString() { return "anyBlock(" + cells.size() + " cells)"; }
+    }
+
+    /** A goal that is a block, satisfied from anywhere within {@code range} of it. */
+    record Near(BlockPos pos, int range) implements AltoGoal {
+        public Near {
+            // The condition search reads this goal on its worker, like AnyBlock.
+            pos = pos.immutable();
+        }
+
+        @Override
+        public Vec3 target() {
+            return new Vec3(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5);
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            return at.distSqr(pos) <= (double) range * range;
+        }
+
+        /** Center heuristic, with arrival decided by the entire radius.
+         * Port of baritone/src/main/java/baritone/api/pathing/goals/GoalNear.java:49-62.
+         * Use Tungsten's existing point costs rather than importing Baritone's engine. */
+        public double remaining(int x, int y, int z) {
+            return kaptainwutax.tungsten.path.fast.FastPlanner.pointEstimate(x, y, z, pos);
+        }
+
+        @Override
+        public String toString() {
+            return "near(" + pos.getX() + "," + pos.getY() + "," + pos.getZ() + " r=" + range + ")";
+        }
+    }
+
+    /**
+     * A block that must be REACHED, not stood in — baritone's {@code GoalGetToBlock}.
+     *
+     * <p>A mining target is solid, so {@link Block}'s "occupy the cell" arrival is unsatisfiable
+     * by construction while the block stands. Measured on the recorded 2026-09-11 playthrough
+     * (docs/BARITONE-GAPS.md G25): the drive snapped such a goal to the SURFACE above the block,
+     * walked there, then asked for a route into the cell it already occupied every tick -- 182
+     * one-cell plans, "Time taken to execute" every 0.6 s, six random-dig shimmies, and the block
+     * blacklisted as unreachable while it sat five blocks under the bot's feet.
+     *
+     * <p>Reached means the FEET cell is next to the block: on top of it, beside it at foot, head
+     * level, or directly under it. Diagonally elevated neighbours are excluded because
+     * their floor can obstruct interaction. These are cells the planner can DIG to: the goal has to be
+     * something a search can complete on a neighbour, or no dig move ever helps. The predicate
+     * itself lives in tungsten ({@code FastPlanner.adjacentToBlock}) so the planner's goal test and
+     * this arrival test cannot drift apart.
+     */
+    record Adjacent(BlockPos pos) implements AltoGoal {
+        @Override
+        public Vec3 target() {
+            return new Vec3(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5);
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            return kaptainwutax.tungsten.path.fast.FastPlanner.adjacentToBlock(at, pos);
+        }
+
+        @Override
+        public String toString() {
+            return "adjacent(" + pos.getX() + "," + pos.getY() + "," + pos.getZ() + ")";
+        }
+    }
+
+    /** A goal on the horizontal plane only — any Y will do. */
+    record Xz(int x, int z) implements AltoGoal {
+        @Override
+        public Vec3 target() {
+            // An XZ goal genuinely has no Y, so it names its own height as NaN and the drive fills
+            // it in from the player: "keep your height, change your ground".
+            return new Vec3(x + 0.5, Double.NaN, z + 0.5);
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            return at.getX() == x && at.getZ() == z;
+        }
+
+        @Override
+        public String toString() {
+            return "xz(" + x + "," + z + ")";
+        }
+    }
+
+    /** A goal that is a height, wherever you happen to stand. */
+    record YLevel(int y) implements AltoGoal {
+        @Override
+        public Vec3 target() {
+            return new Vec3(Double.NaN, y, Double.NaN);
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            return at.getY() == y;
+        }
+
+        @Override
+        public String toString() {
+            return "y(" + y + ")";
+        }
+    }
+
+    /**
+     * A goal that is a whole CHUNK — anywhere inside it will do.
+     *
+     * <p>Ported from {@code adris.altoclef.util.projectiles.GoalChunk}, which implemented baritone's
+     * Goal purely to answer these two questions: head for the middle, and count any column inside
+     * the sixteen-by-sixteen as arrived. Neither needs a pathfinder, so the type does not either.
+     */
+    record Chunk(int startX, int startZ) implements AltoGoal {
+        @Override
+        public Vec3 target() {
+            // The centre of the chunk, and NaN for Y: a chunk goal has no height, exactly as the
+            // XZ goal above has none, and the drive fills it in from the player.
+            return new Vec3(startX + 8.0, Double.NaN, startZ + 8.0);
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            return at.getX() >= startX && at.getX() <= startX + 15
+                    && at.getZ() >= startZ && at.getZ() <= startZ + 15;
+        }
+
+        @Override
+        public String toString() {
+            return "chunk(" + (startX >> 4) + "," + (startZ >> 4) + ")";
+        }
+    }
+
+    /**
+     * A goal that is a DIRECTION rather than a place: keep going that way.
+     *
+     * <p>Ported from {@code util.baritone.GoalDirectionXZ}, whose {@code isInGoal} was literally
+     * {@code return false} — you never arrive, you just keep walking — and whose heuristic rewarded
+     * distance along the line and punished drift off it.
+     *
+     * <p>WHAT IS NOT CARRIED OVER, AND WHY. The side penalty was a RANKING term for baritone's A*,
+     * which chose between candidate nodes. The tungsten drive does not rank; it steers at a point.
+     * So the direction is expressed the way a drive can use it — a target far along the line — and
+     * staying on that line falls out of steering toward it rather than out of a cost. If a future
+     * search wants the penalty back it belongs in that search, not in the goal type.
+     */
+    record Direction(double originX, double originZ, double dirX, double dirZ) implements AltoGoal {
+        /** Far enough that the bot never runs out of line before something else re-targets it. */
+        private static final double PROJECTION = 128.0;
+
+        @Override
+        public Vec3 target() {
+            return new Vec3(originX + dirX * PROJECTION, Double.NaN, originZ + dirZ * PROJECTION);
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            return false;   // a direction is never arrived at, exactly as upstream had it
+        }
+
+        @Override
+        public String toString() {
+            return String.format("dir(%.1f,%.1f -> %.2f,%.2f)", originX, originZ, dirX, dirZ);
+        }
+    }
+
+    /**
+     * The nearest cell that SATISFIES A TEST — the shape every goal left in altoclef actually needs.
+     *
+     * <h2>Why one type rather than four ports</h2>
+     *
+     * Taken one at a time, the goals still holding a baritone type look like separate jobs. They
+     * are not: every one of them is a PREDICATE rather than a place.
+     *
+     * <ul>
+     *   <li>escape water — "not water, and not next to water"</li>
+     *   <li>escape lava — "not lava, and not next to lava"</li>
+     *   <li>flee — "further than N from every threat"</li>
+     *   <li>dodge — "not on the arrow's line"</li>
+     * </ul>
+     *
+     * <p>Baritone could consume those directly because it SEARCHED: a predicate is a perfectly good
+     * goal function for A*, which visits candidate nodes and asks each one. The tungsten drive does
+     * not search — it STEERS AT A POINT. That mismatch is what cost an earlier session 368 of 596
+     * navigation entries and left the bot motionless for over four minutes, and it is why
+     * {@code GoalRunAwayFromEntities} grew a {@code suggestFleePoint} and why {@link Flee} makes
+     * its caller compute the point.
+     *
+     * <p>So the point search belongs in ONE place, done properly once, rather than open-coded per
+     * goal: expansion order, a radius cap, and a cache so a target read every tick does not rescan
+     * the world sixty times a second.
+     *
+     * <h2>Deliberately unused for now</h2>
+     *
+     * Nothing calls this yet. Wiring water, lava, flee and dodge onto it changes BEHAVIOUR on paths
+     * the bot uses to survive, and that wants a pass which can watch nav_water and the mob suite
+     * react. Adding the type alone cannot regress anything — no caller, no effect — and it leaves
+     * the next pass four call sites instead of four designs.
+     */
+    final class NearestSatisfying implements AltoGoal {
+
+        private final java.util.function.Predicate<BlockPos> satisfies;
+        private final BlockPos origin;
+        private final int maxRadius;
+
+        /** Cached answer, and the tick it was computed on — see the note about rescanning. */
+        private Vec3 cached;
+        private long cachedAtTick = Long.MIN_VALUE;
+
+        public NearestSatisfying(java.util.function.Predicate<BlockPos> satisfies, BlockPos origin,
+                                 int maxRadius) {
+            this.satisfies = satisfies;
+            this.origin = origin;
+            this.maxRadius = maxRadius;
+        }
+
+        @Override
+        public Vec3 target() {
+            // ONE SCAN PER TICK AT MOST. target() is read by the drive every tick, and an
+            // unbounded rescan of a radius-N shell sixty times a second is how a goal type turns
+            // into a frame-rate problem.
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+            long tick = mc.level == null ? 0 : mc.level.getGameTime();
+            if (tick == cachedAtTick) {
+                return cached;
+            }
+            cachedAtTick = tick;
+            cached = search();
+            return cached;
+        }
+
+        /**
+         * Expand outward until the test passes.
+         *
+         * <p>Radius-first, so the answer is the NEAREST satisfying cell rather than merely one that
+         * satisfies; within a shell the vertical offsets come last, because walking sideways is
+         * cheaper than climbing and a goal one block up is rarely what "get out of the water" means.
+         */
+        private Vec3 search() {
+            if (satisfies.test(origin)) {
+                return new Vec3(origin.getX() + 0.5, origin.getY(), origin.getZ() + 0.5);
+            }
+            for (int r = 1; r <= maxRadius; r++) {
+                for (int dy = 0; dy <= r; dy++) {
+                    for (int sy : dy == 0 ? new int[]{0} : new int[]{dy, -dy}) {
+                        for (int dx = -r; dx <= r; dx++) {
+                            for (int dz = -r; dz <= r; dz++) {
+                                // Only the SHELL at this radius; the inside was covered already.
+                                if (Math.max(Math.abs(dx), Math.abs(dz)) != r && Math.abs(sy) != r) {
+                                    continue;
+                                }
+                                BlockPos at = origin.offset(dx, sy, dz);
+                                if (satisfies.test(at)) {
+                                    return new Vec3(at.getX() + 0.5, at.getY(), at.getZ() + 0.5);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // NOTHING WITHIN REACH SATISFIES IT. Null is the honest answer, and the drive already
+            // reads a null target as "no route this tick" rather than as an error -- see target().
+            return null;
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            return satisfies.test(at);
+        }
+
+        @Override
+        public String toString() {
+            return "nearest(r<=" + maxRadius + ")";
+        }
+    }
+
+    /**
+     * Get AWAY from some places — the first goal here that names no destination of its own.
+     *
+     * <p>Ported from baritone's {@code GoalRunAway}. Fleeing is a DIRECTION, not a place, which is
+     * exactly the case {@link #target()} documents as legitimately having no point: upstream
+     * expressed it as a heuristic that grew with distance from the danger, and a search could work
+     * with that. A drive cannot — it steers at something.
+     *
+     * <p>So the CALLER computes where "away" is and hands over a finished point, and this stays a
+     * pure record like every other shape here. Dragging the client into the type to read the
+     * player's position would be the easy wrong move: it would make the goal's answer depend on
+     * when you asked it.
+     *
+     * <p>{@code reached} keeps upstream's meaning exactly — clear of EVERY danger position, not
+     * merely the nearest one.
+     */
+    record Flee(Vec3 away, java.util.List<BlockPos> from, double distance) implements AltoGoal {
+        @Override
+        public Vec3 target() {
+            return away;
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            for (BlockPos danger : from) {
+                if (at.distSqr(danger) < distance * distance) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        @Override
+        public String toString() {
+            // PRINT THE INPUTS, NOT THE SHAPE. "flee(1 danger(s), d=3.0)" named the goal and
+            // still could not say why the route climbed to y=10 -- the away point and the danger
+            // it was computed from are the two numbers that decide that, and neither was shown.
+            return "flee(from=" + (from.isEmpty() ? "-" : from.get(0).toShortString())
+                    + " away=" + String.format("%.1f,%.1f,%.1f", away.x, away.y, away.z)
+                    + " n=" + from.size() + " d=" + distance + ")";
+        }
+    }
+
+    /**
+     * Stay outside every live danger's exclusion circle. This is a region, not a point.
+     * A centroid can lie far from the nearby threat and send the body straight toward it.
+     * The drive searches the ordinary move graph for a cell satisfying a stable snapshot;
+     * completion still checks the live positions on the client thread.
+     */
+    final class FleeLive implements AltoGoal {
+        private final java.util.function.Supplier<java.util.List<Vec3>> dangers;
+        private final double distance;
+
+        /** standingAt is retained for constructor compatibility; the planner reads its own start. */
+        public FleeLive(java.util.function.Supplier<java.util.List<Vec3>> dangers,
+                        java.util.function.Supplier<Vec3> standingAt, double distance) {
+            this.dangers = dangers;
+            this.distance = distance;
+        }
+
+        /** No arbitrary point represents this region; the drive uses snapshotSafety instead. */
+        @Override
+        public Vec3 target() { return null; }
+
+        /** Client thread only: copy entity positions before a worker searches the world. */
+        public java.util.function.Predicate<BlockPos> snapshotSafety(double margin) {
+            var live = dangers.get();
+            var snapshot = live == null ? java.util.List.<Vec3>of() : java.util.List.copyOf(live);
+            double separation = distance + margin;
+            // Not under water: full56 fled a creeper into a flooded cave, stayed under and drowned.
+            // A cell whose head space is water is no refuge from anything.
+            var world = adris.altoclef.AltoClef.getInstance() == null ? null
+                    : adris.altoclef.AltoClef.getInstance().getWorld();
+            return at -> (world == null || world.getFluidState(at.above()).isEmpty())
+                    && safeAt(at, snapshot, separation);
+        }
+
+        /**
+         * baritone GoalRunAway's heuristic, shaped for a search that must also STOP: blocks still
+         * missing to the separation from the nearest danger (0 once clear of all of them). A search
+         * guided by it heads away from the threats, and its partial, when the budget runs out,
+         * ends farther from them than it started -- which is the whole point of fleeing.
+         */
+        public kaptainwutax.tungsten.path.fast.FastPlanner.CellHeuristic snapshotRunAway(double margin) {
+            var live = dangers.get();
+            var snapshot = live == null ? java.util.List.<Vec3>of() : java.util.List.copyOf(live);
+            double separation = distance + margin;
+            return (x, y, z) -> {
+                double best = Double.MAX_VALUE;
+                for (Vec3 d : snapshot) {
+                    double dx = x + 0.5 - d.x, dz = z + 0.5 - d.z;
+                    best = Math.min(best, Math.sqrt(dx * dx + dz * dz));
+                }
+                return best == Double.MAX_VALUE ? 0.0 : Math.max(0.0, separation - best);
+            };
+        }
+
+        private static boolean safeAt(BlockPos at, java.util.List<Vec3> from, double separation) {
+            if (from == null) return true;
+            for (Vec3 danger : from) {
+                double dx = at.getX() + 0.5 - danger.x;
+                double dz = at.getZ() + 0.5 - danger.z;
+                if (dx * dx + dz * dz < separation * separation) return false;
+            }
+            return true;
+        }
+
+        @Override
+        public boolean reached(BlockPos at) { return safeAt(at, dangers.get(), distance); }
+
+        @Override
+        public String toString() {
+            var from = dangers.get();
+            return "fleeLive(" + (from == null ? 0 : from.size()) + " danger(s), d=" + distance + ")";
+        }
+    }
+
+    /**
+     * A flee goal aimed away from the danger, as seen from {@code standingAt}.
+     *
+     * @param maintainY hold this height, or null to keep the player's own (NaN, filled by the drive)
+     */
+    /** Times the flee point had to be moved to reach standable ground, and times none was found. */
+    java.util.concurrent.atomic.AtomicInteger FLEE_RELOCATED = new java.util.concurrent.atomic.AtomicInteger();
+    java.util.concurrent.atomic.AtomicInteger FLEE_NO_SPOT = new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * Walk outward along the away heading and return the first cell the bot could actually STAND in.
+     *
+     * <h2>What this restores</h2>
+     *
+     * Upstream's {@code GoalRunAway} is a HEURISTIC over the whole search space -- every cell far
+     * enough from the danger satisfies it -- so the search picks a reachable one by itself. Porting
+     * it to "the caller computes a finished point" collapsed that to a single projected coordinate,
+     * and the note on {@link Flee} says as much: fleeing is a direction, but a drive steers at
+     * something. What it did not say is what happens when the something is inside a wall.
+     *
+     * <p>Which is the ordinary case for the caller that matters. {@code DestroyBlockTask} flees the
+     * block it has just mined and passes that block's Y as maintainY, so a bot at the bottom of a
+     * pit is sent "three blocks that way, at the depth I am digging" -- a point inside solid stone,
+     * with the void underneath it. The search cannot reach it, burns its budget, restarts, and from
+     * a 1x1 shaft the only direction a best-effort route can expand is UP. Measured over 35 runs of
+     * mine_stone: 13 of 19 failures end with the bot on a cobblestone tower scoring exactly zero.
+     *
+     * <p>Vertical spread before horizontal: climbing out of the hole you are fleeing is usually one
+     * step, and it is what a person would do. Beyond that it keeps walking outward, which is the
+     * heuristic's own preference -- further away is better.
+     */
+    private static Vec3 firstStandableAlong(double cx, double cz, double ux, double uz,
+                                             double reach, double baseY) {
+        try {
+            for (int r = (int) Math.ceil(reach); r <= reach + 12; r++) {
+                for (int dy : new int[]{0, 1, -1, 2, -2, 3, 4}) {
+                    int x = (int) Math.floor(cx + ux * r);
+                    int y = (int) baseY + dy;
+                    int z = (int) Math.floor(cz + uz * r);
+                    BlockPos feet = new BlockPos(x, y, z);
+                    if (adris.altoclef.util.helpers.WorldHelper.isSolidBlock(feet.below())
+                            && !adris.altoclef.util.helpers.WorldHelper.isSolidBlock(feet)
+                            && !adris.altoclef.util.helpers.WorldHelper.isSolidBlock(feet.above())) {
+                        return new Vec3(x + 0.5, y, z + 0.5);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // a goal must never be the thing that throws; the projected point is still returned
+        }
+        return null;
+    }
+
+    static AltoGoal flee(Vec3 standingAt, java.util.List<BlockPos> from, double distance,
+                         Integer maintainY) {
+        double cx = 0, cz = 0;
+        for (BlockPos p : from) {
+            cx += p.getX() + 0.5;
+            cz += p.getZ() + 0.5;
+        }
+        cx /= from.size();
+        cz /= from.size();
+        double dx = standingAt.x - cx, dz = standingAt.z - cz;
+        double len = Math.sqrt(dx * dx + dz * dz);
+        if (len < 1.0E-4) {
+            // Standing exactly on the danger: any direction is equally away, so pick one rather
+            // than dividing by zero and steering the bot at NaN.
+            dx = 1;
+            dz = 0;
+            len = 1;
+        }
+        // Aim past the ring, so arriving at the point means the reached() test is satisfied.
+        double reach = distance + 2;
+        // NaN here is the file's CONVENTION, not a bug -- Xz, YLevel, Chunk and Direction all name
+        // an absent axis that way and the drive fills it in from the player. It is left exactly as
+        // it was. The scan below still needs a concrete height to start from, so it takes the
+        // player's own when the caller named none.
+        double baseY = maintainY != null ? maintainY : Math.floor(standingAt.y);
+        Vec3 away = new Vec3(cx + dx / len * reach,
+                maintainY != null ? maintainY : Double.NaN,
+                cz + dz / len * reach);
+        if (kaptainwutax.tungsten.TungstenConfig.get().fleePicksStandableSpot) {
+            Vec3 standable = firstStandableAlong(cx, cz, dx / len, dz / len, reach, baseY);
+            if (standable != null) {
+                // Compare in XZ and on the scan base, never against away.y -- that is NaN by
+                // convention when the caller named no height, and every comparison through NaN
+                // is false, which would silently stop this counter ever incrementing.
+                double dxr = standable.x - (cx + dx / len * reach);
+                double dzr = standable.z - (cz + dz / len * reach);
+                if (dxr * dxr + dzr * dzr > 0.5 || Math.abs(standable.y - baseY) > 0.5) {
+                    FLEE_RELOCATED.incrementAndGet();
+                }
+                away = standable;
+            } else {
+                FLEE_NO_SPOT.incrementAndGet();
+            }
+        }
+        return new Flee(away, java.util.List.copyOf(from), distance);
+    }
+
+    /** {@code offset} need not be normalised; it is flattened to XZ and normalised here. */
+    static AltoGoal direction(Vec3 origin, Vec3 offset) {
+        Vec3 flat = offset.multiply(1, 0, 1).normalize();
+        return new Direction(origin.x(), origin.z(), flat.x, flat.z);
+    }
+
+    static AltoGoal chunk(int startX, int startZ) {
+        return new Chunk(startX, startZ);
+    }
+
+    static AltoGoal block(BlockPos pos) {
+        return new Block(pos);
+    }
+
+    static AltoGoal near(BlockPos pos, int range) {
+        return new Near(pos, range);
+    }
+
+    /**
+     * A goal that is a MOVING cell, satisfied from anywhere within {@code range} of wherever it is
+     * right now (G48, 2026-09-11). The drive reads target() every tick, so a supplier is enough to
+     * follow an entity; baritone's GoalFollowEntity is the same idea. A null from the supplier
+     * (the entity is gone) reads as "no route this tick", exactly like the nearest-cell search.
+     */
+    record NearLive(java.util.function.Supplier<BlockPos> pos, int range) implements AltoGoal {
+        @Override
+        public Vec3 target() {
+            BlockPos p = pos.get();
+            return p == null ? null : new Vec3(p.getX() + 0.5, p.getY(), p.getZ() + 0.5);
+        }
+
+        @Override
+        public boolean reached(BlockPos at) {
+            BlockPos p = pos.get();
+            return p != null && at.distSqr(p) <= (double) range * range;
+        }
+
+        @Override
+        public String toString() {
+            BlockPos p = pos.get();
+            return "nearLive(" + (p == null ? "gone" : p.toShortString()) + ", r=" + range + ")";
+        }
+    }
+
+    static AltoGoal nearLive(java.util.function.Supplier<BlockPos> pos, int range) {
+        return new NearLive(pos, range);
+    }
+
+    /** Reach a block from a neighbouring cell (GoalGetToBlock); the miner's approach. */
+    static AltoGoal adjacent(BlockPos pos) {
+        return new Adjacent(pos);
+    }
+
+    static AltoGoal xz(int x, int z) {
+        return new Xz(x, z);
+    }
+
+    static AltoGoal yLevel(int y) {
+        return new YLevel(y);
+    }
+}

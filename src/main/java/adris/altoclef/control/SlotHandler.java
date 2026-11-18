@@ -1,0 +1,602 @@
+package adris.altoclef.control;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.util.ItemTarget;
+import adris.altoclef.util.helpers.ItemHelper;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.slots.CursorSlot;
+import adris.altoclef.util.slots.PlayerSlot;
+import adris.altoclef.util.slots.Slot;
+import adris.altoclef.multiversion.entity.PlayerVer;
+import adris.altoclef.util.time.TimerGame;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.world.item.*;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.inventory.InventoryMenu;
+import net.minecraft.world.item.BucketItem;
+import net.minecraft.world.item.EmptyMapItem;
+import net.minecraft.world.item.EnderEyeItem;
+import net.minecraft.world.item.FireworkRocketItem;
+import net.minecraft.world.item.FishingRodItem;
+import net.minecraft.world.item.FoodOnAStickItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.PotionItem;
+import net.minecraft.world.item.SpawnEggItem;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Predicate;
+
+
+public class SlotHandler {
+
+    /** Slot clicks that went through, and those the rate gate swallowed; read over py4j. */
+    public static volatile int shIssued, shDropped, shBlacklisted, shThrown;
+
+    /** Unresolvable slots that kept the item in the cursor instead of dropping it on the floor. */
+    public static volatile int shUnresolvedKept;
+
+    /** Who clicked outside the window, i.e. dropped a stack on the floor. Read as throwers(). */
+    public static final java.util.Map<String, Integer> throwers =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
+
+    /** Commonest thrower first, so one run says which caller is losing the bot its tools. */
+    public static String throwers() {
+        synchronized (throwers) {
+            return throwers.entrySet().stream()
+                    .sorted((a, b) -> b.getValue() - a.getValue())
+                    .limit(5)
+                    .map(e -> e.getKey() + "x" + e.getValue())
+                    .reduce((a, b) -> a + " " + b).orElse("(none)");
+        }
+    }
+    /** Window slot most recently blacklisted as "server cancelled"; read over py4j. */
+    public static volatile int shLastBlacklistedSlot = -1;
+
+    /** Sampled attribution of slot clicks: who calls, and how often (1 in 1024). */
+    /** Full-inventory sweeps, and those begun while something was HOLDING an item. */
+    public static volatile int shRefreshes, shRefreshWithCursor;
+    public static volatile String shTopCaller = "-";
+    public static final java.util.Map<String, Integer> shCallers =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
+    public static String shCallersDump() {
+        synchronized (shCallers) {
+            if (shCallers.isEmpty()) return "none";
+            return shCallers.entrySet().stream()
+                    .sorted((x, y) -> y.getValue() - x.getValue())
+                    .limit(4)
+                    .map(e -> e.getKey() + "x" + e.getValue())
+                    .reduce((x, y) -> x + " " + y).orElse("none");
+        }
+    }
+
+    private final AltoClef mod;
+
+    private final TimerGame slotActionTimer = new TimerGame(0);
+    private boolean overrideTimerOnce = false;
+
+    /** {@code alone}: no other click was in flight when this one went out (G83b). */
+    private record PendingSlotAction(long timeMs, int syncId, int windowSlot, ItemStack before, boolean alone) {}
+    private final Deque<PendingSlotAction> _pendingSlotActions = new ArrayDeque<>();
+
+    private record BlacklistKey(int syncId, int windowSlot) {}
+    private final Map<BlacklistKey, Long> _slotBlacklist = new HashMap<>();
+    private final Map<BlacklistKey, Integer> _slotCancelCount = new HashMap<>();
+    private static final long SLOT_BLACKLIST_MS = 4000;
+
+    // ── G83 (2026-09-13): a muzzle is earned one click at a time, and dies with its cause ──
+    //
+    // ⛔ ONE CLICK CLIMBED THE WHOLE LADDER. Round 42, 22:47:19: "Server cancelled slot action:
+    // window slot 38 (flint x1) — blacklisting for 4s (cancel #1)" -- and nothing more in the
+    // log, yet the bot stood from 22:48 to 22:57 with a log in that slot and the plank craft
+    // asking for it (mv=4706/3754/952/0/0: 952 pick-ups asked, none delivered), and walked
+    // again at 22:57:23, six hundred seconds after the muzzle. The pending action was never
+    // consumed by its verdict: every further server packet for that slot inside 600 ms -- a
+    // full inventory sync carries every slot -- matched the SAME click again, "cancel #2",
+    // "cancel #3", 4 s -> 30 s -> 600 s in one burst, printed once because the slot was
+    // "already blocked". Then a death, a new body, a log in the muzzled slot, ten minutes of
+    // silence. Three rules now: a click gets ONE verdict (the pending action is removed when
+    // it is judged); the ladder only climbs on cancels within a minute of each other (a slot
+    // the server truly refuses still reaches the ten-minute muzzle in half a minute, a
+    // one-off revert decays); and the muzzles belong to the body that earned them -- a new
+    // ClientPlayerEntity (respawn, dimension change) starts with none. And a dropped click is
+    // COUNTED and SAID, once every five seconds, so the next silent stand names its slot.
+    /** Clicks dropped by a muzzle; ladders restarted because the last cancel was over a
+     *  minute old; muzzle sets cleared with a new body; the slot a click was last dropped on. */
+    public static volatile int shBanDropped, shBanDecayed, shBanClearedOnRespawn;
+    /** G83b: "reverts" not judged because other clicks were in flight when the packet came. */
+    public static volatile int shBanUnattributed;
+    public static volatile int shBanDropSlot = -1;
+    private final Map<BlacklistKey, Long> _slotCancelAt = new HashMap<>();
+    private static final long CANCEL_LADDER_MS = 60_000L;
+    private long banDropLogMs;
+    private LocalPlayer bansOwner;
+
+    /** The muzzles belong to one body; a new one (respawn) starts clean. */
+    private void adoptBody(LocalPlayer player) {
+        if (bansOwner == player) return;
+        if (!_slotBlacklist.isEmpty() || !_slotCancelCount.isEmpty()) shBanClearedOnRespawn++;
+        _slotBlacklist.clear();
+        _slotCancelCount.clear();
+        _slotCancelAt.clear();
+        _pendingSlotActions.clear();
+        bansOwner = player;
+    }
+
+    /**
+     * G83 bench hook: one click on {@code windowSlot} followed by {@code packets} server updates
+     * that all carry the pre-click stack -- the burst a full inventory sync produces. Returns
+     * the muzzle this left on the slot, in ms (0 = none; negative = no body / no such slot).
+     * Client thread only.
+     */
+    public long debugRevertBurst(int windowSlot, int packets) {
+        LocalPlayer player = Minecraft.getInstance().player;
+        if (player == null) return -1;
+        if (windowSlot < 0 || windowSlot >= player.containerMenu.slots.size()) return -2;
+        adoptBody(player);
+        int syncId = player.containerMenu.containerId;
+        ItemStack before = player.containerMenu.getSlot(windowSlot).getItem().copy();
+        long now = System.currentTimeMillis();
+        _pendingSlotActions.removeIf(a -> now - a.timeMs() > 600);
+        _pendingSlotActions.add(new PendingSlotAction(now, syncId, windowSlot, before, _pendingSlotActions.isEmpty()));
+        for (int i = 0; i < packets; i++) onServerSlotUpdate(syncId, windowSlot, before.copy());
+        return banRemainingMs(windowSlot);
+    }
+
+    /** How much longer clicks on {@code windowSlot} of the current screen are dropped (ms). */
+    public long banRemainingMs(int windowSlot) {
+        LocalPlayer player = Minecraft.getInstance().player;
+        if (player == null) return -1;
+        Long exp = _slotBlacklist.get(new BlacklistKey(player.containerMenu.containerId, windowSlot));
+        return exp == null ? 0 : Math.max(0, exp - System.currentTimeMillis());
+    }
+
+    public SlotHandler(AltoClef mod) {
+        this.mod = mod;
+    }
+
+    public void forceAllowNextSlotAction() {
+        overrideTimerOnce = true;
+    }
+
+    public boolean canDoSlotAction() {
+        if (overrideTimerOnce) {
+            overrideTimerOnce = false;
+            return true;
+        }
+        slotActionTimer.setInterval(mod.getModSettings().getContainerItemMoveDelay());
+        return slotActionTimer.elapsed();
+    }
+
+    public void registerSlotAction() {
+        mod.getItemStorage().registerSlotAction();
+        slotActionTimer.reset();
+    }
+
+
+    /** How many clicks have been traced; see the note at the trace site. Reset by resetRunCounters. */
+    public static volatile int clickTrace;
+
+    public void clickSlot(Slot slot, int mouseButton, ContainerInput type) {
+        // A CLICK THAT SILENTLY DOES NOT HAPPEN LOOKS EXACTLY LIKE A CLICK THAT DID NOTHING.
+        // The output-collection task clicks the crafting result 8996 times a run and the item
+        // never leaves the slot; this gate returning early is one of the two ways that happens,
+        // and until now nothing told them apart.
+        if (!canDoSlotAction()) { shDropped++; return; }
+        shIssued++;
+        // WHO IS CLICKING SIX HUNDRED THOUSAND TIMES? shIssued=603671 in one ten-minute run
+        // while the item mover accounted for about 2255 of them. A second actor hammering the
+        // cursor would explain the mover's 2255 pickups against 3 places -- it picks an item
+        // up and something else empties the cursor before it can put it down. Sample the
+        // caller rather than nominate one; the same trick named the search-killer earlier.
+        // Sampled, not every call: a stack trace at this rate would itself distort the run.
+        // 1 in 64 rather than 1 in 1024 -- at 1/1024 a HEALTHY run yielded three samples, too
+        // few to rank anything, so attribution only worked on a stall that would not recur.
+        // At 1/64 a normal run gives about fifty and the distribution is readable every time.
+        if ((shIssued & 0x3F) == 0) {
+            StackTraceElement[] st = Thread.currentThread().getStackTrace();
+            for (StackTraceElement e : st) {
+                String c = e.getClassName();
+                if (c.contains("SlotHandler") || c.contains("java.lang.Thread")) continue;
+                shTopCaller = c.substring(c.lastIndexOf('.') + 1) + ":" + e.getLineNumber();
+                synchronized (shCallers) { shCallers.merge(shTopCaller, 1, Integer::sum); }
+                break;
+            }
+        }
+
+        if (slot.getWindowSlot() == -1) {
+            // ⛔ "I CANNOT FIND THE SLOT" MUST NOT MEAN "THROW IT ON THE FLOOR".
+            //
+            // PlayerSlot.UNDEFINED clicks OUTSIDE the window, and outside the window is vanilla's
+            // drop action -- so an unresolvable slot ends with whatever is in the cursor lying on
+            // the ground. The counter fifteen lines down was added to watch for exactly this and
+            // it is not zero: shThrown=7 on a twenty-minute playthrough.
+            //
+            // What that costs, from the same run: the bot dropped its WOODEN PICKAXE and then
+            // spent the rest of the run chasing it into a cave --
+            //     lock=wooden_pickaxe:41.6>41.6, m0.0, h34.0, dy-24.0 @bot[605.61,106.00,-245.35]
+            //     end inv: dirt, brown_mushroom
+            // -- 41 blocks out, 24 down, no wood gathered at all, ladder zero.
+            //
+            // Doing nothing is strictly better: the cursor keeps the item and the caller asks
+            // again next tick. A slot that cannot be resolved this tick usually can the next one,
+            // and an item on the floor of a cave usually cannot be recovered at all.
+            if (kaptainwutax.tungsten.TungstenConfig.get().unresolvedSlotKeepsItem) {
+                shUnresolvedKept++;
+                return;
+            }
+            clickSlot(PlayerSlot.UNDEFINED, 0, ContainerInput.PICKUP);
+            return;
+        }
+        // NOT THE CASE! We may have something in the cursor slot to place.
+        //if (getItemStackInSlot(slot).isEmpty()) return getItemStackInSlot(slot);
+
+        clickWindowSlot(slot.getWindowSlot(), mouseButton, type);
+    }
+
+    private void clickSlotForce(Slot slot, int mouseButton, ContainerInput type) {
+        forceAllowNextSlotAction();
+        clickSlot(slot, mouseButton, type);
+    }
+
+    private void clickWindowSlot(int windowSlot, int mouseButton, ContainerInput type) {
+        LocalPlayer player = Minecraft.getInstance().player;
+        if (player == null) {
+            return;
+        }
+        // A CLICK OUTSIDE THE WINDOW IS A THROW ONTO THE GROUND, and the crafting code does it in
+        // several places. Measured: the bot crafts planks and sticks, does NOT die (zero deaths a
+        // run), and still ends with an empty pack while its craft task spends 95% of its time
+        // "collecting materials". If this counter runs into the hundreds, it is throwing away what
+        // it just made.
+        if (windowSlot < 0) {
+            shThrown++;
+            // ⛔ NAME THE THROWER. Two fixes have now been aimed at this by reading the code and
+            // both missed: the getWindowSlot()==-1 path (shKept=0 while shThrown=70) and the fix
+            // chain's last-resort line (fixKept=0). Slot.UNDEFINED is -999, so several callers
+            // reach here and only one of them matters.
+            // The key-thief instrument settled the same kind of question in one run today by
+            // recording the stack frame instead of arguing about it. Same thing here.
+            try {
+                for (StackTraceElement el : new Throwable().getStackTrace()) {
+                    String cn = el.getClassName();
+                    if (cn.endsWith("SlotHandler")) continue;
+                    String key = cn.substring(cn.lastIndexOf('.') + 1) + ":" + el.getLineNumber();
+                    synchronized (throwers) {
+                        throwers.merge(key, 1, Integer::sum);
+                    }
+                    break;
+                }
+            } catch (Exception ignored) {
+                // an instrument must never be the thing that breaks a run
+            }
+        }
+        // Bounds check — prevent CrashException from ScreenHandler.onSlotClick
+        if (windowSlot >= 0 && windowSlot >= player.containerMenu.slots.size()) {
+            return;
+        }
+        // WATCH ONE CLICK, PROPERLY. The craft loop asks for a move 1854 times, 658 clicks go out,
+        // and the grid stays empty -- and no counter can say whether the click lands on the wrong
+        // slot, or the right slot with nothing in hand, or the right slot and the server undoes it.
+        // Slot, button, what is in the cursor and what is in the target, before the click. The
+        // first twenty are enough to see one whole pick-up-and-place cycle; after that it is noise.
+        if (clickTrace < 20) {
+            clickTrace++;
+            net.minecraft.world.item.ItemStack cur = StorageHelper.getItemStackInCursorSlot();
+            String tgt = "?";
+            try {
+                if (windowSlot >= 0 && windowSlot < player.containerMenu.slots.size()) {
+                    net.minecraft.world.item.ItemStack st = player.containerMenu.getSlot(windowSlot).getItem();
+                    tgt = st.isEmpty() ? "empty" : (st.getItem() + "x" + st.getCount());
+                }
+            } catch (RuntimeException ignored) { }
+            Debug.logMessage("CLICK win=" + windowSlot + " btn=" + mouseButton + " type=" + type
+                    + " cursor=" + (cur.isEmpty() ? "empty" : (cur.getItem() + "x" + cur.getCount()))
+                    + " target=" + tgt
+                    + " screen=" + player.containerMenu.getClass().getSimpleName());
+        }
+        registerSlotAction();
+        int syncId = player.containerMenu.containerId;
+        adoptBody(player);
+
+        // Check blacklist before clicking -- and say so (G83): a click that vanishes here looks
+        // exactly like a click that landed and did nothing, and round 42 stood eight minutes on it.
+        BlacklistKey blKey = new BlacklistKey(syncId, windowSlot);
+        Long blExpiry = _slotBlacklist.get(blKey);
+        if (blExpiry != null && System.currentTimeMillis() < blExpiry) {
+            shBanDropped++;
+            shBanDropSlot = windowSlot;
+            long now = System.currentTimeMillis();
+            if (now - banDropLogMs > 5000) {
+                banDropLogMs = now;
+                Debug.logMessage(String.format(
+                        "SlotHandler: window slot %d is muzzled for %.0fs more (cancel #%d) — dropping clicks on it",
+                        windowSlot, (blExpiry - now) / 1000.0, _slotCancelCount.getOrDefault(blKey, 0)));
+            }
+            return;
+        }
+
+        // Snapshot slot state before click for server-cancellation detection
+        // Skip tracking in chest/GUI screens — server cancels are expected there (shop menus etc.)
+        boolean isPlayerInventory = player.containerMenu instanceof InventoryMenu;
+        try {
+            if (isPlayerInventory && windowSlot >= 0 && windowSlot < player.containerMenu.slots.size()) {
+                ItemStack before = player.containerMenu.getSlot(windowSlot).getItem().copy();
+                long now = System.currentTimeMillis();
+                _pendingSlotActions.removeIf(a -> now - a.timeMs() > 600);
+                boolean alone = _pendingSlotActions.isEmpty();
+                _pendingSlotActions.add(new PendingSlotAction(now, syncId, windowSlot, before, alone));
+            }
+        } catch (Exception ignored) {}
+
+        try {
+            mod.getController().handleContainerInput(syncId, windowSlot, mouseButton, type, player);
+        } catch (Exception e) {
+            Debug.logWarning("Slot Click Error (ignored)");
+            e.printStackTrace();
+        }
+    }
+
+    public void onServerSlotUpdate(int syncId, int slot, ItemStack serverStack) {
+        long now = System.currentTimeMillis();
+        // A CRAFTING RESULT THAT REFILLS IS NOT A CANCELLATION.
+        // The test below blacklists a slot whose server state equals the state from before the
+        // click, which is right for an ordinary slot. A crafting output is the exception: take
+        // four planks, the grid still holds a log, the slot refills with four planks, and the two
+        // stacks match to the byte. Measured: slot 0 -- the 2x2 result -- was blacklisted three
+        // times in one run, and three cancels escalate to a TEN MINUTE muzzle, after which every
+        // click on it is dropped in silence. That is the whole of "the item is in the slot
+        // (ciReceive 98%), the task clicks thousands of times, nothing ever leaves".
+        try {
+            LocalPlayer p = Minecraft.getInstance().player;
+            if (p != null && slot >= 0 && slot < p.containerMenu.slots.size()
+                    && p.containerMenu.getSlot(slot)
+                            instanceof net.minecraft.world.inventory.ResultSlot) {
+                return;
+            }
+        } catch (Exception ignored) {}
+        java.util.Iterator<PendingSlotAction> it = _pendingSlotActions.iterator();
+        while (it.hasNext()) {
+            PendingSlotAction action = it.next();
+            if (now - action.timeMs() > 600) { it.remove(); continue; }
+            if (action.syncId() != syncId || action.windowSlot() != slot) continue;
+            // ONE CLICK, ONE VERDICT (G83): whatever this packet says about the click, the click
+            // has been judged. Left in the deque, the same click was re-judged by every packet
+            // for its slot inside 600 ms -- a full inventory sync is one packet per slot -- and
+            // climbed the ladder below to ten minutes in a single burst.
+            it.remove();
+            if (action.before().isEmpty() || !ItemStack.matches(serverStack, action.before())) {
+                continue;   // the click landed (the slot changed): not a cancellation
+            }
+            // ⛔ A VERDICT NEEDS THE CLICK TO HAVE BEEN ALONE IN FLIGHT (G83b, round 43). "window
+            // slot 37 is muzzled for 569s more (cancel #6)" -- the stone pickaxe's slot, six
+            // "cancels" inside a minute, each one the tool-swap's three clicks in one tick, and
+            // three slots "cancelled" in the same second twice during a craft. The server answers
+            // a click whose revision does not match with a FULL sync of the state after THAT click
+            // -- in which the slots of the clicks still queued behind it are, correctly, untouched,
+            // and equal to their "before". Read as a revert, that is a lie: the server had not seen
+            // those clicks yet. A packet can only judge a click that had no company: the hub-menu
+            // slot the ladder was built for is clicked once and reverted once, and still counts.
+            int others = 0;
+            for (PendingSlotAction o : _pendingSlotActions) if (now - o.timeMs() <= 600) others++;
+            if (!action.alone() || others > 0) {
+                shBanUnattributed++;
+                continue;
+            }
+            BlacklistKey key = new BlacklistKey(syncId, slot);
+            boolean alreadyBlocked = _slotBlacklist.containsKey(key)
+                    && now < _slotBlacklist.get(key);
+            // ESCALATING blacklist (operator/dev 2026-06-21, fdmc.pw anti-cheat): a slot the server
+            // keeps REVERTING is protected/locked (e.g. hub "menu" hotbar items: compass/feather/dye
+            // on anti-cheat servers). Re-clicking it every 4s forever spams "Server cancelled slot
+            // action" and gets the bot anti-cheat-KICKED. So the more times it's cancelled, the LONGER
+            // we give up on it: 4s -> 30s -> 10min. Normal inventory slots are ~never cancelled, so
+            // they never escalate; this only muzzles slots the server actively refuses.
+            // WHICH SLOTS GET MUZZLED? Reading says a crafting OUTPUT looks identical to a
+            // cancellation when it refills with the same stack, and the escalation would then
+            // silence it for ten minutes. Record the slot so that stops being a reading.
+            // THE LADDER DECAYS (G83): a cancel more than a minute after the previous one starts
+            // the count over. The hub-menu slot the ladder was built for is refused on every
+            // click and still reaches ten minutes in thirty-four seconds; a slot reverted once
+            // in a run no longer carries that first step for the rest of the session.
+            shBlacklisted++;
+            shLastBlacklistedSlot = slot;
+            Long lastCancel = _slotCancelAt.get(key);
+            int cancels;
+            if (lastCancel != null && now - lastCancel > CANCEL_LADDER_MS) {
+                shBanDecayed++;
+                cancels = 1;
+            } else {
+                cancels = _slotCancelCount.getOrDefault(key, 0) + 1;
+            }
+            _slotCancelCount.put(key, cancels);
+            _slotCancelAt.put(key, now);
+            long blacklistMs = cancels >= 3 ? 600_000L : (cancels == 2 ? 30_000L : SLOT_BLACKLIST_MS);
+            _slotBlacklist.put(key, now + blacklistMs);
+            if (!alreadyBlocked) {
+                Debug.logMessage("[WARN] Server cancelled slot action: window slot " + slot
+                        + " (" + serverStack.getItem().getDescriptionId()
+                        + " x" + serverStack.getCount()
+                        + ") — blacklisting for " + (blacklistMs / 1000) + "s (cancel #" + cancels + ")");
+            }
+        }
+    }
+
+    public void forceEquipItemToOffhand(Item toEquip) {
+        if (StorageHelper.getItemStackInSlot(PlayerSlot.OFFHAND_SLOT).getItem() == toEquip) {
+            return;
+        }
+        List<Slot> currentItemSlot = mod.getItemStorage().getSlotsWithItemPlayerInventory(false,
+                toEquip);
+        for (Slot CurrentItemSlot : currentItemSlot) {
+            if (!Slot.isCursor(CurrentItemSlot)) {
+                mod.getSlotHandler().clickSlot(CurrentItemSlot, 0, ContainerInput.PICKUP);
+            } else {
+                mod.getSlotHandler().clickSlot(PlayerSlot.OFFHAND_SLOT, 0, ContainerInput.PICKUP);
+            }
+        }
+    }
+
+    public boolean forceEquipItem(Item toEquip) {
+
+        // Already equipped
+        if (StorageHelper.getItemStackInSlot(PlayerSlot.getEquipSlot()).getItem() == toEquip) return true;
+
+        // Always equip to the second slot. First + last is occupied by baritone.
+        PlayerVer.setSelectedSlot(mod.getPlayer().getInventory(), 1);
+
+        // If our item is in our cursor, simply move it to the hotbar.
+        boolean inCursor = StorageHelper.getItemStackInSlot(CursorSlot.SLOT).getItem() == toEquip;
+
+        List<Slot> itemSlots = mod.getItemStorage().getSlotsWithItemScreen(toEquip);
+        if (!itemSlots.isEmpty()) {
+            for (Slot ItemSlots : itemSlots) {
+                int hotbar = 1;
+                //_mod.getPlayer().getInventory().swapSlotWithHotbar();
+                clickSlotForce(Objects.requireNonNull(ItemSlots), inCursor ? 0 : hotbar, inCursor ? ContainerInput.PICKUP : ContainerInput.SWAP);
+                //registerSlotAction();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /** Put away whatever we are hitting with. The 1.21.11 stub was {@code stack -> false}, which
+     *  matches nothing, so on the live version this never put anything away. */
+    public boolean forceDeequipHitTool() {
+        return forceDeequip(stack -> adris.altoclef.util.helpers.ItemHelper.isTool(stack.getItem()));
+    }
+
+    public void forceDeequipRightClickableItem() {
+        forceDeequip(stack -> {
+                    Item item = stack.getItem();
+                    return item instanceof BucketItem // water,lava,milk,fishes
+                            || item instanceof EnderEyeItem
+                            || item == Items.BOW
+                            || item == Items.CROSSBOW
+                            || item == Items.FLINT_AND_STEEL || item == Items.FIRE_CHARGE
+                            || item == Items.ENDER_PEARL
+                            || item instanceof FireworkRocketItem
+                            || item instanceof SpawnEggItem
+                            || item == Items.END_CRYSTAL
+                            || item == Items.EXPERIENCE_BOTTLE
+                            || item instanceof PotionItem // also includes splash/lingering
+                            || item == Items.TRIDENT
+                            || item == Items.WRITABLE_BOOK
+                            || item == Items.WRITTEN_BOOK
+                            || item instanceof FishingRodItem
+                            || item instanceof FoodOnAStickItem
+                            || item == Items.COMPASS
+                            || item instanceof EmptyMapItem
+                            || item == Items.LEAD
+                            || item == Items.SHIELD;
+                }
+        );
+    }
+
+    /**
+     * Tries to de-equip any item that we don't want equipped.
+     *
+     * @param isBad: Whether an item is bad/shouldn't be equipped
+     * @return Whether we successfully de-equipped, or if we didn't have the item equipped at all.
+     */
+    public boolean forceDeequip(Predicate<ItemStack> isBad) {
+        ItemStack equip = StorageHelper.getItemStackInSlot(PlayerSlot.getEquipSlot());
+        ItemStack cursor = StorageHelper.getItemStackInSlot(CursorSlot.SLOT);
+        if (isBad.test(cursor)) {
+            // Throw away cursor slot OR move
+            Optional<Slot> fittableSlots = mod.getItemStorage().getSlotThatCanFitInPlayerInventory(equip, false);
+            if (fittableSlots.isEmpty()) {
+                // Try to swap items with the first non-bad slot.
+                for (Slot slot : Slot.getCurrentScreenSlots()) {
+                    if (!isBad.test(StorageHelper.getItemStackInSlot(slot))) {
+                        clickSlotForce(slot, 0, ContainerInput.PICKUP);
+                        return false;
+                    }
+                }
+                if (ItemHelper.canThrowAwayStack(mod, cursor)) {
+                    clickSlotForce(PlayerSlot.UNDEFINED, 0, ContainerInput.PICKUP);
+                    return true;
+                }
+                // Can't throw :(
+                return false;
+            } else {
+                // Put in the empty/available slot.
+                clickSlotForce(fittableSlots.get(), 0, ContainerInput.PICKUP);
+                return true;
+            }
+        } else if (isBad.test(equip)) {
+            // Pick up the item
+            clickSlotForce(PlayerSlot.getEquipSlot(), 0, ContainerInput.PICKUP);
+            return false;
+        } else if (equip.isEmpty() && !cursor.isEmpty()) {
+            // cursor is good and equip is empty, so finish filling it in.
+            clickSlotForce(PlayerSlot.getEquipSlot(), 0, ContainerInput.PICKUP);
+            return true;
+        }
+        // We're already de-equipped
+        return true;
+    }
+
+    public void forceEquipSlot(Slot slot) {
+        Slot target = PlayerSlot.getEquipSlot();
+        clickSlotForce(slot, target.getInventorySlot(), ContainerInput.SWAP);
+    }
+
+    public boolean forceEquipItem(Item[] matches, boolean unInterruptable) {
+        return forceEquipItem(new ItemTarget(matches, 1), unInterruptable);
+    }
+
+    public boolean forceEquipItem(ItemTarget toEquip, boolean unInterruptable) {
+        if (toEquip == null) return false;
+
+        //If the bot try to eat
+        if (mod.getFoodChain().needsToEat() && !unInterruptable) { //unless we really need to force equip the item
+            return false; //don't equip the item for now
+        }
+
+        Slot target = PlayerSlot.getEquipSlot();
+        // Already equipped
+        if (toEquip.matches(StorageHelper.getItemStackInSlot(target).getItem())) return true;
+
+        for (Item item : toEquip.getMatches()) {
+            if (mod.getItemStorage().hasItem(item)) {
+                if (forceEquipItem(item)) return true;
+            }
+        }
+        return false;
+    }
+
+    // By default, don't force equip if the bot is eating.
+    public boolean forceEquipItem(Item... toEquip) {
+        return forceEquipItem(toEquip, false);
+    }
+
+    public void refreshInventory() {
+        // COUNT THE SWEEP ITSELF. Each refresh is 36 slots x 2 clicks = 72, issued through
+        // clickSlotForce, which BYPASSES the rate limiter. At one sweep per 30 s that is about
+        // 1440 clicks in ten minutes and matches a healthy run (shIssued=1545). It does NOT
+        // explain the stalled run's 603671, which would need fourteen sweeps a second -- so
+        // either the timer is being reset or something else calls this. Count before guarding.
+        shRefreshes++;
+        if (!StorageHelper.getItemStackInCursorSlot().isEmpty()) shRefreshWithCursor++;
+        LocalPlayer player = Minecraft.getInstance().player;
+        if (player == null) return;
+        // Only refresh when player inventory is active — clicking slots in
+        // other screen handlers (chests, crafting tables, etc.) crashes.
+        if (!(player.containerMenu instanceof InventoryMenu)) return;
+        for (int i = 0; i < 36; ++i) {
+            Slot slot = Slot.getFromCurrentScreenInventory(i);
+            clickSlotForce(slot, 0, ContainerInput.PICKUP);
+            clickSlotForce(slot, 0, ContainerInput.PICKUP);
+        }
+    }
+}

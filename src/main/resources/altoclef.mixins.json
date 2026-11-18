@@ -1,0 +1,50 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "adris.altoclef.mixins",
+  "compatibilityLevel": "JAVA_8",
+  "mixins": [
+    "AbstractFurnaceScreenHandlerAccessor",
+    "BlockModifiedByPlayerMixin",
+    "ClientBlockBreakAccessor",
+    "ClientConnectionAccessor",
+    "ClientInteractWithBlockMixin",
+    "ClientPlayerInteractionAccessor",
+    "ClientUIMixin",
+    "DeathScreenAccessor",
+    "EntityAccessor",
+    "EntityMixin",
+    "GameOverlayMixin",
+    "LivingEntityMixin",
+    "MapRendererInvoker",
+    "MinecraftClientSessionMixin",
+    "MiningToolItemAccessor",
+    "PersistentProjectileEntityAccessor",
+    "PortalManagerAccessor",
+    "ScreenshotRecorderInvoker",
+    "ServerPlayerEntityMixin",
+    "SlotClickMixin",
+    "WorldBlockModifiedMixin"
+  ],
+  "client": [
+    "InactivityFpsLimiterMixin",
+    "CameraMixin",
+    "ConfirmScreenAccessor",
+    "ChatInputMixin",
+    "ChatInputSuggestorMixin",
+    "ChatReadMixin",
+    "ClientBlockBreakMixin",
+    "ClientOpenScreenMixin",
+    "ClientPlayNetworkHandlerMixin",
+    "ClientPlayerInteractionManagerMixin",
+    "ClientTickMixin",
+    "EntryMixin",
+    "LoadChunkMixin",
+    "MouseMixin",
+    "PlayerCollidesWithEntityMixin",
+    "SimpleOptionMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

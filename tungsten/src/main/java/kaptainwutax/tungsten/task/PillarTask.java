@@ -1,0 +1,542 @@
+package kaptainwutax.tungsten.task;
+
+import kaptainwutax.tungsten.Debug;
+import kaptainwutax.tungsten.path.PlaceRules;
+import kaptainwutax.tungsten.util.WindMouseRotation;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.LevelReader;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
+
+/**
+ * Pillar up: reach a raised goal (a ledge / tree top / tower) by placing blocks
+ * under yourself — the vertical counterpart to {@link BridgeTask}. Classic
+ * Minecraft pillaring, driven tick-by-tick: stay centred, jump, and while airborne
+ * place a block into the air cell under your feet (against the block below it), so
+ * you land one higher. Repeat to the target Y.
+ *
+ * A directed execution primitive (like BridgeTask). The pathfinder integration
+ * (place-as-a-move) drives it; it's also exposed via py4j (pillarTo) and is the
+ * reach mechanism for goals #27's give-up currently abandons.
+ */
+public class PillarTask {
+
+    private static boolean active = false;
+    /** The climb is being performed by the chosen external engine, not by this task. */
+    private static boolean externalPillar = false;
+    private static int targetY;
+    private static int climbGoalY;   // the FINAL height this climb is heading to (for the visual);
+                                     // the tower is built in chunks, but the whole column is drawn.
+    private static int placed;
+    /** Ticks since the body last RESTED a rung higher (G82); NaN lastY = it has not rested yet. */
+    private static int sinceRung;
+    private static double lastY;
+    /**
+     * ⛔ A TOWER WITH NO RUNG IN FIVE SECONDS HAS FAILED (G82, 2026-09-13). The old test was
+     * "the height has not changed by 0.02 for eighty ticks" -- and a HOPPING body never holds
+     * still, so a tower that could not place (a carpet under the feet, 22:39 recording) hopped
+     * for 488 airborne ticks before the verdict came, three times over, while the column's
+     * refusal memory (G62, sixty seconds) expired between towers. Baritone bounds every
+     * movement by its cost plus {@code movementTimeoutTicks} (100) and cancels the path; a
+     * rung costs about twenty ticks, so a hundred ticks without one is that bound here.
+     */
+    private static final int RUNG_TIMEOUT_TICKS = 100;
+    /** G82: towers stopped for want of a rung, and towers refused at once because the feet
+     *  stood inside a thin block (carpet, snow layers) that vanilla will not place into. */
+    public static volatile int pillarNoRung, pillarThinFeet;
+    /** Ticks spent walking the body to the middle of its cell before the first jump (G42). */
+    private static int centerTicks;
+    private static final double CENTER_TOL = 0.2;
+    private static final int CENTER_TICKS_MAX = 60;
+    /** Towers that had to start off-centre because the walk to the middle timed out. */
+    public static volatile int pillarCenterTimeout;
+    /** G51: towers refused at once because a block sat within the jump's reach overhead. */
+    public static volatile int pillarNoHeadroom;
+    /** Per-tower anatomy for the "stuck" verdict: airborne-and-rising ticks, ticks with a cell to
+     *  place into, ticks the live ray was not on the support's top face, clicks refused, placed. */
+    private static int dAir, dPlaceAt, dReadyNull, dTryFalse, dPlaced, dInsideCell, dSneakWait;
+    /** Ticks on which the jump this task pressed was found released again before the game
+     *  sampled it -- another owner of the keys under the tower (G52 diagnostic). */
+    private static int dJumpStolen;
+    private static boolean jumpAsked;
+    private static double dApex = -1e9;
+    private static BlockPos dLastPlaceAt;
+    // How far above the cell's top the feet must be before a click is attempted. Moved to
+    // TungstenConfig.placeClearance 2026-09-15 so it can be A/B tested live -- see its javadoc
+    // for why the current 0.05 vs baritone's cited 0.1 is still an open question.
+
+    // ── G62: a column that will not take a tower is remembered, so it is not asked twice ──
+    //
+    // ⛔ STOPPING IS NOT THE SAME AS NOT BEING ASKED AGAIN. This task already gives up after four
+    // seconds without vertical progress, and the 16:30 recording still spent SEVEN AND A HALF
+    // MINUTES on one spot: stop, "FastNavigator: no progress -- re-planning", the same plan, "Wall
+    // too high to jump -- pillaring to y=68", stop, ten times over, with a wander shuffling
+    // between them ("Random Orientation" x65). The refusal has to survive the task that made it,
+    // or the navigator keeps re-asking a question that has already been answered.
+    private static BlockPos refusedColumn;
+    private static int refusedStreak;
+    private static long refusedAtMs;
+    /** How long a refusal counts, and how many in a row before the navigator must route around. */
+    private static final long REFUSAL_MS = 60_000L;
+    private static final int REFUSALS_BEFORE_ROUTE_AROUND = 2;
+    /** Towers refused because this very column had already failed to take one. */
+    public static volatile int pillarColumnRefused;
+
+    /** This tower built nothing here -- remember the column. */
+    private static void noteRefusal(BlockPos column) {
+        long now = System.currentTimeMillis();
+        if (column == null) return;
+        if (refusedColumn != null && refusedColumn.getX() == column.getX()
+                && refusedColumn.getZ() == column.getZ() && now - refusedAtMs < REFUSAL_MS) {
+            refusedStreak++;
+        } else {
+            refusedColumn = column;
+            refusedStreak = 1;
+        }
+        refusedAtMs = now;
+    }
+
+    /** A tower went up here, so whatever the trouble was, it is over. */
+    private static void clearRefusal() {
+        refusedColumn = null;
+        refusedStreak = 0;
+    }
+
+    /**
+     * Has this column already refused a tower, recently and more than once? The navigator asks
+     * before handing a wall over, and routes around instead of starting the same tower again.
+     */
+    public static boolean refusedRecently(BlockPos column) {
+        if (column == null || refusedColumn == null) return false;
+        if (refusedStreak < REFUSALS_BEFORE_ROUTE_AROUND) return false;
+        if (System.currentTimeMillis() - refusedAtMs > REFUSAL_MS) return false;
+        return refusedColumn.getX() == column.getX() && refusedColumn.getZ() == column.getZ();
+    }
+
+    /**
+     * ⛔ WHICH BLOCK TO TOWER WITH (G108, 2026-09-19). A pillar to GAIN HEIGHT (a nav climb) spends
+     * throwaway -- {@code startTo(ty)} leaves {@code structureBlock} null and the tick picks the
+     * cheapest scaffold. But the build queue also pillars to place a TARGET cell (a portal frame block
+     * the placer reaches only by towering into it), and THAT block must be the structure material, not
+     * cobblestone: {@code startTo(ty, "obsidian")} pins it, so the frame cell is obsidian, not a
+     * throwaway the frame-builder then destroys and re-places forever.
+     */
+    private static String structureBlock;
+
+    /**
+     * ⛔ THE TARGET COLUMN A STRUCTURE PILLAR MUST STAY IN (G108, 2026-09-19). A nav climb only
+     * cares about HEIGHT, so it leaves these unset ({@code Integer.MIN_VALUE}) and the tick fills
+     * whatever column the body is in. But a build-queue pillar casts a NAMED structure block to
+     * place one specific frame cell -- and {@code FastNavigator.startExact(cell)} sends the body to
+     * balance ON a 1-wide wall over open air, from which it slides to an adjacent column; the tick
+     * then cast the structure block into THAT drifted column (measured: portal obsidian landing at
+     * x-1, x+1 and the interior, then re-gathered forever). When a target column is pinned, the
+     * place gate refuses any cell whose x/z is not it, so a drifted body never mislays the block.
+     */
+    private static int targetX = Integer.MIN_VALUE, targetZ = Integer.MIN_VALUE;
+
+    public static synchronized boolean startTo(int ty) {
+        return startTo(ty, null);
+    }
+
+    public static synchronized boolean startTo(int ty, String structureBlockName) {
+        return startTo(ty, structureBlockName, Integer.MIN_VALUE, Integer.MIN_VALUE);
+    }
+
+    public static synchronized boolean startTo(int ty, String structureBlockName, int tx, int tz) {
+        // THE CHOSEN ENGINE CAN ALSO PILLAR. Hand it the column and start no tungsten tower beside
+        // it; externalPillar keeps isActive()/stop()/tick() honest about who owns the climb.
+        if (kaptainwutax.tungsten.api.MovementDelegates.pillarTo(ty, tx, tz)) {
+            externalPillar = true;
+            return true;
+        }
+        LocalPlayer p = Minecraft.getInstance().player;
+        if (p == null) return false;
+        structureBlock = structureBlockName;
+        targetX = tx;
+        targetZ = tz;
+        targetY = ty;
+        climbGoalY = ty;
+        placed = 0;
+        sinceRung = 0;
+        centerTicks = 0;
+        dAir = dPlaceAt = dReadyNull = dTryFalse = dPlaced = dInsideCell = dJumpStolen = dSneakWait = 0;
+        jumpAsked = false;
+        dApex = -1e9;
+        dLastPlaceAt = null;
+        climbingLastTick = false;
+        // The first rung is measured from where the body first RESTS: a task started mid-hop
+        // would otherwise demand a rung half a block above the apex.
+        lastY = p.onGround() ? p.getY() : Double.NaN;
+        active = true;
+        Debug.logMessage("Pillaring up to y=" + ty);
+        return true;
+    }
+
+    /** Tell the visual how high the WHOLE climb is going (the final goal), so the green plan shows
+     *  the entire tower even though it is built to intermediate waypoints one chunk at a time. */
+    public static void setClimbGoal(int y) { if (y > climbGoalY) climbGoalY = y; }
+
+    public static boolean isActive() { return active || externalPillar; }
+    public static int getPlaced() { return placed; }
+
+    public static void stop() {
+        externalPillar = false;
+        kaptainwutax.tungsten.api.MovementDelegates.stop();
+        active = false;
+        structureBlock = null;   // next pillar defaults to a throwaway climb unless told otherwise
+        targetX = targetZ = Integer.MIN_VALUE;   // and to filling whatever column the body is in
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.options != null) {
+            mc.options.keyJump.setDown(false);
+            mc.options.keyUse.setDown(false);
+            mc.options.keyUp.setDown(false);
+            mc.options.keySprint.setDown(false);
+            mc.options.keyShift.setDown(false);
+        }
+        WindMouseRotation.INSTANCE.clearTarget();
+        kaptainwutax.tungsten.TungstenModRenderContainer.PLACE_PLAN.clear();
+    }
+
+    /** Called every game tick from MixinClientPlayerEntity. */
+    public static void tick(LocalPlayer player) {
+        if (externalPillar) {
+            // The external engine owns the climb; keep the flag live so isActive() tracks it.
+            if (!kaptainwutax.tungsten.api.MovementDelegates.externalActive()) externalPillar = false;
+            return;
+        }
+        if (!active) return;
+        Minecraft mc = Minecraft.getInstance();
+        LevelReader world = player.level();
+        var opts = mc.options;
+        // The jump asked for last tick: still down, or taken away by another owner of the keys?
+        if (jumpAsked && !opts.keyJump.isDown()) dJumpStolen++;
+        jumpAsked = false;
+
+        // ⛔ A TOWER NEEDS HEADROOM (G51, 2026-09-11). The wall hand-off started this task where
+        // the body happened to stand -- under the edge leaf of a canopy, in the column NEXT to
+        // the one the planner had chosen -- and the jump was capped by the leaf two above the
+        // feet: "air=80 insideCell=80 placed=0" twice in a row, four seconds each, sixteen
+        // restarts. A ceiling within the jump's reach makes this column impossible; say so at
+        // once and let the navigator re-plan, instead of jumping into it for the stuck window.
+        {
+            int fy = net.minecraft.util.Mth.floor(player.getY());
+            BlockPos col = supportedColumnUnder(player, world);
+            if (col == null) col = BlockPos.containing(player.getX(), fy, player.getZ());
+            BlockPos over = new BlockPos(col.getX(), fy + 2, col.getZ());
+            if (!isAir(world, over) && fy + 1 < targetY) {
+                Debug.logMessage("Pillar stopped: no headroom, " + world.getBlockState(over).getBlock()
+                        + " at " + over.toShortString());
+                pillarNoHeadroom++;
+                noteRefusal(col);
+                stop();
+                return;
+            }
+        }
+
+        // reached target height (standing on / at the target level)
+        if (player.getY() >= targetY - 0.05 && player.onGround()) {
+            Debug.logMessage("Pillar done at y=" + String.format("%.1f", player.getY()) + " (placed " + placed + ")");
+            clearRefusal();
+            stop();
+            return;
+        }
+
+        // ⛔ NO TOWER STARTS FROM INSIDE A CARPET (G82, 2026-09-13). The feet cell holding a
+        // non-air, non-replaceable block with a collision box -- a carpet, two or more snow
+        // layers -- is a cell vanilla will not place into: the click lands on the block's top
+        // face, the cobblestone goes to the cell above, and the body is in the way (22:39
+        // recording: 488 airborne ticks, placeAt=0). The navigator clears such a cell before it
+        // asks for a tower (FastNavigator, G82); any other caller gets the refusal at once,
+        // with the column remembered, instead of the hop. A climbable cell is the ladder
+        // branch (G66) and is not this.
+        if (player.onGround() && !player.onClimbable()) {
+            int fy = net.minecraft.util.Mth.floor(player.getY());
+            BlockPos col = supportedColumnUnder(player, world);
+            if (col == null) col = BlockPos.containing(player.getX(), fy, player.getZ());
+            var fst = world.getBlockState(col);
+            if (!fst.isAir() && !fst.canBeReplaced() && !isAir(world, col)) {
+                Debug.logMessage("Pillar refused: the feet stand in " + fst.getBlock() + " at "
+                        + col.toShortString() + " — a tower cannot start from inside it (clear it first)");
+                pillarThinFeet++;
+                noteRefusal(col);
+                stop();
+                return;
+            }
+        }
+
+        // Re-equip each tick so a tower does not stop halfway when one stack ends. For a nav climb
+        // that is the cheapest throwaway (equipThrowaway); for a build-queue pillar placing a TARGET
+        // cell it is the STRUCTURE block (structureBlock), so the frame cell is obsidian, not a
+        // throwaway the frame-builder destroys and re-places forever (G108).
+        boolean equipped = structureBlock != null
+                ? kaptainwutax.tungsten.helpers.BlockPlaceHelper.equipNamedBlock(player, structureBlock)
+                : kaptainwutax.tungsten.helpers.BlockPlaceHelper.equipThrowaway(player);
+        if (!equipped) {
+            Debug.logMessage("Pillar: out of blocks — nothing placeable in the hotbar (want "
+                    + (structureBlock == null ? "scaffold" : structureBlock) + ")");
+            stop();
+            return;
+        }
+
+        // Visualize the WHOLE tower still to be built (green), not just the next block. PillarTask
+        // places one cell per hop, so the executor's single-cell overlay only ever showed the first
+        // block of a tall pillar (user 2026-09-10). Draw every cell of this column from the bot's
+        // current level up to the target, so the full plan is visible at once.
+        if (kaptainwutax.tungsten.TungstenConfig.get().renderPlacePlan
+                && !kaptainwutax.tungsten.task.FastNavigator.isActive()) {  // FastNavigator owns the overlay while it drives
+            int cx = net.minecraft.util.Mth.floor(player.getX());
+            int cz = net.minecraft.util.Mth.floor(player.getZ());
+            int fy = net.minecraft.util.Mth.floor(player.getY());
+            int top = Math.min(Math.max(targetY, climbGoalY), fy + 30);   // cap so a freak goal cannot draw an endless tower
+            kaptainwutax.tungsten.TungstenModRenderContainer.PLACE_PLAN.clear();
+            for (int y = fy - 1; y < top; y++) {
+                kaptainwutax.tungsten.TungstenModRenderContainer.PLACE_PLAN.add(
+                        new kaptainwutax.tungsten.render.Cuboid(
+                                new Vec3(cx + 0.1, y + 0.1, cz + 0.1),
+                                new Vec3(0.8, 0.8, 0.8),
+                                new kaptainwutax.tungsten.render.Color(60, 220, 120)));
+            }
+        }
+
+        // ⛔ A TOWER IS BUILT FROM THE MIDDLE OF ITS CELL (G42, 2026-09-11). "Stay centred" below
+        // only released the keys; it never MOVED the body to the centre. On canopy_drop the wall
+        // hand-off started this task with the body at x=764.0 -- exactly on the boundary between
+        // two cells, where the previous manoeuvre had left it -- and the placement never fired:
+        // the crosshair straight down lands on the neighbouring column, RealPlacement predicts a
+        // different cell, no click, "Pillar stuck at y=-59.0" every twelve seconds for the whole
+        // window. Baritone's MovementPillar centres before it jumps (the 0.17 test); so does the
+        // navigator before a dig (G34). Walk to the centre first, sneaking so the body cannot
+        // overshoot; jump only from there.
+        {
+            // ⛔ CENTRE ON THE CELL THAT HOLDS YOU UP, NOT ON floor(x). A body straddling the lip
+            // of a gap has floor(x) in the AIR cell; walking to that cell's centre is walking off
+            // the edge -- nav_bridge in round 7 read "the bot LEFT THE ARENA: min Y -120.4" for
+            // exactly that, one deploy after this centring was added. Among the cells the hitbox
+            // overlaps, take the nearest one with a solid block under it; with none, do not
+            // centre at all.
+            BlockPos column = supportedColumnUnder(player, world);
+            double ccx = column == null ? player.getX() : column.getX() + 0.5;
+            double ccz = column == null ? player.getZ() : column.getZ() + 0.5;
+            double ox = ccx - player.getX(), oz = ccz - player.getZ();
+            if (column != null && player.onGround() && ox * ox + oz * oz > CENTER_TOL * CENTER_TOL
+                    && centerTicks < CENTER_TICKS_MAX) {
+                centerTicks++;
+                float yaw = (float) Math.toDegrees(-Math.atan2(ox, oz));
+                WindMouseRotation.INSTANCE.setTarget(yaw, 15f);
+                float err = Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - player.getYRot()));
+                opts.keyUp.setDown(err < 25f);
+                opts.keyShift.setDown(true);
+                opts.keySprint.setDown(false);
+                opts.keyJump.setDown(false);
+                lastY = player.getY();   // centring is not a stuck tower
+                sinceRung = 0;
+                return;
+            }
+            if (centerTicks >= CENTER_TICKS_MAX && centerTicks < CENTER_TICKS_MAX + 1) {
+                centerTicks++;
+                pillarCenterTimeout++;   // could not centre in the time; build from here rather than never
+            }
+        }
+
+        // ⛔ A VINE IN THE COLUMN IS CLIMBED, NOT JUMPED FROM, NOT BROKEN (G66, 2026-09-12). The
+        // operator watched the bot hop and turn for ever in a narrow shaft with a vine on the wall.
+        // Vanilla's LivingEntity.travel, and tungsten's Agent.applyMovementInput with it: on any
+        // tick where the body is in a climbable cell and JUMP is down (or it presses into a wall),
+        // the vertical speed is SET to 0.2 -- the jump's 0.42 is overwritten on its first tick and
+        // the arc never happens. This task released JUMP the moment the body was airborne (one hop
+        // per block), so the body rose 0.42, then 0.116, then 0.035 -- 0.57 in all -- and fell back
+        // into the vine at the clamped 0.15: the place window (feet above the cell's top) never
+        // opened. Rounds 28-31 tried to break the vine out of the column first: a vine breaks in six
+        // ticks by hand and the CLIENT did break it, 981 ticks over 158 breaks, but the block was
+        // back within the same six ticks every time -- the server's own clock had not caught up
+        // and its ack reverted the prediction. Baritone never breaks it: MovementPillar.cost says
+        // "we won't actually need to break the ladder / vine because we're going to use it", and
+        // its ladder branch holds the movement key and lets vanilla climb. This is that branch. A
+        // climbable feet cell keeps JUMP DOWN through the whole rise; the body climbs at 0.2 a
+        // tick, the placement below it fires from the same window as on a free jump (feet above
+        // the cell's top), the vine cell takes the block -- a vine is replaceable -- and the tower
+        // goes up the vine at climb speed. A vine only ABOVE the feet gets the same treatment the
+        // tick the rising body enters it. pillarVine=ticks/met.
+        boolean climbing = player.onClimbable();
+        if (climbing && !climbingLastTick) pillarVineMet++;
+        if (climbing) pillarVineTicks++;
+        climbingLastTick = climbing;
+        // Baritone Movement.java:125-127 retains JUMP in liquid; its MovementPillar.java:
+        // 187-200 separates swimming from land placement. The ordinary land branch also
+        // sneaks initially, but full source water needs different input here: published055
+        // wet-task at30FPS held JUMP+SNEAK for100 grounded ticks with zero vertical rise.
+        // Vanilla water sneak sinks while jump rises (Agent.java:459,506); their impulses
+        // cancel. Hold swimming JUMP without SNEAK until the body leaves water, then
+        // re-arm the existing land pose. The actual sneak-pose/cell/ray click gates below
+        // still apply; swimming alone must not count as constructing a rung.
+        boolean swimmingPillar = kaptainwutax.tungsten.TungstenConfig.get()
+                .pillarUsesSwimInputInWater && player.isInWater();
+        // Stay centred over the column (no horizontal drift) and aim straight down.
+        opts.keyUp.setDown(false);
+        opts.keySprint.setDown(false);
+        // On land, arm sneak before the jump and retain it through the placement window.
+        // ClientPlayerEntity updates its cached sneak pose before sampling new input;
+        // requesting it only at the apex misses the short window below a low roof.
+        opts.keyShift.setDown(!swimmingPillar);
+        WindMouseRotation.INSTANCE.setTarget(player.getYRot(), 89f); // pitch +89 = down
+
+        // Jump off the ground; release jump while airborne (single hop per block) -- unless the
+        // body is climbing or swimming, where JUMP held is the ascent itself.
+        boolean jump = player.onGround() || climbing || swimmingPillar;
+        opts.keyJump.setDown(jump);
+        jumpAsked = jump;
+
+        // Find the air cell directly under the player that has a solid block below it
+        // (within 2 down) — that's where the pillar block goes. Only place while
+        // airborne and rising, so we don't fight our own footing.
+        if (!player.onGround() && player.getDeltaMovement().y > -0.15) {
+            double px = player.getX(), pz = player.getZ();
+            BlockPos placeAt = null, against = null;
+            for (int dy = 0; dy <= 2; dy++) {
+                BlockPos c = BlockPos.containing(px, player.getY() - dy, pz);
+                BlockPos b = c.below();
+                if (isAir(world, c) && !isAir(world, b)) { placeAt = c; against = b; break; }
+            }
+            // ⛔ A STRUCTURE PILLAR NEVER CASTS OUTSIDE ITS TARGET COLUMN (G108, 2026-09-19). The
+            // body drifts off a 1-wide build stand over open air; without this, the tick cast the
+            // named block (obsidian) into the drifted column, off the frame plane, and the frame
+            // re-gathered/re-mined it forever. A nav climb (targetX unset) is unaffected.
+            if (placeAt != null && structureBlock != null && targetX != Integer.MIN_VALUE
+                    && (placeAt.getX() != targetX || placeAt.getZ() != targetZ)) {
+                placeAt = null;
+                against = null;
+            }
+            dAir++;
+            if (player.getY() > dApex) dApex = player.getY();
+            // ⛔ THE BODY MUST HAVE LEFT THE CELL BEFORE THE CELL IS FILLED (G42, 2026-09-11).
+            // "Airborne and rising" starts at the first tick off the ground, feet at +0.42, still
+            // inside the cell the block is going into -- vanilla refuses a cube that intersects
+            // an entity, so that click fails, and BlockPlaceHelper's rate gate is armed by the
+            // attempt regardless: the next click is allowed four ticks later, after the apex, and
+            // the tower never rises. Diagnosed on pit_escape: "air=81 placeAt=81 readyNull=0
+            // tryFalse=81 placed=0" -- the ray on the right face every time, every click refused.
+            // Baritone's MovementPillar clicks only at player.y > dest.y + 0.1 (feet above the
+            // cell's top); this is that test, so the first click is the one inside the window.
+            if (placeAt != null && player.getY() < placeAt.getY() + 1.0
+                    + kaptainwutax.tungsten.TungstenConfig.get().placeClearance) {
+                dInsideCell++;
+                placeAt = null;
+            }
+            if (placeAt != null) {
+                dPlaceAt++;
+                if (!PlaceRules.canPlace(world, placeAt)) {
+                    Debug.logMessage("Pillar stopped: protected/denied at " + placeAt.toShortString());
+                    stop();
+                    return;
+                }
+                // Keep the actual-pose gate: a smoker or crafting table otherwise
+                // opens its GUI instead of supporting a new block. On land sneak is
+                // held through the jump; after swimming it must be re-armed first.
+                // THIS DID NOT EVEN AIM. It forged a hit on the top face of the block below
+                // and clicked, so a tower went up with the camera pointing anywhere at all —
+                // a placement through geometry, not a placement. Now: look DOWN at that face
+                // through the mouse pipeline, and click only when the player's own crosshair
+                // agrees it would fill the cell (RealPlacement, ported from baritone's
+                // MovementHelper.attemptToPlaceABlock).
+                Vec3 faceCenter = Vec3.atCenterOf(against).add(0, 0.5, 0); // top face of the block below
+                Vec3 dv = faceCenter.subtract(player.getEyePosition());
+                float wantYaw = (float) Math.toDegrees(-Math.atan2(dv.x, dv.z));
+                float wantPitch = (float) Math.toDegrees(
+                        -Math.atan2(dv.y, Math.sqrt(dv.x * dv.x + dv.z * dv.z)));
+                kaptainwutax.tungsten.util.WindMouseRotation.INSTANCE.setTarget(wantYaw, wantPitch);
+                BlockHitResult hit =
+                        kaptainwutax.tungsten.helpers.RealPlacement.readyToPlace(mc, placeAt);
+                // Same shared rate gate as every other placement (helpers/BlockPlaceHelper).
+                if (!player.isCrouching()) {
+                    dSneakWait++;
+                } else if (hit == null) {
+                    dReadyNull++;
+                } else if (kaptainwutax.tungsten.helpers.BlockPlaceHelper.tryPlace(hit)) {
+                    // remember this pillar block as scaffolding so a cleanup can mine it back out
+                    kaptainwutax.tungsten.util.ScaffoldRegistry.record(placeAt);
+                    dPlaced++;
+                } else {
+                    dTryFalse++;
+                }
+                dLastPlaceAt = placeAt;
+            }
+        }
+
+        // Progress: a RUNG is the body RESTING higher than it last rested -- on the ground, or on
+        // a climbable it is going up (G66). A hop's apex is not a rung (G82): the old test
+        // credited "y rose by 0.5" from mid-air and then could not see a hopping body as stuck.
+        boolean resting = player.onGround() || climbing;
+        if (resting && Double.isNaN(lastY)) lastY = player.getY();
+        if (resting && player.getY() - lastY > 0.5) {
+            placed++;
+            lastY = player.getY();
+            sinceRung = 0;
+        } else if (++sinceRung > RUNG_TIMEOUT_TICKS) {
+            // SAY WHY, NOT JUST THAT. A tower that places nothing has one of four reasons --
+            // never airborne, no cell to place into, the crosshair not on the support's top
+            // face, or the click refused -- and "stuck" alone named none of them (canopy_drop
+            // and pit_escape, 2026-09-11: 0 placed, 16 restarts, no idea which).
+            String hitS = "-";
+            try {
+                var lh = kaptainwutax.tungsten.path.movements.RotationHelper.liveHit(player);
+                if (lh instanceof BlockHitResult bh) {
+                    hitS = bh.getBlockPos().toShortString() + "/" + String.valueOf(bh.getDirection());
+                } else if (lh != null) {
+                    hitS = lh.getType().name();
+                }
+            } catch (Throwable ignored) {
+                // a diagnostic never breaks the tick it rides on
+            }
+            Debug.logMessage(String.format(
+                    "Pillar stuck at y=%.1f (no rung in %d ticks) air=%d insideCell=%d placeAt=%d readyNull=%d tryFalse=%d placed=%d"
+                    + " pitch=%.0f onGround=%b hit=%s lastPlaceAt=%s hand=%s center=%d/%d at=(%.2f,%.2f)"
+                    + " apex=%.2f jumpStolen=%d sneakWait=%d",
+                    player.getY(), sinceRung, dAir, dInsideCell, dPlaceAt, dReadyNull, dTryFalse, dPlaced,
+                    player.getXRot(), player.onGround(), hitS,
+                    dLastPlaceAt == null ? "-" : dLastPlaceAt.toShortString(),
+                    player.getMainHandItem().getItem().toString(),
+                    centerTicks, CENTER_TICKS_MAX, player.getX(), player.getZ(), dApex,
+                    dJumpStolen, dSneakWait));
+            pillarNoRung++;
+            if (dPlaced == 0) {
+                noteRefusal(supportedColumnUnder(player, world));
+            }
+            stop();
+        }
+    }
+
+    private static boolean isAir(LevelReader w, BlockPos p) {
+        return w.getBlockState(p).getCollisionShape(w, p).isEmpty();
+    }
+
+    /** G66: ticks the tower spent with its feet in a climbable cell (a vine, a ladder) with JUMP
+     *  held as the climb, and the number of times a tower entered one. */
+    public static volatile int pillarVineTicks, pillarVineMet;
+    private static boolean climbingLastTick = false;
+
+    /** The feet-level cell, among those the hitbox overlaps, that has a solid block under it and
+     *  lies nearest the body -- the column a tower can be built in. Null when the body hangs over
+     *  nothing (mid-bridge over a void), so the caller does not walk it anywhere. */
+    private static BlockPos supportedColumnUnder(LocalPlayer player, LevelReader world) {
+        net.minecraft.world.phys.AABB box = player.getBoundingBox();
+        int fy = net.minecraft.util.Mth.floor(player.getY());
+        double[][] corners = {
+            {player.getX(), player.getZ()},
+            {box.minX + 0.01, box.minZ + 0.01}, {box.minX + 0.01, box.maxZ - 0.01},
+            {box.maxX - 0.01, box.minZ + 0.01}, {box.maxX - 0.01, box.maxZ - 0.01},
+        };
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+        for (double[] c : corners) {
+            BlockPos cell = BlockPos.containing(c[0], fy, c[1]);
+            if (isAir(world, cell.below())) continue;
+            double dx = cell.getX() + 0.5 - player.getX(), dz = cell.getZ() + 0.5 - player.getZ();
+            double d = dx * dx + dz * dz;
+            if (d < bestD) { bestD = d; best = cell; }
+        }
+        return best;
+    }
+}

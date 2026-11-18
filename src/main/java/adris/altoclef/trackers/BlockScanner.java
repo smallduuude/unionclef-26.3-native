@@ -1,0 +1,720 @@
+package adris.altoclef.trackers;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.eventbus.EventBus;
+import adris.altoclef.eventbus.events.BlockPlaceEvent;
+import adris.altoclef.multiversion.blockpos.BlockPosVer;
+import adris.altoclef.trackers.blacklisting.WorldLocateBlacklist;
+import adris.altoclef.util.Dimension;
+import adris.altoclef.util.helpers.BaritoneHelper;
+import adris.altoclef.util.helpers.WorldHelper;
+import adris.altoclef.util.time.TimerGame;
+import java.util.*;
+import java.util.function.Predicate;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.phys.Vec3;
+
+public class BlockScanner {
+
+    private static final boolean LOG = false;
+    private static final int RESCAN_TICK_DELAY = 4 * 20;
+    private static final int CACHED_POSITIONS_PER_BLOCK = 40;
+
+
+    private final AltoClef mod;
+    private final TimerGame rescanTimer = new TimerGame(1);
+
+    private final HashMap<Block, HashSet<BlockPos>> trackedBlocks = new HashMap<>();
+    private final HashMap<Block, HashSet<BlockPos>> scannedBlocks = new HashMap<>();
+    private final HashMap<ChunkPos, Long> scannedChunks = new HashMap<>();
+    private final WorldLocateBlacklist blacklist = new WorldLocateBlacklist();
+    // used while scanning
+    private HashMap<Block, HashSet<BlockPos>> cachedScannedBlocks = new HashMap<>();
+    private Dimension scanDimension = Dimension.OVERWORLD;
+    private Level scanWorld = null;
+
+    // Client-thread ownership. A worker only writes its private request and
+    // publishes completion through the volatile flag; it never changes caches
+    // or game timers belonging to a later world.
+    private ScanRequest activeScan;
+
+
+    public BlockScanner(AltoClef mod) {
+        this.mod = mod;
+
+        EventBus.subscribe(BlockPlaceEvent.class, evt -> addBlock(evt.blockState.getBlock(), evt.blockPos));
+    }
+
+
+    public void addBlock(Block block, BlockPos pos) {
+        if (!isBlockAtPosition(pos, block)) {
+            Debug.logInternal("INVALID SET: " + block + " " + pos);
+            return;
+        }
+
+        if (trackedBlocks.containsKey(block)) {
+            trackedBlocks.get(block).add(pos);
+        } else {
+            HashSet<BlockPos> set = new HashSet<>();
+            set.add(pos);
+
+            trackedBlocks.put(block, set);
+        }
+    }
+
+
+    public void requestBlockUnreachable(BlockPos pos, int allowedFailures) {
+        blacklist.blackListItem(mod, pos, allowedFailures);
+    }
+
+    //TODO replace four with config
+    public void requestBlockUnreachable(BlockPos pos) {
+        blacklist.blackListItem(mod, pos, 4);
+    }
+
+    /**
+     * A DECISIVE unreachable verdict (Finding B, 2026-09-18): the block's reach/dig route was given
+     * up repeatedly with no progress (G74), which is strong enough evidence to exclude it at once
+     * rather than cost one of four attempts. Unlike {@link #requestBlockUnreachable(BlockPos)} it
+     * makes {@link #isUnreachable} true immediately, but it still cools off and is retried (never a
+     * permanent 'deliberate' exclusion). See {@link adris.altoclef.trackers.blacklisting.AbstractObjectBlacklist#blackListNow}.
+     */
+    public void requestBlockUnreachableNow(BlockPos pos) {
+        blacklist.blackListNow(mod, pos);
+    }
+
+    /**
+     * {@link #requestBlockUnreachableNow(BlockPos)} for the block AND the local cluster of the SAME
+     * block type around it (Finding B, 2026-09-18). Unreachability is a LOCAL GEOMETRIC FACT: a
+     * canopy log 6 up that a reach route cannot reach has same-height neighbours it cannot reach
+     * either, so condemning them together lets the bot leave an unreachable patch after ONE verdict.
+     *
+     * <p>Without this, a decisive per-block verdict still lost to the cluster: grinding a 3x3 canopy
+     * one log at a time (~3 give-ups each) took longer than the 45 s cool-off, so the first logs
+     * came back into the candidate pool before the last were excluded and the list never emptied --
+     * the bot churned on the same patch for ever instead of exploring for wood it could reach.
+     *
+     * <p>Still EVIDENCE, never a decision: each cooled-off entry is retried, so a patch wrongly
+     * lumped in (a reachable block of the same type within the radius) is offered again in 45 s.
+     * The radius is small and same-type only, and a genuine vertical separation (a reachable trunk
+     * base far below an unreachable canopy log) is outside it. Reach targets only -- the dig route
+     * (a movement goal into solid rock) stays per-block so this never condemns rock a tunnel needs.
+     */
+    public void requestAreaUnreachableNow(BlockPos pos, double radius) {
+        requestBlockUnreachableNow(pos);
+        if (mod.getWorld() == null) return;
+        Block target = mod.getWorld().getBlockState(pos).getBlock();
+        HashSet<BlockPos> tracked = trackedBlocks.get(target);
+        if (tracked == null) return;
+        // snapshot, then mark -- blackListNow does not touch trackedBlocks, but a scan may
+        List<BlockPos> near = new LinkedList<>();
+        for (BlockPos p : tracked) {
+            if (!p.equals(pos) && p.closerToCenterThan(Vec3.atCenterOf(pos), radius)) {
+                near.add(p);
+            }
+        }
+        for (BlockPos p : near) {
+            requestBlockUnreachableNow(p);
+        }
+    }
+
+
+    public boolean isUnreachable(BlockPos pos) {
+        return blacklist.unreachable(pos);
+    }
+
+    public List<BlockPos> getKnownLocations(Block... blocks) {
+        List<BlockPos> locations = new LinkedList<>();
+
+        for (Block block : blocks) {
+            if (!trackedBlocks.containsKey(block)) continue;
+
+            locations.addAll(trackedBlocks.get(block));
+        }
+        // G63: the cool-off picks BETWEEN candidates; it does not delete the last one. An empty
+        // list here is read by the callers as "this block does not exist in the world".
+        List<BlockPos> rested = new LinkedList<>(locations);
+        rested.removeIf(this::isUnreachable);
+        if (rested.isEmpty() && !locations.isEmpty()) {
+            // G63b: hand back the cooling-off ones, never the deliberately excluded ones
+            List<BlockPos> notExcluded = new LinkedList<>(locations);
+            notExcluded.removeIf(blacklist::excludedDeliberately);
+            if (!notExcluded.isEmpty()) {
+                scanCoolOffLifted++;
+                return notExcluded;
+            }
+        }
+
+        return rested;
+    }
+
+    /**
+     * Scans a radius for the closest block of a given type .
+     *
+     * @param pos    The center of this radius
+     * @param range  Radius to scan for
+     * @param blocks What blocks to check for
+     */
+    public Optional<BlockPos> getNearestWithinRange(Vec3 pos, double range, Block... blocks) {
+        Optional<BlockPos> nearest = getNearestBlock(pos, blocks);
+
+        if (nearest.isEmpty() || nearest.get().closerToCenterThan(pos, range)) return nearest;
+
+        return Optional.empty();
+    }
+
+    public Optional<BlockPos> getNearestWithinRange(BlockPos pos, double range, Block... blocks) {
+        return getNearestWithinRange(new Vec3(pos.getX(), pos.getY(), pos.getZ()), range, blocks);
+    }
+
+
+    public boolean anyFound(Block... blocks) {
+        return anyFound((block) -> true, blocks);
+    }
+
+
+    public boolean anyFound(Predicate<BlockPos> isValidTest, Block... blocks) {
+        for (Block block : blocks) {
+            if (!trackedBlocks.containsKey(block)) continue;
+
+            for (BlockPos pos : trackedBlocks.get(block)) {
+                if (isValidTest.test(pos) && mod.getWorld().getBlockState(pos).getBlock().equals(block) && !this.isUnreachable(pos))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    public Optional<BlockPos> getNearestBlock(Block... blocks) {
+        // Add juuust a little, to prevent digging down all the time/bias towards blocks BELOW the player
+        return getNearestBlock(mod.getPlayer().position().add(0, 0.6f, 0), blocks);
+    }
+
+    public Optional<BlockPos> getNearestBlock(Vec3 pos, Block... blocks) {
+        return getNearestBlock(pos, p -> true, blocks);
+    }
+
+    public Optional<BlockPos> getNearestBlock(Predicate<BlockPos> isValidTest, Block... blocks) {
+        return getNearestBlock(mod.getPlayer().position().add(0, 0.6f, 0), isValidTest, blocks);
+    }
+
+    public Optional<BlockPos> getNearestBlock(Vec3 pos, Predicate<BlockPos> isValidTest, Block... blocks) {
+        Optional<BlockPos> closest = Optional.empty();
+
+        for (Block block : blocks) {
+            Optional<BlockPos> p = getNearestBlock(block, isValidTest, pos);
+
+            if (p.isPresent()) {
+                if (closest.isEmpty()) closest = p;
+                else {
+                    if (BaritoneHelper.calculateGenericHeuristic(pos, WorldHelper.toVec3d(closest.get())) > BaritoneHelper.calculateGenericHeuristic(pos, WorldHelper.toVec3d(p.get()))) {
+                        closest = p;
+                    }
+                }
+            }
+        }
+
+        return closest;
+    }
+
+    public Optional<BlockPos> getNearestBlock(Block block, Vec3 fromPos) {
+        return getNearestBlock(block, (pos) -> true, fromPos);
+    }
+
+    public Optional<BlockPos> getNearestBlock(Block block, Predicate<BlockPos> isValidTest, Vec3 fromPos) {
+        return getNearestBlock(block, isValidTest, fromPos, true);
+    }
+
+    /**
+     * @param honourCoolOff false on the second pass — see the bottom of this method (G63).
+     */
+    private Optional<BlockPos> getNearestBlock(Block block, Predicate<BlockPos> isValidTest, Vec3 fromPos,
+                                               boolean honourCoolOff) {
+        BlockPos pos = null;
+        double nearest = Double.POSITIVE_INFINITY;
+
+        if (!trackedBlocks.containsKey(block)) {
+            return Optional.empty();
+        }
+
+        // Read ONCE, not per candidate. Putting a config lookup inside the innermost loop of the
+        // very thing being optimised would have handed some of the saving straight back.
+        final boolean cheapFirst = kaptainwutax.tungsten.TungstenConfig.get().scanCheapTestFirst;
+
+        for (BlockPos p : trackedBlocks.get(block)) {
+            // ⛔ CHEAPEST TEST FIRST. This walked EVERY tracked position of the block and did a
+            // world getBlockState -- a chunk lookup -- plus the caller's predicate and the
+            // unreachable set, before finally computing a distance that throws most of them away.
+            // Called every tick, over every type in the list (a "wood" target is fourteen), across
+            // everything the scanner has ever seen.
+            //
+            // Measured on the playthrough stall corpus: scanAccepted reads 95k, 136k, 514k and
+            // 1,346,059 accepted candidates in nine-minute runs, against 200-400 on a passing
+            // arena course -- the ONE signal common to all four stall families rather than to any
+            // single one. On a client this bench has established is fps-bound, that is real CPU.
+            //
+            // The distance is arithmetic on two vectors and rejects almost everything, so it goes
+            // first, and the expensive checks run only for a candidate that is actually the best
+            // so far. RESULTS ARE IDENTICAL: `nearest` only ever advances on a candidate that
+            // passed every check, so anything at or beyond it cannot win regardless of whether it
+            // would have passed. Same answer, a fraction of the work.
+            // The old order is kept behind a flag ONLY so the saving can be measured. The two
+            // branches return the same answer -- that is the whole point -- so this is not a
+            // behaviour gate, it is the control arm for an fps A/B on the survival world, where
+            // frames are the binding constraint and a scan of a million candidates might be worth
+            // some of them. Delete the flag once that number exists.
+            if (!cheapFirst) {
+                if (!mod.getWorld().getBlockState(p).getBlock().equals(block)) continue;
+                if (!isValidTest.test(p) || (honourCoolOff ? isUnreachable(p) : blacklist.excludedDeliberately(p))) continue;
+                double old = BaritoneHelper.calculateGenericHeuristic(fromPos, WorldHelper.toVec3d(p));
+                if (old < nearest) { nearest = old; pos = p; }
+                continue;
+            }
+
+            // G63: on the rested pass every candidate has failed, so rank them by what they cost
+            // -- the one that failed once beats the one that failed five times.
+            double dist = BaritoneHelper.calculateGenericHeuristic(fromPos, WorldHelper.toVec3d(p))
+                    + (honourCoolOff ? 0 : blacklist.penaltyBlocks(p));
+            if (dist >= nearest) continue;
+
+            //ensure the block is there (can change upon rescan)
+            if (!mod.getWorld().getBlockState(p).getBlock().equals(block)) continue;
+            // G63b: the rested pass skips what the brain excluded ON PURPOSE (zero attempts
+            // allowed) -- an "extra furnace" handed back as a last resort is how the 19:38 run
+            // stood seven minutes at a smoker.
+            if (!isValidTest.test(p) || (honourCoolOff ? isUnreachable(p) : blacklist.excludedDeliberately(p))) continue;
+
+            nearest = dist;
+            pos = p;
+        }
+
+        // ⛔ SETTLE THE EQUIVALENCE CLAIM BY MEASURING IT, NOT BY ARGUING IT AGAIN.
+        //
+        // I shipped the reorder saying the answer "cannot change by construction", and mine_coal
+        // then read 1/5 against 3/4 for the old order. The proof still looks right -- `nearest`
+        // only advances on a validated candidate -- but a proof that disagrees with the bench is
+        // a proof with an unexamined assumption, and the obvious candidate is that isValidTest is
+        // called for EVERY position in one order and only for a new best in the other.
+        //
+        // So compute BOTH and compare the chosen block. A mismatch proves the orders differ and
+        // says on which block; zero mismatches across a full suite says the 1/5 was noise and the
+        // optimisation is safe to ship. Off by default -- it does the expensive walk twice.
+        if (kaptainwutax.tungsten.TungstenConfig.get().scanEquivCheck) {
+            BlockPos other = null;
+            double otherNearest = Double.POSITIVE_INFINITY;
+            for (BlockPos p : trackedBlocks.get(block)) {
+                if (cheapFirst) {
+                    // the OTHER order: validate everything, then compare
+                    if (!mod.getWorld().getBlockState(p).getBlock().equals(block)) continue;
+                    if (!isValidTest.test(p) || isUnreachable(p)) continue;
+                    double d = BaritoneHelper.calculateGenericHeuristic(fromPos, WorldHelper.toVec3d(p));
+                    if (d < otherNearest) { otherNearest = d; other = p; }
+                } else {
+                    double d = BaritoneHelper.calculateGenericHeuristic(fromPos, WorldHelper.toVec3d(p));
+                    if (d >= otherNearest) continue;
+                    if (!mod.getWorld().getBlockState(p).getBlock().equals(block)) continue;
+                    if (!isValidTest.test(p) || isUnreachable(p)) continue;
+                    otherNearest = d; other = p;
+                }
+            }
+            scanEquivChecked++;
+            if (!java.util.Objects.equals(pos, other)) {
+                scanEquivMismatch++;
+                adris.altoclef.Debug.logMessage("SCANDIFF block=" + block + " cheapFirst=" + cheapFirst
+                        + " chose=" + pos + " other=" + other);
+            }
+        }
+
+        // ⛔ A COOL-OFF CANNOT OUTLIVE THE ABSENCE OF ALTERNATIVES (G63, 2026-09-12).
+        //
+        // Every caller of this scanner FILTERS by the cool-off, so a patch of forest whose logs had
+        // each failed once answered "there are no logs" — and "no candidates" comes out downstream
+        // as the wander and the "Failed exploring" the operator keeps seeing, with the logs in
+        // plain sight. Stepping aside only means anything while there is something to step aside
+        // FOR. With nothing else on offer, the best of the rested targets is the answer, and the
+        // bot goes back to work instead of walking in circles.
+        if (pos == null && honourCoolOff) {
+            Optional<BlockPos> spared = getNearestBlock(block, isValidTest, fromPos, false);
+            if (spared.isPresent()) {
+                scanCoolOffLifted++;
+                return spared;
+            }
+        }
+
+        return pos != null ? Optional.of(pos) : Optional.empty();
+    }
+
+    /** G63: scans that found nothing until the cool-off was ignored. Read as banLifted. */
+    public static volatile int scanCoolOffLifted;
+
+    /** Equivalence audit for the scan reorder. Read as scanEquiv=checked/mismatched. */
+    public static volatile int scanEquivChecked, scanEquivMismatch;
+
+    public boolean anyFoundWithinDistance(double distance, Block... blocks) {
+        return anyFoundWithinDistance(mod.getPlayer().position().add(0, 0.6f, 0), distance, blocks);
+    }
+
+    public boolean anyFoundWithinDistance(Vec3 pos, double distance, Block... blocks) {
+        Optional<BlockPos> blockPos = getNearestBlock(blocks);
+        return blockPos.map(value -> value.closerToCenterThan(pos, distance)).orElse(false);
+    }
+
+    public double distanceToClosest(Block... blocks) {
+        return distanceToClosest(mod.getPlayer().position().add(0, 0.6f, 0), blocks);
+    }
+
+    public double distanceToClosest(Vec3 pos, Block... blocks) {
+        Optional<BlockPos> blockPos = getNearestBlock(blocks);
+        return blockPos.map(value ->  Math.sqrt(BlockPosVer.getSquaredDistance(value, pos))).orElse(Double.POSITIVE_INFINITY);
+    }
+
+    // Checks if 'pos' one of 'blocks' block
+    // Returns false if incorrect or undetermined/unsure
+    public boolean isBlockAtPosition(BlockPos pos, Block... blocks) {
+        if (isUnreachable(pos)) {
+            return false;
+        }
+
+        if (!mod.getChunkTracker().isChunkLoaded(pos)) {
+            return false;
+        }
+
+        ClientLevel world = Minecraft.getInstance().level;
+        if (world == null) {
+            return false;
+        }
+        try {
+            for (Block block : blocks) {
+                if (world.isEmptyBlock(pos) && WorldHelper.isAir(block)) {
+                    return true;
+                }
+                BlockState state = world.getBlockState(pos);
+                if (state.getBlock() == block) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (NullPointerException e) {
+            // Probably out of chunk. This means we can't judge its state.
+            return false;
+        }
+    }
+
+    public void reset() {
+        Minecraft client = Minecraft.getInstance();
+        if (!client.isSameThread()) {
+            client.execute(this::reset);
+            return;
+        }
+        if (activeScan != null) activeScan.cancelled = true;
+        activeScan = null;
+        trackedBlocks.clear();
+        scannedBlocks.clear();
+        scannedChunks.clear();
+        cachedScannedBlocks.clear();
+        rescanTimer.forceElapse();
+        blacklist.clear();
+    }
+
+    public void tick() {
+        Level world = mod.getWorld();
+        // Invalidate before processing a completion, including ticks spent in
+        // menus. Port the ownership order in baritone/src/main/java/baritone/cache/WorldProvider.java:
+        // 102-110 (closeWorld clears the current world before closing its cache).
+        if (world != scanWorld) {
+            reset();
+            scanWorld = world;
+        }
+        if (world == null || !AltoClef.inGame()) {
+            // A connection can disappear before the world reference is cleared.
+            // Detach its request here as well; TimerGame requires the connection.
+            if (activeScan != null) reset();
+            return;
+        }
+        Dimension dimension = WorldHelper.getCurrentDimension();
+        if (scanDimension != dimension) {
+            reset();
+            scanDimension = dimension;
+        }
+
+        if (activeScan != null && activeScan.completed) {
+            ScanRequest completed = activeScan;
+            activeScan = null;
+            if (!completed.cancelled && completed.world == world && completed.succeeded) {
+                scannedBlocks.clear();
+                scannedBlocks.putAll(completed.blocks);
+                scannedChunks.clear();
+                scannedChunks.putAll(completed.chunks);
+                cachedScannedBlocks = copyBlocks(scannedBlocks);
+                scanDone++;
+                scanChunks = completed.visited;
+                scanScanned = completed.scanned;
+                scanMs = completed.ms;
+            }
+            // Only the current world's client tick owns this timer. A completed
+            // worker after logout is discarded by reset(), never timed in a menu.
+            rescanTimer.reset();
+        }
+        //be maximally aware of the closest blocks around you
+        scanCloseBlocks();
+        if (!rescanTimer.elapsed() || activeScan != null) return;
+
+        if (LOG) {
+            mod.log("Updating BlockScanner.. size: " + trackedBlocks.size() + " : " + cachedScannedBlocks.size());
+        }
+
+        ScanRequest request = new ScanRequest(world, mod.getPlayer().chunkPosition(),
+                mod.getPlayer().position(), world.getGameTime(), copyBlocks(scannedBlocks),
+                new HashMap<>(scannedChunks), blacklist.snapshotUnreachable());
+        activeScan = request;
+        scanStarted++;
+        new Thread(() -> {
+            try {
+                rescan(request, Integer.MAX_VALUE, Integer.MAX_VALUE);
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                // Release-publish every result field. The client tick either
+                // accepts this request or has already detached it on world exit.
+                request.completed = true;
+            }
+        }, "unionclef-block-scan").start();
+    }
+
+    private static HashMap<Block, HashSet<BlockPos>> copyBlocks(Map<Block, HashSet<BlockPos>> source) {
+        HashMap<Block, HashSet<BlockPos>> copy = new HashMap<>(source.size());
+        source.forEach((block, positions) -> copy.put(block, new HashSet<>(positions)));
+        return copy;
+    }
+
+    private void scanCloseBlocks() {
+        for (Map.Entry<Block, HashSet<BlockPos>> entry : cachedScannedBlocks.entrySet()) {
+            if (!trackedBlocks.containsKey(entry.getKey())) {
+                trackedBlocks.put(entry.getKey(), new HashSet<>());
+            }
+            trackedBlocks.get(entry.getKey()).clear();
+
+            trackedBlocks.get(entry.getKey()).addAll(entry.getValue());
+        }
+
+        HashMap<Block, HashSet<BlockPos>> map = new HashMap<>();
+
+        BlockPos pos = mod.getPlayer().blockPosition();
+        Level world = mod.getPlayer().level();
+
+        // This runs EVERY TICK over a 17x16x17 volume (~4,600 cells), so the per-cell cost is the
+        // cost. It used to call getBlockState TWICE per cell (a chunk lookup each time) and allocate
+        // a fresh BlockPos for all 4,600 of them. One reused mutable cursor removes ~4,600
+        // allocations a tick, and the single state read halves the chunk lookups; only cells that
+        // actually hold a block allocate an immutable position to keep.
+        final BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+        for (int x = pos.getX() - 8; x <= pos.getX() + 8; x++) {
+            for (int y = pos.getY() - 8; y < pos.getY() + 8; y++) {
+                for (int z = pos.getZ() - 8; z <= pos.getZ() + 8; z++) {
+                    cursor.set(x, y, z);
+                    BlockState state = world.getBlockState(cursor);
+                    if (state.isAir()) continue;
+
+                    map.computeIfAbsent(state.getBlock(), b -> new HashSet<>()).add(cursor.immutable());
+                }
+            }
+        }
+
+        for (Map.Entry<Block, HashSet<BlockPos>> entry : map.entrySet()) {
+            getFirstFewPositions(entry.getValue(),mod.getPlayer().position());
+
+            if (!trackedBlocks.containsKey(entry.getKey())) {
+                trackedBlocks.put(entry.getKey(), new HashSet<>());
+            }
+
+            trackedBlocks.get(entry.getKey()).addAll(entry.getValue());
+        }
+    }
+
+    /** Instrumentation for the distant-block investigation: does a full rescan pass ever COMPLETE? */
+    public static volatile int scanStarted, scanDone, scanChunks, scanScanned, scanMs;
+
+    private void rescan(ScanRequest request, int maxCount, int cutOffRadius) {
+        long ms = System.currentTimeMillis();
+
+        Level world = request.world;
+        ChunkPos playerChunkPos = request.playerChunk;
+        Vec3 playerPos = request.playerPos;
+
+        int scanned = 0;
+        HashSet<ChunkPos> visited = new HashSet<>();
+        Queue<Node> queue = new ArrayDeque<>();
+        queue.add(new Node(playerChunkPos, 0));
+
+        while (!queue.isEmpty() && visited.size() < maxCount && !request.cancelled) {
+            Node node = queue.poll();
+
+            if (node.distance > cutOffRadius || visited.contains(node.pos) || !world.getChunkSource().hasChunk(node.pos.x(), node.pos.z()))
+                continue;
+
+            visited.add(node.pos);
+
+            // A CHUNK SCANNED RECENTLY USED TO `continue` HERE -- skipping the enqueue below with it,
+            // so a fresh chunk BLOCKED THE WAVEFRONT and nothing beyond it was reached on that pass.
+            // rescan() runs about once a second while RESCAN_TICK_DELAY is 80 ticks, so the ring at
+            // distance 3 is nearly always too fresh to re-scan: the walk stopped there, and only the
+            // priority chunks (distance <= 2, exempt from the delay) were reliably covered at all.
+            // Recency is a reason to skip the WORK, not the TRAVERSAL. Walking on costs a set lookup;
+            // the expensive part, scanChunk(), is still gated exactly as before.
+            boolean isPriorityChunk = getChunkDist(node.pos, playerChunkPos) <= 2;
+            boolean tooFresh = !isPriorityChunk && request.chunks.containsKey(node.pos)
+                    && request.worldTime - request.chunks.get(node.pos) < RESCAN_TICK_DELAY;
+            if (!tooFresh) {
+                scanned++;
+                scanChunk(request, node.pos, playerChunkPos);
+            }
+
+            // THIS BFS USED TO STEP ONLY DIAGONALLY -- (x+1,z+1), (x-1,z+1), (x-1,z-1), (x+1,z-1).
+            // Every such step changes both coordinates by one, so (x + z) % 2 is INVARIANT: from the
+            // player's chunk you can only ever reach chunks of the same parity, and the other half of
+            // the world is never scanned at all. Not a smaller radius -- a checkerboard.
+            // It hid behind scanCloseBlocks(), which re-reads +-8 blocks around the player every tick,
+            // so anything close was always seen and only distant blocks blinked in and out as the
+            // player walked between chunks of one parity and the other. Measured on the distant-table
+            // course: a crafting table 29 blocks away was found on 510 of 6018 lookups.
+            // Orthogonal steps cover both parities, and they also make node.distance exactly the
+            // Manhattan getChunkDist() used for the cutoff below and the prune further down, which
+            // the diagonal version did not.
+            queue.add(new Node(new ChunkPos(node.pos.x() + 1, node.pos.z()), node.distance + 1));
+            queue.add(new Node(new ChunkPos(node.pos.x() - 1, node.pos.z()), node.distance + 1));
+            queue.add(new Node(new ChunkPos(node.pos.x(), node.pos.z() + 1), node.distance + 1));
+            queue.add(new Node(new ChunkPos(node.pos.x(), node.pos.z() - 1), node.distance + 1));
+        }
+        if (request.cancelled) return;
+
+        for (Iterator<ChunkPos> iterator = request.chunks.keySet().iterator(); iterator.hasNext(); ) {
+            ChunkPos pos = iterator.next();
+            int distance = getChunkDist(pos, playerChunkPos);
+
+            if (distance > cutOffRadius) {
+                iterator.remove();
+            }
+        }
+
+        for (HashSet<BlockPos> set : request.blocks.values()) {
+            if (set.size() < CACHED_POSITIONS_PER_BLOCK) {
+                continue;
+            }
+
+            getFirstFewPositions(set, playerPos);
+        }
+
+        // visited = chunks WALKED, scanned = chunks actually re-read. They differ once recency stops
+        // gating the traversal, and the gap is the point: a pass now reaches far more than it re-reads.
+        request.visited = visited.size();
+        request.scanned = scanned;
+        request.ms = (int) (System.currentTimeMillis() - ms);
+        request.succeeded = true;
+    }
+
+    private int getChunkDist(ChunkPos pos1, ChunkPos pos2) {
+        return Math.abs(pos1.x() - pos2.x()) + Math.abs(pos1.z() - pos2.z());
+    }
+
+
+    //TODO rename
+    private void getFirstFewPositions(HashSet<BlockPos> set, Vec3 playerPos) {
+        Queue<BlockPos> queue = new PriorityQueue<>(Comparator.comparingDouble((pos) -> -BaritoneHelper.calculateGenericHeuristic(playerPos, WorldHelper.toVec3d(pos))));
+
+        for (BlockPos pos : set) {
+            queue.add(pos);
+
+            if (queue.size() > CACHED_POSITIONS_PER_BLOCK) {
+                queue.poll();
+            }
+        }
+
+        set.clear();
+
+        for (int i = 0; i < CACHED_POSITIONS_PER_BLOCK && !queue.isEmpty(); i++) {
+            set.add(queue.poll());
+        }
+    }
+
+    /**
+     * scans a chunk and adds block positions corresponding to a specific block in a list
+     *
+     * @param chunkPos position of the scanned chunk
+     */
+    private void scanChunk(ScanRequest request, ChunkPos chunkPos, ChunkPos playerChunkPos) {
+        Level world = request.world;
+        LevelChunk chunk = world.getChunk(chunkPos.x(), chunkPos.z());
+        request.chunks.put(chunkPos, request.worldTime);
+
+        boolean isPriorityChunk = getChunkDist(chunkPos, playerChunkPos) <= 2;
+
+        for (int x = chunkPos.getMinBlockX(); x <= chunkPos.getMaxBlockX(); x++) {
+            for (int y = world.getMinY(); y < world.getHeight(); y++) {
+                if (request.cancelled) return;
+                for (int z = chunkPos.getMinBlockZ(); z <= chunkPos.getMaxBlockZ(); z++) {
+                    BlockPos p = new BlockPos(x, y, z);
+                    if (request.excluded.contains(p) || world.isOutsideBuildHeight(p)) continue;
+
+                    BlockState state = chunk.getBlockState(p);
+                    if (state.isAir()) continue;
+
+                    Block block = state.getBlock();
+                    if (request.blocks.containsKey(block)) {
+                        HashSet<BlockPos> set = request.blocks.get(block);
+
+                        if ((set.size() > CACHED_POSITIONS_PER_BLOCK * 750 && !isPriorityChunk)) continue;
+
+                        set.add(p);
+                    } else {
+                        HashSet<BlockPos> set = new HashSet<>();
+                        set.add(p);
+                        request.blocks.put(block, set);
+                    }
+                }
+            }
+        }
+    }
+
+    private record Node(ChunkPos pos, int distance) {
+    }
+
+    private static final class ScanRequest {
+        // World identity and player/search inputs are fixed for this request.
+        // Chunk contents still come from the live captured world off-thread;
+        // C4.1's immutable chunk-state cache remains separate, open work.
+        final Level world;
+        final ChunkPos playerChunk;
+        final Vec3 playerPos;
+        final long worldTime;
+        final HashMap<Block, HashSet<BlockPos>> blocks;
+        final HashMap<ChunkPos, Long> chunks;
+        final Set<BlockPos> excluded;
+        volatile boolean cancelled;
+        volatile boolean completed;
+        boolean succeeded;
+        int visited, scanned, ms;
+
+        ScanRequest(Level world, ChunkPos playerChunk, Vec3 playerPos, long worldTime,
+                    HashMap<Block, HashSet<BlockPos>> blocks, HashMap<ChunkPos, Long> chunks,
+                    Set<BlockPos> excluded) {
+            this.world = world;
+            this.playerChunk = playerChunk;
+            this.playerPos = playerPos;
+            this.worldTime = worldTime;
+            this.blocks = blocks;
+            this.chunks = chunks;
+            this.excluded = excluded;
+        }
+    }
+
+
+}

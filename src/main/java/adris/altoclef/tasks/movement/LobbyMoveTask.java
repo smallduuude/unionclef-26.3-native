@@ -1,0 +1,65 @@
+package adris.altoclef.tasks.movement;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.time.TimerGame;
+import kaptainwutax.tungsten.path.movements.Input;
+
+/**
+ * Will move around randomly while holding shift
+ * Used to escape weird situations where baritone doesn't work.
+ */
+public class LobbyMoveTask extends Task {
+
+    private final TimerGame _lookTimer;
+    private boolean _elapsed = false;
+
+    public LobbyMoveTask(float randomLookInterval) {
+        _lookTimer  = new TimerGame(randomLookInterval);
+    }
+    public LobbyMoveTask() {
+        this(5);
+    }
+
+    @Override
+    protected void onStart() {
+        _lookTimer.reset();
+    }
+
+    @Override
+    protected Task onTick() {
+        AltoClef mod = AltoClef.getInstance();
+
+        if (_lookTimer.elapsed()) {
+            Debug.logMessage("Moving to the lobby...");
+            _lookTimer.reset();
+            _elapsed = true;
+            //LookHelper.randomOrientation(mod);
+        }
+
+        mod.getInputControls().hold(Input.MOVE_BACK);
+        return null;
+    }
+
+    @Override
+    protected void onStop(Task interruptTask) {
+        AltoClef mod = AltoClef.getInstance();
+        mod.getInputControls().release(Input.MOVE_BACK);
+    }
+
+    @Override
+    public boolean isFinished() {
+        return _elapsed;
+    }
+
+    @Override
+    protected boolean isEqual(Task other) {
+        return other instanceof LobbyMoveTask;
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "Lobby moving";
+    }
+}

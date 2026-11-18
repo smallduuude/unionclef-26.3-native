@@ -1,0 +1,194 @@
+package adris.altoclef.tasks.entity;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.tasks.movement.GetCloseToBlockTask;
+import adris.altoclef.tasks.movement.GetToEntityTask;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.helpers.ItemHelper;
+import adris.altoclef.util.helpers.LookHelper;
+import adris.altoclef.util.helpers.WorldHelper;
+import adris.altoclef.util.time.TimerGame;
+import kaptainwutax.tungsten.path.movements.Input;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.phys.Vec3;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Random;
+
+public class ShiftEntityTask extends AbstractDoToEntityTask {
+
+    private Entity _target;
+    private String _targetName;
+    private int _phase = 0;
+    private double _interactDistance = 2.5d;
+    private double _shiftDistance = 0.7d;
+    private double _stopDistance = 0.2d;
+
+    public enum ShiftType {
+        Back,
+        Forward,
+        Any
+    }
+
+    public ShiftType _shiftType;
+    private final TimerGame _shiftTimer = new TimerGame(0.1);
+
+    public ShiftEntityTask(Entity target, ShiftType type) {
+        super(2, -1, -1);
+        _target = target;
+        _shiftType = type;
+    }
+
+    public ShiftEntityTask(String target, ShiftType type) {
+        super(2, -1, -1);
+        _targetName = target;
+        _shiftType = type;
+    }
+
+    public ShiftEntityTask(String target) {
+        // ⛔ FIXED 2026-09-05: nextInt(length - 1) excludes the LAST enum constant entirely --
+        // with 3 ShiftType values this only ever picked Back(0) or Forward(1), never Any(2).
+        // Random.nextInt(bound) already returns [0, bound), so the "random type" constructors
+        // never needed the -1 and it silently made a third of the values unreachable.
+        this(target, ShiftType.values()[new Random().nextInt(ShiftType.values().length)]);
+    }
+
+    public ShiftEntityTask(Entity target) {
+        this(target, ShiftType.values()[new Random().nextInt(ShiftType.values().length)]);
+    }
+
+    @Override
+    protected Optional<Entity> getEntityTarget(AltoClef mod) {
+        if (_target == null) {
+            if (_targetName != null && mod.getEntityTracker().isPlayerLoaded(_targetName)) {
+                return mod.getEntityTracker().getPlayerEntity(_targetName).map(Entity.class::cast);
+            }
+            return Optional.empty();
+        }
+        // if we constructed via entity
+        if (_target instanceof Player && _targetName == null) {
+            _targetName = _target.getName().getString();
+        }
+        return Optional.of(_target);
+    }
+
+    @Override
+    protected boolean isSubEqual(AbstractDoToEntityTask other) {
+        if (other instanceof ShiftEntityTask task) {
+            return Objects.equals(task._target, _target);
+        }
+        return false;
+    }
+
+    @Override
+    protected Task onEntityInteract(AltoClef mod, Entity entity) {
+        if (entity != null && entity.getName() != null)
+            setDebugState("target = " + entity.getName().getString());
+
+        double yDiff = entity.position().y() - mod.getPlayer().position().y();
+        boolean canShift = LookHelper.canHitEntity(mod, entity, (float) _interactDistance) && yDiff <= 1d;
+        boolean tooClose;
+        boolean shifting;
+        double yBorder = 0.9f;
+
+        if (!canShift) {
+            return new GetToEntityTask(entity);
+        }
+        if (_shiftType.equals(ShiftType.Any)) {
+            LookHelper.smoothLook(mod, entity);
+            tooClose = mod.getPlayer().position().closerThan(entity.position(), _stopDistance);
+            shifting = mod.getPlayer().position().closerThan(entity.position(), _shiftDistance);
+        } else {
+            Vec3 targetPos = entity.getEyePosition();
+            Vec3 originPos = mod.getPlayer().getEyePosition();
+            // Calculate position behind the entity
+            float entityYaw = entity.getVisualRotationYInDegrees();
+            double offsetX = -Math.sin(Math.toRadians(entityYaw));
+            double offsetZ = Math.cos(Math.toRadians(entityYaw));
+
+            if (_shiftType.equals(ShiftType.Forward)) {
+                targetPos = targetPos.add(
+                        offsetX * _stopDistance,
+                        0d,
+                        offsetZ * _stopDistance
+                );
+
+                yDiff = (entity.getEyePosition().y() - mod.getPlayer().position().y());
+                yBorder = 0.8d;
+                originPos = mod.getPlayer().position().add(new Vec3(0d, 0.5d, 0d));
+                BlockPos targetBlockPos = WorldHelper.toBlockPos(targetPos);
+                if (WorldHelper.isSolidBlock(targetBlockPos) && !originPos.closerThan(targetPos, 2d)) {
+                    return new GetCloseToBlockTask(targetBlockPos);
+                }
+            } else if (_shiftType.equals(ShiftType.Back)) {
+                targetPos = targetPos.add(
+                        -offsetX * _stopDistance,
+                        0d,
+                        -offsetZ * _stopDistance
+                );
+            }
+            // Look at the position behind the entity
+            tooClose = originPos.closerThan(targetPos, _stopDistance, 1d);
+            shifting = originPos.closerThan(targetPos, _shiftDistance, 1d);
+            if (tooClose) {
+                LookHelper.smoothLook(mod, new Vec3(entity.getEyePosition().x(), mod.getPlayer().getEyePosition().y() - 0.3, entity.getEyePosition().z()));
+            } else {
+                LookHelper.smoothLook(mod, new Vec3(targetPos.x(), mod.getPlayer().getEyePosition().y() - 0.3, targetPos.z()));
+            }
+        }
+
+        if (yDiff >= yBorder) {
+            mod.getInputControls().hold(Input.JUMP);
+        } else {
+            mod.getInputControls().release(Input.JUMP);
+        }
+
+        if (shifting) {
+            if (_phase == 0) {
+                mod.getInputControls().hold(Input.SNEAK);
+            } else {
+                mod.getInputControls().release(Input.SNEAK);
+            }
+        } else {
+            mod.getInputControls().release(Input.SNEAK);
+        }
+
+        if (tooClose) {
+            if (mod.getPlayer().getDeltaMovement().horizontalDistanceSqr() > 0.0025) {
+                mod.getInputControls().hold(Input.MOVE_BACK);
+            } else {
+                mod.getInputControls().release(Input.MOVE_BACK);
+            }
+            mod.getInputControls().release(Input.SPRINT);
+            mod.getInputControls().release(Input.MOVE_FORWARD);
+        } else {
+            mod.getInputControls().release(Input.MOVE_BACK);
+            mod.getInputControls().hold(Input.SPRINT);
+            mod.getInputControls().hold(Input.MOVE_FORWARD);
+        }
+
+        if (_shiftTimer.elapsed()) {
+            if (_phase > 0) {
+                _phase = 0;
+            } else {
+                _phase += 1;
+            }
+            _shiftTimer.reset();
+        }
+        return null;
+    }
+
+    public boolean equipShiftItem(AltoClef mod) {
+        if (!ItemHelper.hasItems(mod, ItemHelper.FunnyShiftItems)) {
+            return false;
+        }
+        return mod.getSlotHandler().forceEquipItem(ItemHelper.FunnyShiftItems, true);
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "Ducking " + _shiftType.toString() + " of target";
+    }
+}

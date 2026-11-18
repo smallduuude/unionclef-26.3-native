@@ -1,0 +1,78 @@
+package adris.altoclef.tasks.movement;
+
+import adris.altoclef.control.Nav;
+import adris.altoclef.AltoClef;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.goals.AltoGoal;
+import adris.altoclef.util.helpers.BaritoneHelper;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.monster.skeleton.Skeleton;
+import net.minecraft.world.phys.Vec3;
+
+public class RunAwayFromHostilesTask extends CustomBaritoneGoalTask {
+
+    private final double distanceToRun;
+    private final boolean includeSkeletons;
+
+    public RunAwayFromHostilesTask(double distance, boolean includeSkeletons) {
+        distanceToRun = distance;
+        this.includeSkeletons = includeSkeletons;
+    }
+
+    public RunAwayFromHostilesTask(double distance) {
+        this(distance, false);
+    }
+
+
+    /**
+     * OFF BARITONE'S GOAL TYPE, AND IT IS THE LIVE READ THAT MADE THIS AWKWARD.
+     *
+     * <p>{@code CustomBaritoneGoalTask} caches the goal object for the life of the task, so a
+     * snapshot flee would send the bot to wherever the mobs stood when it started running and
+     * leave it there. {@link AltoGoal.FleeLive} checks completion against live positions and supplies immutable threat snapshots
+     * to the condition-goal planner. New searches never reuse a stale centroid.
+     */
+    @Override
+    protected AltoGoal newAltoGoal(AltoClef mod) {
+        // We want to run away NOW
+        Nav.cancel();
+        return new AltoGoal.FleeLive(
+                () -> hostiles(mod).stream()
+                        .map(e -> new net.minecraft.world.phys.Vec3(e.getX(), e.getY(), e.getZ()))
+                        .collect(Collectors.toList()),
+                () -> mod.getPlayer() == null ? null : mod.getPlayer().position(),
+                distanceToRun);
+    }
+
+    /** The hostiles this task runs from — skeletons only when asked, as before. */
+    private List<Entity> hostiles(AltoClef mod) {
+        // Retain threats through the requested separation and the flee goal's two-block
+        // destination margin. A fixed detection radius can otherwise end a longer retreat early.
+        Stream<LivingEntity> stream = mod.getEntityTracker().getTrackedHostiles().stream()
+                .filter(hostile -> hostile.closerThan(mod.getPlayer(), distanceToRun + 2));
+        synchronized (BaritoneHelper.MINECRAFT_LOCK) {
+            if (!includeSkeletons) {
+                stream = stream.filter(hostile -> !(hostile instanceof Skeleton));
+            }
+            return stream.collect(Collectors.toList());
+        }
+    }
+
+    @Override
+    protected boolean isEqual(Task other) {
+        if (other instanceof RunAwayFromHostilesTask task) {
+            return Math.abs(task.distanceToRun - distanceToRun) < 1;
+        }
+        return false;
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "NIGERUNDAYOO, SUMOOKEYY! distance="+ distanceToRun +", skeletons="+ includeSkeletons;
+    }
+
+}

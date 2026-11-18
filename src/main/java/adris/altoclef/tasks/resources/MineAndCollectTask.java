@@ -1,0 +1,735 @@
+package adris.altoclef.tasks.resources;
+
+import adris.altoclef.control.BaritoneBridge;
+import adris.altoclef.control.Nav;
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.multiversion.blockpos.BlockPosVer;
+import adris.altoclef.tasks.AbstractDoToClosestObjectTask;
+import adris.altoclef.tasks.ResourceTask;
+import adris.altoclef.tasks.construction.DestroyBlockTask;
+import adris.altoclef.tasks.movement.PickupDroppedItemTask;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.ItemTarget;
+import adris.altoclef.util.MiningRequirement;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.helpers.WorldHelper;
+import adris.altoclef.util.progresscheck.MovementProgressChecker;
+import adris.altoclef.util.slots.CursorSlot;
+import adris.altoclef.util.slots.PlayerSlot;
+import adris.altoclef.util.time.TimerGame;
+import java.util.*;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import com.mojang.datafixers.util.Pair;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.phys.Vec3;
+
+public class MineAndCollectTask extends ResourceTask {
+
+    /** Times the gather was handed to Baritone's mine process. Read as {@code baritoneMines}. */
+    public static volatile int baritoneMines;
+
+    private final Block[] _blocksToMine;
+
+    private final MiningRequirement _requirement;
+
+    private final TimerGame _cursorStackTimer = new TimerGame(3);
+
+    private final MineOrCollectTask _subtask;
+
+    public MineAndCollectTask(ItemTarget[] itemTargets, Block[] blocksToMine, MiningRequirement requirement) {
+        super(itemTargets);
+        _requirement = requirement;
+        _blocksToMine = blocksToMine;
+        _subtask = new MineOrCollectTask(_blocksToMine, this.itemTargets);
+    }
+
+    public MineAndCollectTask(ItemTarget[] blocksToMine, MiningRequirement requirement) {
+        this(blocksToMine, itemTargetToBlockList(blocksToMine), requirement);
+    }
+
+    public MineAndCollectTask(ItemTarget target, Block[] blocksToMine, MiningRequirement requirement) {
+        this(new ItemTarget[]{target}, blocksToMine, requirement);
+    }
+
+    public MineAndCollectTask(Item item, int count, Block[] blocksToMine, MiningRequirement requirement) {
+        this(new ItemTarget(item, count), blocksToMine, requirement);
+    }
+
+    /**
+     * Gate which target blocks may be mined by an extra per-position test (ANDed with the usual
+     * reachable/breakable checks). Fluent, so a caller can write {@code new MineAndCollectTask(...)
+     * .withTargetFilter(p -> ...)}. Null (the default) is the unchanged behaviour. Used by the
+     * obsidian collect to refuse obsidian sitting against lava.
+     */
+    public MineAndCollectTask withTargetFilter(java.util.function.Predicate<net.minecraft.core.BlockPos> filter) {
+        _subtask.setTargetFilter(filter);
+        return this;
+    }
+
+    public static Block[] itemTargetToBlockList(ItemTarget[] targets) {
+        List<Block> result = new ArrayList<>(targets.length);
+        for (ItemTarget target : targets) {
+            for (Item item : target.getMatches()) {
+                Block block = Block.byItem(item);
+                if (block != null && !WorldHelper.isAir(block)) {
+                    result.add(block);
+                }
+            }
+        }
+        return result.toArray(Block[]::new);
+    }
+
+    @Override
+    protected void onResourceStart(AltoClef mod) {
+        mod.getBehaviour().push();
+
+        // We're mining, so don't throw away pickaxes.
+        mod.getBehaviour().addProtectedItems(Items.WOODEN_PICKAXE, Items.STONE_PICKAXE, Items.IRON_PICKAXE, Items.DIAMOND_PICKAXE, Items.NETHERITE_PICKAXE);
+
+        _subtask.resetSearch();
+    }
+
+    @Override
+    protected boolean shouldAvoidPickingUp(AltoClef mod) {
+        // Picking up is controlled by a separate task here.
+        return true;
+    }
+
+    /** Times the tool gate was skipped because the target was already lying on the floor. */
+    public static volatile int toolGateSkipped;
+    /** G57: ticks the drops-only chooser had no drop to choose and the tool became the job. */
+    public static volatile int dropsOnlyNoDrop;
+
+    @Override
+    protected Task onResourceTick(AltoClef mod) {
+        // ⛔ A DROP ON THE FLOOR NEEDS NO PICKAXE, AND THIS GATE MADE THE BOT BLIND TO ONE.
+        //
+        // Two lines in this class disagree, and between them they hide a drop completely:
+        //
+        //   shouldAvoidPickingUp() returns TRUE, on the grounds that "picking up is controlled by
+        //   a separate task here" -- which switches OFF ResourceTask's own pickup block; and
+        //   this gate returns SatisfyMiningRequirementTask BEFORE that separate task (_subtask,
+        //   the MineOrCollectTask that actually considers drops) ever gets to run.
+        //
+        // So while the requirement is unmet the bot has no pickup path at all. Measured on
+        // pickup_pit, a course built for exactly this: RTGATE targets=[[diamond]] avoid=true
+        // dropped=true -- the tracker HAD the diamond and the pickup block was skipped anyway --
+        // with idrop=0/0/0/0 and scan=0 confirming the separate task never ran. The bot spent the
+        // whole run trying to craft an iron pickaxe, hunting wood on a stone arena, while the
+        // diamond it had been sent for lay eight blocks away (et=1247/1247, seen every tick).
+        //
+        // On the playthrough this is worse than a lost course: every ore the bot mines drops an
+        // item, and any interruption that leaves the requirement unmet makes those drops invisible.
+        //
+        // The rule is simply that a tool is needed to BREAK a block, not to walk over a drop. If
+        // the thing we were sent for is already on the ground, collect it and let the tool wait.
+        if (!StorageHelper.miningRequirementMet(_requirement)) {
+            if (kaptainwutax.tungsten.TungstenConfig.get().collectDropsBeforeTools
+                    && mod.getEntityTracker().itemDropped(itemTargets)) {
+                // ⛔ THE DROP, AND ONLY THE DROP (G57, 2026-09-11). Skipping the tool gate let
+                // the chooser below pick a BLOCK when the block scored closer than the drop, and
+                // the bot punched stone bare-handed with no pickaxe in the pack: 7.5 s a block
+                // against a give-up clock of five -- eleven stone blocks tried, none broken, the
+                // 19:08 recording standing two minutes at (1820,62,683) with dbToolEquipped=0.
+                // With the requirement unmet the blocks are off the table; when no drop can be
+                // chosen either (banned, blacklisted), the tool is the job after all.
+                _subtask.setDropsOnly(true);
+                if (_subtask.wasWandering()) {
+                    dropsOnlyNoDrop++;
+                    return new SatisfyMiningRequirementTask(_requirement);
+                }
+                toolGateSkipped++;
+                setDebugState("Collecting a drop instead of crafting a tool for it");
+                return _subtask;
+            }
+            _subtask.setDropsOnly(false);
+            return new SatisfyMiningRequirementTask(_requirement);
+        }
+        _subtask.setDropsOnly(false);
+
+        // ── ENGINE: LET BARITONE MINE IT ──────────────────────────────────────────────────────
+        // altoclef's own miner aims at the target, and when the ray is blocked it mines whatever the
+        // cursor hit — reported by the operator as "it will break a block blocking the cursor from
+        // the bed instead of just going closer". Baritone's mine process does the part that kept
+        // going wrong: it picks a target it can reach, walks to a position it can be mined from, and
+        // mines THAT block. So while Baritone is the chosen engine, it mines and we collect.
+        //
+        // Drops are ours by construction: `mineScanDroppedItems` is set false when we configure
+        // Baritone, so it does not chase them and ResourceTask's own pickup — which runs BEFORE this
+        // method on every tick — picks them up. One owner per job.
+        //
+        // ONE REQUEST, NOT ONE PER TICK: re-issuing would restart the process every tick, which is
+        // the replan-thrash this project has already paid for twice.
+        if (BaritoneBridge.selected() && _blocksToMine != null && _blocksToMine.length > 0) {
+            int need = 0;
+            for (ItemTarget t : itemTargets) {
+                need += Math.max(0, t.getTargetCount() - mod.getItemStorage().getItemCount(t.getMatches()));
+            }
+            if (need > 0 && !BaritoneBridge.isMining()) {
+                if (BaritoneBridge.mineBlocks(need, _blocksToMine)) {
+                    baritoneMines++;
+                    setDebugState("Baritone mining " + need + " of " + _blocksToMine.length + " block kind(s)");
+                }
+            } else {
+                setDebugState("Baritone mining (waiting)");
+            }
+            return null;
+        }
+
+        if (_subtask.isMining()) {
+            makeSureToolIsEquipped(mod);
+        }
+
+        // Wrong dimension check.
+        if (_subtask.wasWandering() && isInWrongDimension(mod) && !mod.getBlockScanner().anyFound(_blocksToMine)) {
+            return getToCorrectDimensionTask(mod);
+        }
+
+        return _subtask;
+    }
+
+    @Override
+    protected void onResourceStop(AltoClef mod, Task interruptTask) {
+        // Baritone's mine process outlives the task that asked for it, the same way a tungsten
+        // search does — so a gather that ends (fulfilled, interrupted or given up) must tell it to
+        // stop, or it keeps mining for a job nobody is waiting for.
+        if (BaritoneBridge.selected()) {
+            BaritoneBridge.cancelMining();
+        }
+        mod.getBehaviour().pop();
+    }
+
+    @Override
+    protected boolean isEqualResource(ResourceTask other) {
+        if (other instanceof MineAndCollectTask task) {
+            return Arrays.equals(task._blocksToMine, _blocksToMine);
+        }
+        return false;
+    }
+
+    @Override
+    protected String toDebugStringName() {
+        return "Mine And Collect";
+    }
+
+    /**
+     * Times a better tool was moved from the cursor into the hand mid-mining. Read as toolSwap.
+     * It was structurally 0 on 1.21.11 before this was ported -- the body was switched off.
+     */
+    public static volatile int toolSwaps;
+
+    private void makeSureToolIsEquipped(AltoClef mod) {
+        if (_cursorStackTimer.elapsed() && !mod.getFoodChain().needsToEat()) {
+            assert Minecraft.getInstance().player != null;
+            ItemStack cursorStack = StorageHelper.getItemStackInCursorSlot();
+            if (cursorStack != null && !cursorStack.isEmpty()) {
+                // We have something in our cursor stack
+                Item item = cursorStack.getItem();
+                net.minecraft.world.level.block.state.BlockState mining = mod.getWorld().getBlockState(_subtask.miningPos());
+                if (item.getDefaultInstance().isCorrectToolForDrops(mining)) {
+                    // ASK WHAT THE TOOLS DO TO THIS BLOCK, NOT WHAT CLASS THEY ARE.
+                    //
+                    // On 1.21.11 this whole body was switched off -- the mining-tool CLASS was
+                    // deleted in that version and the port left a TODO where the comparison used
+                    // to be -- so the bot never moved a better pickaxe from its cursor into its
+                    // hand while mining. It would pick one up and carry on with whatever was
+                    // already equipped, including a bare hand.
+                    //
+                    // Comparing mining SPEED on the block in front of us needs no version fork at
+                    // all: getMiningSpeedMultiplier and isSuitableFor both exist unchanged in 1.21.1
+                    // and 1.21.11. It is also a truer question than the old one, which asked about
+                    // tool tiers and so could only ever rank pickaxes against pickaxes. The old
+                    // `else` branch equipped ANY mining tool over a non-mining one even when that
+                    // was a downgrade; a speed comparison cannot make that mistake. An empty hand
+                    // scores 1.0, so a pickaxe wins on stone by arithmetic rather than by a special
+                    // case, and axes, shovels and shears are handled by the same line for free.
+                    ItemStack equipped = StorageHelper.getItemStackInSlot(PlayerSlot.getEquipSlot());
+                    if (item.getDefaultInstance().getDestroySpeed(mining)
+                            > equipped.getDestroySpeed(mining)) {
+                        toolSwaps++;
+                        mod.getSlotHandler().forceEquipSlot(CursorSlot.SLOT);
+                    }
+                }
+            }
+            _cursorStackTimer.reset();
+        }
+    }
+
+    public static class MineOrCollectTask extends AbstractDoToClosestObjectTask<Object> {
+
+        private final Block[] _blocks;
+        private final ItemTarget[] _targets;
+        private final Set<BlockPos> blacklist = new HashSet<>();
+        private final MovementProgressChecker progressChecker = new MovementProgressChecker();
+        private final Task _pickupTask;
+        private BlockPos miningPos;
+        /** Optional extra gate on which target blocks may be chosen/kept; null = no gate (default). */
+        private java.util.function.Predicate<BlockPos> _targetFilter = null;
+
+        public MineOrCollectTask(Block[] blocks, ItemTarget[] targets) {
+            _blocks = blocks;
+            _targets = targets;
+            _pickupTask = new PickupDroppedItemTask(_targets, true);
+        }
+
+        public void setTargetFilter(java.util.function.Predicate<BlockPos> filter) { _targetFilter = filter; }
+
+        @Override
+        protected Vec3 getPos(AltoClef mod, Object obj) {
+            if (obj instanceof BlockPos b) {
+                return WorldHelper.toVec3d(b);
+            }
+            if (obj instanceof ItemEntity item) {
+                return item.position();
+            }
+            throw new UnsupportedOperationException("Shouldn't try to get the position of object " + obj + " of type " + (obj != null ? obj.getClass().toString() : "(null object)"));
+        }
+
+        /**
+         * How far the chosen mining target actually is, and how often it is absurd.
+         *
+         * <p>Sampled during a sixteen-minute ladder stall, the bot stood at (90.9, 127.0,
+         * -66.6) and spent 35.6% of the samples walking to an acacia log at (1800, 64, 361)
+         * -- about eighteen hundred blocks away -- while a log at (80, 133, -44), thirty
+         * blocks away, took 13.3%. "Nearest" is returning something unreachable in practice,
+         * and a run spent walking toward it climbs no rungs at all.
+         */
+        public static volatile int minePickFar, minePickTotal, minePickFarthest;
+        /** Every call, and the calls that chose a DROP -- so minePickTotal=0 can be read.
+         *  Kept only in the block branch it could not tell "no block was ever picked" from
+         *  "the task never ran", and a 20-minute run read 0/0 while an earlier one read 6723. */
+        public static volatile int minePickCalls, minePickDrop;
+
+        /** Beyond this the walk costs more than the whole run is worth. */
+        private static final double MINE_PICK_FAR_BLOCKS = 160.0D;
+
+        /** G57: with the mining requirement unmet only DROPS may be chosen (see onResourceTick). */
+        private boolean dropsOnly = false;
+
+        public void setDropsOnly(boolean v) { dropsOnly = v; }
+
+        @Override
+        protected Optional<Object> getClosestTo(AltoClef mod, Vec3 pos) {
+            minePickCalls++;
+            Pair<Double, Optional<BlockPos>> closestBlock = dropsOnly
+                    ? new Pair<>(Double.POSITIVE_INFINITY, Optional.empty())
+                    : getClosestBlock(mod,pos,  _targetFilter, _blocks);
+            Pair<Double, Optional<ItemEntity>> closestDrop = getClosestItemDrop(mod,pos,  _targets);
+
+            double blockSq = closestBlock.getFirst();
+            double dropSq = closestDrop.getFirst();
+
+            // We can't mine right now.
+            if (mod.getExtraBaritoneSettings().isInteractionPaused()) {
+                return closestDrop.getSecond().map(Object.class::cast);
+            }
+
+            if (dropSq <= blockSq) {
+                minePickDrop++;
+                return closestDrop.getSecond().map(Object.class::cast);
+            } else {
+                // A TARGET YOU CANNOT REACH THIS RUN IS NOT A TARGET. Counted before it is
+                // acted on: minePickFar over minePickTotal, with the worst distance kept.
+                if (closestBlock.getSecond().isPresent()) {
+                    minePickTotal++;
+                    double d = Math.sqrt(blockSq);
+                    // THE MAXIMUM IS TRACKED ALWAYS, NOT ONLY WHEN IT IS ALREADY ALARMING.
+                    // Kept inside the far branch it read max0 on a clean run, which cannot be
+                    // told apart from a counter that never ran. Unconditional, the same field
+                    // says "the worst pick this run was forty blocks" -- a zero that means
+                    // something. Ninth instrument corrected this session, before it was quoted.
+                    if ((int) d > minePickFarthest) minePickFarthest = (int) d;
+                    if (d > MINE_PICK_FAR_BLOCKS) {
+                        minePickFar++;
+                        if (kaptainwutax.tungsten.TungstenConfig.get().mineRefusesUnreachableTargets) {
+                            return Optional.empty();
+                        }
+                    }
+                }
+                return closestBlock.getSecond().map(Object.class::cast);
+            }
+        }
+
+        /** Times the tracker was asked about drops, and times it said there were some. Read as drop=asked/seen.
+         *  rcon says three cobblestone entities are lying in the arena while the pack stays empty and the
+         *  pickup task never ticks -- so whether the tracker AGREES that a drop exists is the question. */
+        public static volatile int dropAsked, dropSeen;
+
+        /** Squared distance inside which a drop is "already here" and needs no anti-ping-pong tax. */
+        private static final double NEAR_DROP_SQ = 9.0;
+        /** G72: how far the body drops for free before every further block down is a dig. */
+        private static final double SAFE_FALL_BLOCKS = 3.0;
+        /** G72: a dug block costs about five walked blocks (23 ticks against 4.6, FastPlanner's own
+         *  numbers), so a drop's vertical leg below the safe fall is stretched by this before the
+         *  squared-distance comparison with the nearest block. */
+        private static final double DIG_WALKS_PER_BLOCK = 5.0;
+        /** G72: drops whose descent was priced as a dig in the drop-versus-block comparison. */
+        public static volatile int dropDeepRepriced;
+        /** The historical handicap, kept for drops far enough away that walking to them costs time. */
+        private static final double DROP_MINING_PENALTY = 10.0;
+
+        /** Times the near-drop exemption actually changed the comparison. Read as drop's 3rd. */
+        public static volatile int dropNearExempt;
+
+        /** Candidates the block filter saw: accepted / rejected as unreachable / rejected as unbreakable.
+         *  Read as scan=ok/unreach/nobreak. */
+        public static volatile int scanAccepted, scanUnreachable, scanNoBreak;
+        public static volatile int scanUnderfoot;
+        /** Candidates rejected for being below standing height while the surface still had some. */
+        public static volatile int scanBelowFeet;
+
+        public static Pair<Double, Optional<ItemEntity>> getClosestItemDrop(AltoClef mod,Vec3 pos, ItemTarget... items) {
+            Optional<ItemEntity> closestDrop = Optional.empty();
+            dropAsked++;
+            if (mod.getEntityTracker().itemDropped(items)) {
+                dropSeen++;
+                closestDrop = mod.getEntityTracker().getClosestItemDrop(pos, items);
+            }
+
+            // ⛔ THE +10 IS A HANDICAP IN SQUARED-DISTANCE SPACE, AND IT IS WHY A DROP AT THE BOT'S
+            // FEET LOSES TO AN ORE FOUR BLOCKS AWAY.
+            //
+            // getClosestTo below compares `dropSq <= blockSq` with this penalty already added to
+            // the drop and nothing added to the block. Ten in SQUARED space is not a small nudge:
+            // a drop lying 2.6 blocks away (h=2.4, dy=-1.0, the geometry measured on every failing
+            // mine_coal run) scores 16.8, so any ore inside 4.1 blocks beats it. On a course whose
+            // ore sits in a cluster there is always such an ore, so collection is deferred to the
+            // end of the run every time -- which is precisely when the drops are lying in the holes
+            // the bot has just dug, and when the barren locks happen.
+            //
+            // The penalty's stated purpose -- "stop the bot ping-ponging away from its mining spot
+            // for every item" -- is real, and it is about drops far enough away that walking there
+            // costs something. It has no business applying to a drop the bot could TOUCH by taking
+            // one step, where collecting costs a step and zero mining time, and where the drop is
+            // the actual objective rather than a distraction from it.
+            //
+            // NEAR_DROP_SQ is 9 (three blocks). Eleven of the thirteen recorded failure geometries
+            // sit at or under 2.4 blocks horizontal, so this covers the trunk of the distribution
+            // and deliberately leaves the far tail alone.
+            final boolean exempt = kaptainwutax.tungsten.TungstenConfig.get().dropNoPenaltyWhenNear;
+            return new Pair<>(
+                    closestDrop.map(itemEntity -> {
+                        double trueSq = itemEntity.distanceToSqr(pos);
+                        // ⛔ A DROP MORE THAN A FALL BELOW IS REACHED BY DIGGING, AND A DIG IS PRICED
+                        // LIKE A DIG (G72, 2026-09-12). This comparison is in squared blocks, where
+                        // eleven blocks straight down costs the same as eleven blocks across. The
+                        // 22:34 run: a cobblestone that had fallen ELEVEN blocks into a cave beat
+                        // every stone on the hillside, "primDrive NO ROUTE" x47, the block search
+                        // "toward a goal 11 below spent its budget" x8, ninety-four seconds and two
+                        // watchdog give-ups for a block the bot could have mined beside its feet.
+                        // The body falls three blocks for free and digs every one below that at
+                        // about five walks' worth of ticks (23 against 4.6), so the vertical leg
+                        // below the safe fall is stretched by that factor before it is squared: a
+                        // drop eleven down now reads as forty-three away, and any stone inside that
+                        // wins, which is what a player does.
+                        double below = pos.y - itemEntity.getY();
+                        if (below > SAFE_FALL_BLOCKS) {
+                            double dx = itemEntity.getX() - pos.x, dz = itemEntity.getZ() - pos.z;
+                            double dyPriced = SAFE_FALL_BLOCKS + (below - SAFE_FALL_BLOCKS) * DIG_WALKS_PER_BLOCK;
+                            trueSq = dx * dx + dz * dz + dyPriced * dyPriced;
+                            dropDeepRepriced++;
+                        }
+                        if (trueSq > NEAR_DROP_SQ) return trueSq + DROP_MINING_PENALTY;
+                        // COUNT ALWAYS, ACT ONLY WHEN FLAGGED -- otherwise the control arm reads
+                        // zero by construction and the counter cannot say the arms differed.
+                        dropNearExempt++;
+                        return trueSq + (exempt ? 0.0 : DROP_MINING_PENALTY);
+                    }).orElse(Double.POSITIVE_INFINITY),
+                    closestDrop
+            );
+        }
+
+        /** Times the bot was found standing in a hole, and times it was not. Read as scan's 4th/5th. */
+        public static volatile int scanEnclosed;
+
+        /**
+         * Is the bot standing in a hole -- solid ground on every side at its OWN feet level?
+         *
+         * <p>Four cardinals only. A diagonal is not what traps you: you can leave a pit through a
+         * cardinal gap and cannot leave through a diagonal one, because the body is a box. The
+         * 1x1 shaft this exists for is enclosed on all four.
+         */
+        private static boolean enclosedAtFeet(AltoClef mod, int feetY) {
+            try {
+                BlockPos feet = new BlockPos(mod.getPlayer().blockPosition().getX(), feetY,
+                        mod.getPlayer().blockPosition().getZ());
+                for (net.minecraft.core.Direction d
+                        : new net.minecraft.core.Direction[]{
+                        net.minecraft.core.Direction.NORTH,
+                        net.minecraft.core.Direction.SOUTH,
+                        net.minecraft.core.Direction.EAST,
+                        net.minecraft.core.Direction.WEST}) {
+                    if (!WorldHelper.isSolidBlock(feet.relative(d))) {
+                        return false;
+                    }
+                }
+                scanEnclosed++;
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        public static Pair<Double,Optional<BlockPos> > getClosestBlock(AltoClef mod,Vec3 pos ,Block... blocks) {
+            return getClosestBlock(mod, pos, null, blocks);
+        }
+
+        /**
+         * As {@link #getClosestBlock(AltoClef, Vec3, Block...)}, with an OPTIONAL extra per-position
+         * gate ANDed into every candidate scan. Null means "no extra gate" and is byte-for-byte the
+         * old behaviour, so the 37 existing callers are untouched. The obsidian collect uses it to
+         * refuse obsidian sitting against lava -- see CollectObsidianTask (G108, 2026-09-19: the bot
+         * mined the flood's obsidian DOWN into the lake basin and stepped into the lava that the water
+         * had not reached, "tried to swim in lava").
+         */
+        public static Pair<Double,Optional<BlockPos> > getClosestBlock(AltoClef mod,Vec3 pos ,java.util.function.Predicate<BlockPos> extraFilter, Block... blocks) {
+
+            // !! DIGGING THE BLOCK UNDER YOUR OWN FEET IS HOW A BOT BURIES ITSELF.
+            //
+            // DestroyBlockTask.canClear already refuses exactly this, and says why in as many
+            // words -- "clearing that is how a bot digs itself into a hole while trying to see a
+            // tree" -- but that guard governs clearing an OBSTRUCTION, not choosing a TARGET.
+            // Target selection never knew the rule, so on mine_stone the bot standing at y=-60
+            // takes the nearest stone, which is directly beneath it, digs down to -63, lands in a
+            // pit, climbs out onto the arena wall at y=-57 and strands itself where nothing is
+            // reachable. Traced by polling its position once a second through a run.
+            //
+            // REFUSING IT OUTRIGHT WOULD BREAK DESCENDING, and mine_diamond is green today
+            // precisely because the bot can dig down to reach ore. So this PREFERS anything else
+            // and falls back to the underfoot block when it is genuinely the only candidate:
+            // the exclusion runs first, and an empty result retries without it.
+            // !! THE PIT IS THE DEFECT, NOT THE ONE BLOCK UNDER THE FEET.
+            // mineAvoidUnderfoot forbade exactly one position and measured 0.40 sigma, because the
+            // bot descends anyway: it takes a block a step aside, follows it down, and ends up in a
+            // hole. Polling the position through a run shows where the time actually goes --
+            // 75 of 120 seconds oscillating at y=-62/-63 inside its own excavation, four blocks
+            // mined -- and the same pit is what it later climbs out of onto the arena wall, which
+            // is the other 35-45% of runs. One cause, both failure modes.
+            //
+            // So the rule is about the SURFACE, not about a block: while enough candidates remain
+            // at or above standing height, do not choose one below it. Descending still works when
+            // the surface runs out, which is what mine_diamond needs and why it stays green.
+            int feetY = mod.getPlayer() == null ? Integer.MIN_VALUE : mod.getPlayer().blockPosition().getY();
+            if (kaptainwutax.tungsten.TungstenConfig.get().mineStayOnSurface
+                    && feetY != Integer.MIN_VALUE) {
+                // !! THE RULE ABOVE RATCHETED, WHICH IS WHY IT MEASURED NOTHING.
+                //
+                // `check.getY() < feetY - 1` is relative to where the bot is STANDING, and the
+                // floor is always feetY-1 -- so the block under its own feet always passes. Break
+                // it, fall one, and the test re-anchors one level lower and passes the next one
+                // too. The guard descends WITH the bot, one level per swing, exactly as if it were
+                // not there. Traced three times: 0,-61,0 at t=0, y=-62 at 4.4 s, y=-63 at 6.6 s,
+                // then `BFS stuck at 0,-63,0` with all eight neighbours feetBlocked=stone.
+                //
+                // What that costs is not the four blocks. It is that a bot at the bottom of a 1x1
+                // shaft has NO lateral move -- the only direction the search can expand is up --
+                // and it has just mined the blocks that make pillaring affordable. So it towers out
+                // to y=-55, six blocks above the floor, spending the whole haul, and the run ends
+                // with the bot standing on a cobblestone column with an empty pack. Every failure
+                // mode this course has follows from the shaft.
+                //
+                // THE FIX IS TO ASK WHETHER WE ARE IN A HOLE, not how deep we have got. Standing on
+                // open ground, digging down is ordinary and stays allowed -- mine_diamond needs it.
+                // Standing in a pit, with solid ground on every side at our own feet level, digging
+                // down deepens a shaft we already cannot walk out of, and the blocks at our feet
+                // level are its walls: mine one of those instead and we can step out. Stateless, so
+                // it releases the moment the bot is not enclosed, and it cannot ratchet because it
+                // is a question about the WORLD rather than about how far we have fallen.
+                int limit = enclosedAtFeet(mod, feetY) ? feetY : feetY - 1;
+                Optional<BlockPos> onSurface = mod.getBlockScanner().getNearestBlock(pos, check -> {
+                    if (extraFilter != null && !extraFilter.test(check)) return false;
+                    if (check.getY() < limit) {
+                        scanBelowFeet++;
+                        return false;
+                    }
+                    if (mod.getBlockScanner().isUnreachable(check)) return false;
+                    if (!WorldHelper.canBreak(check)) return false;
+                    return true;
+                }, blocks);
+                if (onSurface.isPresent()) {
+                    return new Pair<>(BlockPosVer.getSquaredDistance(onSurface.get(), pos), onSurface);
+                }
+            }
+            BlockPos underfoot = mod.getPlayer() == null ? null : mod.getPlayer().blockPosition().below();
+            if (kaptainwutax.tungsten.TungstenConfig.get().mineAvoidUnderfoot && underfoot != null) {
+                Optional<BlockPos> preferred = mod.getBlockScanner().getNearestBlock(pos, check -> {
+                    if (extraFilter != null && !extraFilter.test(check)) return false;
+                    if (check.equals(underfoot)) {
+                        scanUnderfoot++;
+                        return false;
+                    }
+                    if (mod.getBlockScanner().isUnreachable(check)) return false;
+                    if (!WorldHelper.canBreak(check)) return false;
+                    return true;
+                }, blocks);
+                if (preferred.isPresent()) {
+                    return new Pair<>(BlockPosVer.getSquaredDistance(preferred.get(), pos), preferred);
+                }
+            }
+            Optional<BlockPos> closestBlock = mod.getBlockScanner().getNearestBlock(pos, check -> {
+                if (extraFilter != null && !extraFilter.test(check)) return false;
+
+                // WHY IS THERE NOTHING TO MINE? MEASURE IT, DO NOT GUESS AGAIN.
+                // Four fixes to the wander machinery all measured an identical course score,
+                // because the wander is healthy and the real question is upstream: the parent
+                // re-asks for a wander only because this search comes back EMPTY. These three say
+                // whether candidates existed and were DISCARDED here, and by which of the two
+                // filters -- if the reachable trunk is being rejected as unreachable alongside the
+                // bait, no reset anywhere else can help, because that set lives in the scanner.
+                if (mod.getBlockScanner().isUnreachable(check)) {
+                    scanUnreachable++;
+                    return false;
+                }
+                if (!WorldHelper.canBreak(check)) {
+                    scanNoBreak++;
+                    return false;
+                }
+                scanAccepted++;
+                return true;
+            }, blocks);
+
+            return new Pair<>(
+                    closestBlock.map(blockPos -> BlockPosVer.getSquaredDistance(blockPos, pos)).orElse(Double.POSITIVE_INFINITY),
+                    closestBlock
+            );
+        }
+
+        @Override
+        protected Vec3 getOriginPos(AltoClef mod) {
+            return mod.getPlayer().position();
+        }
+
+        @Override
+        protected Task onTick() {
+            AltoClef mod = AltoClef.getInstance();
+
+            // A SEARCH IS NOT PROGRESS -- the identical defect as in PickupDroppedItemTask, and the
+            // identical two lines. While the pathfinder merely LOOKS, isPathing() is true, so this
+            // reset fires every tick and the "failed to mine, suggest unreachable, blacklist, pick
+            // another block" branch below can never be reached. See Nav.isExecutingRoute.
+            if (kaptainwutax.tungsten.TungstenConfig.get().progressCheckIgnoresSearch
+                    ? Nav.isExecutingRoute() : Nav.isPathing()) {
+                progressChecker.reset();
+            }
+            // A DIG IS PROGRESS TOO (G32, 2026-09-11): while the executor is mining or placing its
+            // way to the block, or a pillar is going up, the body stands still on purpose. The
+            // "failed to mine, unreachable" verdict below must not be reached from that state --
+            // it was, on the dig bench, and condemned reachable stone six blocks under the feet.
+            var exM = kaptainwutax.tungsten.TungstenModDataContainer.EXECUTOR;
+            // ...AND SO IS A ROUTE BEING WALKED (G49, 2026-09-11). The 16:26 recording blacklisted
+            // five logs in twelve seconds ("Failed to mine block. Suggesting it may be
+            // unreachable" x5) while the navigator was walking legs and arriving at them: the
+            // checker asks whether the BODY moved 0.1 blocks in six seconds, and a bot standing
+            // at a leg's end while the next one is planned reads as stuck. A verdict of
+            // "unreachable" belongs to the dig-capable planner, not to a clock; while any driver
+            // owns the route the clock waits.
+            if ((exM != null && (exM.breakQueue != null || exM.placeQueue != null))
+                    || kaptainwutax.tungsten.task.PillarTask.isActive()
+                    || kaptainwutax.tungsten.task.FastNavigator.isActive()
+                    || kaptainwutax.tungsten.task.BlockPathWalker.isRunning()
+                    || kaptainwutax.tungsten.path.movements.MovementQueue.isRunning()) {
+                progressChecker.reset();
+            }
+            if (miningPos != null && !progressChecker.check(mod)) {
+                Nav.cancel();
+                Debug.logMessage("Failed to mine block. Suggesting it may be unreachable.");
+                mod.getBlockScanner().requestBlockUnreachable(miningPos, 2);
+                blacklist.add(miningPos);
+                miningPos = null;
+                progressChecker.reset();
+            }
+            return super.onTick();
+        }
+
+        @Override
+        protected Task getGoalTask(Object obj) {
+            if (obj instanceof BlockPos newPos) {
+                if (miningPos == null || !miningPos.equals(newPos)) {
+                    // COUNT THE RE-CHOICE. The operator saw the bot walking between two
+                    // spots forever, and the switch breakdown put 9-11 of 21 switches on
+                    // 'Getting to block X -> Getting to block Y'. Every one of those is a
+                    // new DestroyBlockTask made right here. Also record how far the target
+                    // jumped: a short hop back and forth is an oscillation, a long one is
+                    // honest progress through a vein.
+                    if (miningPos != null) {
+                        mineRetarget++;
+                        mineRetargetCm = (int) Math.min(
+                                Math.sqrt(miningPos.distSqr(newPos)) * 100.0,
+                                2_000_000_000.0);
+                        if (lastLeft != null && lastLeft.equals(newPos)) mineRetargetBack++;
+                        lastLeft = miningPos;
+                    }
+                    progressChecker.reset();
+                }
+                miningPos = newPos;
+                return new DestroyBlockTask(miningPos);
+            }
+            if (obj instanceof ItemEntity) {
+                miningPos = null;
+                return _pickupTask;
+            }
+            throw new UnsupportedOperationException("Shouldn't try to get the goal from object " + obj + " of type " + (obj != null ? obj.getClass().toString() : "(null object)"));
+        }
+
+        @Override
+        protected boolean isValid(AltoClef mod, Object obj) {
+            if (obj instanceof BlockPos b) {
+                if (_targetFilter != null && !_targetFilter.test(b)) return false;
+                return mod.getBlockScanner().isBlockAtPosition(b, _blocks) && WorldHelper.canBreak(b);
+            }
+            if (obj instanceof ItemEntity drop) {
+                Item item = drop.getItem().getItem();
+                if (_targets != null) {
+                    for (ItemTarget target : _targets) {
+                        if (target.matches(item)) return true;
+                    }
+                }
+                return false;
+            }
+            return false;
+        }
+
+        @Override
+        protected void onStart() {
+            progressChecker.reset();
+            miningPos = null;
+        }
+
+        @Override
+        protected void onStop(Task interruptTask) {
+
+        }
+
+        @Override
+        protected boolean isEqual(Task other) {
+            if (other instanceof MineOrCollectTask task) {
+                return Arrays.equals(task._blocks, _blocks) && Arrays.equals(task._targets, _targets);
+            }
+            return false;
+        }
+
+        @Override
+        protected String toDebugString() {
+            return "Mining or Collecting";
+        }
+
+        public boolean isMining() {
+            return miningPos != null;
+        }
+
+        public BlockPos miningPos() {
+            return miningPos;
+        }
+    }
+
+
+    /** Target-block re-choices, how far the last one jumped, and how many went straight BACK. */
+    public static volatile int mineRetarget, mineRetargetCm, mineRetargetBack;
+    private static net.minecraft.core.BlockPos lastLeft = null;
+}

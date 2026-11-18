@@ -1,0 +1,68 @@
+package adris.altoclef.tasks.movement;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.Debug;
+import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.helpers.LookHelper;
+import adris.altoclef.util.time.TimerGame;
+import kaptainwutax.tungsten.path.movements.Input;
+
+/**
+ * Will move around randomly while holding shift
+ * Used to escape weird situations where baritone doesn't work.
+ */
+public class SafeRandomShimmyTask extends Task {
+
+    private final TimerGame _lookTimer;
+
+    public SafeRandomShimmyTask(float randomLookInterval) {
+        _lookTimer = new TimerGame(randomLookInterval);
+    }
+
+    public SafeRandomShimmyTask() {
+        this(5);
+    }
+
+    @Override
+    protected void onStart() {
+        _lookTimer.reset();
+    }
+
+    @Override
+    protected Task onTick() {
+
+        if (_lookTimer.elapsed()) {
+            Debug.logMessage("Random Orientation");
+            _lookTimer.reset();
+            LookHelper.randomOrientation();
+        }
+
+        AltoClef.getInstance().getInputControls().hold(Input.SNEAK);
+        AltoClef.getInstance().getInputControls().hold(Input.MOVE_FORWARD);
+        // NO ATTACK KEY. Holding CLICK_LEFT here made the "shimmy" a RANDOM DIG: the bot turned
+        // at random and mined whatever it faced. On the recorded 2026-09-11 playthrough that is
+        // the "digs the ground back and forth" the operator saw at 0:22 -- six shimmies carried
+        // the bot five blocks down to the stone it wanted, by luck; on another spawn the same six
+        // shimmies dig into nothing. A recovery that changes the world at random is not a
+        // recovery (docs/BARITONE-GAPS.md G26). Digging is a PLANNED move now (FastPlanner
+        // breakDown / breakThrough / breakStair); this task only jiggles the body.
+        return null;
+    }
+
+    @Override
+    protected void onStop(Task interruptTask) {
+        AltoClef.getInstance().getInputControls().release(Input.MOVE_FORWARD);
+        AltoClef.getInstance().getInputControls().release(Input.SNEAK);
+        AltoClef.getInstance().getInputControls().release(Input.CLICK_LEFT);
+    }
+
+    @Override
+    protected boolean isEqual(Task other) {
+        return other instanceof SafeRandomShimmyTask;
+    }
+
+    @Override
+    protected String toDebugString() {
+        return "Shimmying";
+    }
+}

@@ -1,0 +1,128 @@
+package adris.altoclef.ui;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.multiversion.InGameHudVer;
+import adris.altoclef.multiversion.DrawContextWrapper;
+import adris.altoclef.multiversion.ColorHelperVer;
+import java.util.ArrayList;
+import java.util.List;
+import net.minecraft.client.gui.Font;
+import net.minecraft.util.Mth;
+
+/**
+ * displays a chart indicating how much of the tick time is taken up by altoclef
+ * (very similar to Minecrafts `TickChart`)
+ */
+public class AltoClefTickChart {
+
+
+    protected final Font textRenderer;
+    protected final List<Long> list = new ArrayList<>();
+
+    public AltoClefTickChart(Font textRenderer) {
+        this.textRenderer = textRenderer;
+    }
+
+
+    public void pushTickNanos(long nanoTime) {
+        list.add(nanoTime);
+        // Bounded. The chart only trims itself while it is being RENDERED, and it is off by default
+        // (showDebugTickMs = false), so without this the list accumulated one Long per tick for the
+        // entire session: unbounded growth and GC churn, and the O(n) remove(0) trim turned into an
+        // O(n^2) stall the moment it was ever switched on. Keep only the newest window.
+        int max = 1024;
+        if (list.size() > max) {
+            list.subList(0, list.size() - max).clear();
+        }
+    }
+
+    public void render(AltoClef mod, DrawContextWrapper context, int x, int width) {
+        if (InGameHudVer.shouldShowDebugHud() || !mod.getTaskRunner().isActive()) return;
+
+        int height = context.getScaledWindowHeight();
+        context.fill(x, height - 37, x + width, height, 0x90505050);
+
+        long m = Integer.MAX_VALUE;
+        long n = Integer.MIN_VALUE;
+
+
+        while (list.size() >= width-1) {
+            list.remove(0);
+        }
+
+        for (int i = 0; i < list.size(); ++i) {
+            int p = x + i + 1;
+
+            long r = this.get(i);
+            m = Math.min(m, r);
+            n = Math.max(n, r);
+
+            this.drawTotalBar(context, p, height, i);
+        }
+
+        context.drawHorizontalLine(x, x + width - 1, height - 37, 0xFFDDDDDD);
+        context.drawHorizontalLine(x, x + width - 1, height - 1, 0xFFDDDDDD);
+        context.drawVerticalLine(x, height - 37, height, 0xFFDDDDDD);
+        context.drawVerticalLine(x + width - 1, height - 37, height, 0xFFDDDDDD);
+
+
+        this.drawBorderedText(context, "50 ms", x + 1, height - 37 + 1);
+    }
+
+
+    protected void drawTotalBar(DrawContextWrapper context, int x, int y, int index) {
+        long l = list.get(index);
+        int i = this.getHeight(l);
+        int j = this.getColor(l);
+        context.fill(x, y - i, x + 1, y, j);
+    }
+
+    protected long get(int index) {
+        return list.get(index);
+    }
+
+
+    protected void drawBorderedText(DrawContextWrapper context, String string, int x, int y) {
+        // TODO [1.21.11] MatrixStack replaced with Matrix3x2fStack — scale API different
+        context.fill(x, y, x + this.textRenderer.width(string)/2 + 1, y + this.textRenderer.lineHeight/2+1, 0x90505050);
+        context.drawText(this.textRenderer, string, x + 1, y + 1, 0xE9E9E9, false);
+    }
+
+
+
+    protected int getHeight(double value) {
+        return (int)Math.round(nanosToMillis(value) * 37 / 50d);
+    }
+
+
+    protected int getColor(long value) {
+        float maxMs = 50f;
+        double ms = nanosToMillis(value);
+
+        if (ms > maxMs) {
+            return 0xFFFFFFFF;
+        }
+
+        return getColor(ms/maxMs, 0xFF00FF00, 0xFFFFC800, 0xFFFF0000);
+    }
+
+    protected int getColor(double value, int minColor, int medianColor, int maxColor) {
+        if (value < 0.5) {
+            return lerp((float)((value) / (0.5)), minColor, medianColor);
+        }
+        return lerp((float)((value - 0.5) / 0.5), medianColor, maxColor);
+    }
+
+    private static int lerp(float delta, int start, int end) {
+        int i = (int) Mth.lerpInt(delta, ColorHelperVer.getAlpha(start), ColorHelperVer.getAlpha(end));
+        int j = (int) Mth.lerpInt(delta, ColorHelperVer.getRed(start), ColorHelperVer.getRed(end));
+        int k = (int) Mth.lerpInt(delta, ColorHelperVer.getGreen(start), ColorHelperVer.getGreen(end));
+        int l = (int) Mth.lerpInt(delta, ColorHelperVer.getBlue(start), ColorHelperVer.getBlue(end));
+        return ColorHelperVer.getArgb(i, j, k, l);
+    }
+
+    private static double nanosToMillis(double nanos) {
+        return nanos / 1_000_000.0;
+    }
+
+}

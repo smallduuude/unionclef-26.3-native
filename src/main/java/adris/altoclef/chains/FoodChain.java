@@ -1,0 +1,406 @@
+package adris.altoclef.chains;
+
+import adris.altoclef.AltoClef;
+import adris.altoclef.Settings;
+import adris.altoclef.multiversion.FoodComponentWrapper;
+import adris.altoclef.multiversion.item.ItemVer;
+import adris.altoclef.tasks.resources.CollectFoodTask;
+import adris.altoclef.tasks.speedrun.DragonBreathTracker;
+import adris.altoclef.tasksystem.TaskRunner;
+import adris.altoclef.util.helpers.*;
+import adris.altoclef.util.slots.PlayerSlot;
+import kaptainwutax.tungsten.path.movements.Input;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import com.mojang.datafixers.util.Pair;
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import java.util.Objects;
+import java.util.Optional;
+
+@SuppressWarnings("OptionalUsedAsFieldOrParameterType")
+public class FoodChain extends SingleTaskChain {
+    private static FoodChainConfig config;
+    private static boolean hasFood;
+
+    static {
+        ConfigHelper.loadConfig("configs/food_chain_settings.json", FoodChainConfig::new, FoodChainConfig.class, newConfig -> config = newConfig);
+    }
+
+    private final DragonBreathTracker dragonBreathTracker = new DragonBreathTracker();
+    private boolean isTryingToEat = false;
+    private boolean requestFillup = false;
+    private boolean needsFood = false;
+    private Optional<Item> cachedPerfectFood = Optional.empty();
+    private boolean shouldStop = false;
+    /** Bites started, and bites broken off because an enemy came close (read over py4j: foodStats). */
+    public static volatile int eatStarts, eatAborts;
+
+    public FoodChain(TaskRunner runner) {
+        super(runner);
+    }
+
+    @Override
+    protected void onTaskFinish(AltoClef mod) {
+        // Nothing.
+    }
+
+    private void startEat(AltoClef mod, Item food) {
+        //Debug.logInternal("EATING " + toUse.getTranslationKey() + " : " + test);
+        if (mod.getPlayer().isBlocking()) {
+            mod.log("want to eat, trying to stop shielding...");
+            mod.getInputControls().release(Input.CLICK_RIGHT);
+            return;
+        }
+
+        if (!isTryingToEat) eatStarts++;
+        isTryingToEat = true;
+        requestFillup = true;
+        // Only equip if we're not already holding this food.
+        // Changing the selected slot/item mid-animation cancels eating — calling
+        // forceEquipItem every tick was causing an infinite restart loop.
+        ItemStack held = StorageHelper.getItemStackInSlot(PlayerSlot.getEquipSlot());
+        if (held.getItem() != food) {
+            mod.getSlotHandler().forceEquipItem(new Item[]{food}, true); // "true" because it's food
+        }
+        mod.getInputControls().hold(Input.CLICK_RIGHT);
+        mod.getExtraBaritoneSettings().setInteractionPaused(true);
+    }
+
+    private void stopEat() {
+        if (isTryingToEat) {
+            AltoClef altoClef = AltoClef.getInstance();
+
+            if (altoClef.getItemStorage().hasItem(Items.SHIELD) || altoClef.getItemStorage().hasItemInOffhand(Items.SHIELD)) {
+                if (StorageHelper.getItemStackInSlot(PlayerSlot.OFFHAND_SLOT).getItem() != Items.SHIELD) {
+                    altoClef.getSlotHandler().forceEquipItemToOffhand(Items.SHIELD);
+                }
+            }
+            // Always clear eating state regardless of shield equip outcome.
+            // If forceEquipItemToOffhand fails (e.g. server cancels the slot action),
+            // we must not stay stuck believing we're still eating.
+            isTryingToEat = false;
+            requestFillup = false;
+            altoClef.getInputControls().release(Input.CLICK_RIGHT);
+            altoClef.getExtraBaritoneSettings().setInteractionPaused(false);
+        }
+    }
+
+    public boolean isTryingToEat() {
+        return isTryingToEat;
+    }
+
+    @Override
+    public float getPriority() {
+        AltoClef mod = AltoClef.getInstance();
+
+        if (WorldHelper.isInNetherPortal()) {
+            stopEat();
+            return Float.NEGATIVE_INFINITY;
+        }
+        // do not interrupt defending from mobs by eating
+        if (mod.getMobDefenseChain().isPuttingOutFire()
+                || mod.getMobDefenseChain().isShielding()
+                || mod.getPlayer().isBlocking()
+                || mod.getMobDefenseChain().isDoingAcrobatics()
+        ) {
+            stopEat();
+            return Float.NEGATIVE_INFINITY;
+        }
+        dragonBreathTracker.updateBreath(mod);
+        for (BlockPos playerIn : WorldHelper.getBlocksTouchingPlayer()) {
+            if (dragonBreathTracker.isTouchingDragonBreath(playerIn)) {
+                stopEat();
+                return Float.NEGATIVE_INFINITY;
+            }
+        }
+        if (!mod.getModSettings().isAutoEat()) {
+            stopEat();
+            return Float.NEGATIVE_INFINITY;
+        }
+
+        // do NOT eat while in lava if we are escaping it (spaghetti code dependencies go brrrr)
+        if (mod.getPlayer().isInLava()) {
+            stopEat();
+            return Float.NEGATIVE_INFINITY;
+        }
+
+        /*
+        - Eats if:
+        - We're hungry and have food that fits
+            - We're low on health and maybe a little bit hungry
+            - We're very low on health and are even slightly hungry
+        - We're kind of hungry and have food that fits perfectly
+         */
+        // We're in danger, don't eat now!!
+        if (!mod.getMLGBucketChain().doneMLG() || mod.getMLGBucketChain().isFalling(mod) ||
+                mod.getPlayer().isBlocking() || shouldStop) {
+            stopEat();
+            return Float.NEGATIVE_INFINITY;
+        }
+        Pair<Integer, Optional<Item>> calculation = calculateFood(mod);
+        int cachedFoodScore = calculation.getFirst();
+        cachedPerfectFood = calculation.getSecond();
+        hasFood = cachedFoodScore > 0;
+        // If we requested a fillup but we're full, stop.
+        if (requestFillup && mod.getPlayer().getFoodData().getFoodLevel() >= 20) {
+            requestFillup = false;
+        }
+        // If we no longer have food, we no longer can eat.
+        if (!hasFood) {
+            requestFillup = false;
+        }
+
+        boolean wantsBite = hasFood && (needsToEat() || requestFillup) && cachedPerfectFood.isPresent() &&
+                !mod.getMLGBucketChain().isChorusFruiting() && !mod.getPlayer().isBlocking();
+        boolean enemyStops = wantsBite && areEnemiesNearby(mod);
+        if (wantsBite && !enemyStops) {
+
+            Item toUse = cachedPerfectFood.get();
+
+            // Make sure we're not facing a container
+            if (!LookHelper.tryAvoidingInteractable(mod)) {
+                return Float.NEGATIVE_INFINITY;
+            }
+            startEat(mod, toUse);
+        } else {
+            if (isTryingToEat && enemyStops) eatAborts++;
+            stopEat();
+        }
+
+        Settings settings = mod.getModSettings();
+
+        if (needsFood || cachedFoodScore < settings.getMinimumFoodAllowed()) {
+            needsFood = cachedFoodScore < settings.getFoodUnitsToCollect();
+
+            // Only collect if we don't have enough food.
+            // If the user inputs invalid settings, the bot would get stuck here.
+            if (cachedFoodScore < settings.getFoodUnitsToCollect()) {
+                setTask(new CollectFoodTask(settings.getFoodUnitsToCollect()));
+                return 55f;
+            }
+        }
+
+
+        // Food eating is handled asynchronously.
+        return Float.NEGATIVE_INFINITY;
+    }
+
+    /**
+     * A bite takes 32 ticks. Begin one only with no enemy within EAT_START_CLEAR, which is about
+     * what a walking zombie covers in those 1.6 s plus its reach; once begun, break it off only when
+     * an enemy is within EAT_ABORT_RANGE, i.e. about to hit.
+     *
+     * <p>⛔ THIS WAS THE OTHER WAY ROUND (operator 2026-09-28: "it tries to eat, a mob comes, it runs,
+     * for ever"). The range was 7 to begin and 14 to keep eating, so a mob anywhere between 7 and 14
+     * blocks started a bite on one tick and cancelled it on the next, again and again -- mob_hungry
+     * counted 10 and 23 bites begun for one meal. A band like this is meant to make an action that
+     * is under way HARDER to stop, not easier.
+     */
+    private static final double EAT_START_CLEAR = 7, EAT_ABORT_RANGE = 3.5;
+    /**
+     * A mob that sees us within MobDefenseChain's melee take-on range (10) is one the defence is
+     * about to go and fight; a bite begun then is broken off when it arrives.
+     */
+    private static final double EAT_START_CLEAR_SEEN = 10;
+
+    /**
+     * ⛔ THE RANGES ABOVE USED TO BE DEAD CODE (2026-09-28). This walked getCloseEntities(), which is
+     * "entities within our interact range" (EntityTracker: inRange(entity), about 3.5 blocks), so a
+     * mob further than a sword's reach did not exist here at all, whatever the range said. Traced on
+     * mob_hungry: every bite began with the nearest hostile "not found" and was broken off with it at
+     * 3.4-3.5 blocks -- bite, zombie steps into reach, stop, fight, bite again. The whole tracked
+     * list is walked now: getHostiles() for mobs, getTrackedEntities for players.
+     */
+    private boolean areEnemiesNearby(AltoClef mod) {
+        double dangerRange = isTryingToEat ? EAT_ABORT_RANGE : EAT_START_CLEAR;
+        for (LivingEntity hostile : mod.getEntityTracker().getHostiles()) {
+            double d = hostile.distanceTo(mod.getPlayer());
+            if (d < dangerRange) return true;
+            if (!isTryingToEat && d < EAT_START_CLEAR_SEEN
+                    && EntityHelper.isAngryAtPlayer(mod, hostile)
+                    && LookHelper.seesPlayer(hostile, mod.getPlayer(), EAT_START_CLEAR_SEEN)) {
+                return true;
+            }
+        }
+        // Threatening players nearby (PvP) -- too dangerous to eat
+        for (Player player : mod.getEntityTracker().getTrackedEntities(Player.class)) {
+            if (player == mod.getPlayer() || player.distanceTo(mod.getPlayer()) >= dangerRange
+                    || player.getName() == null) continue;
+            String name = player.getName().getString();
+            if (mod.getDamageTracker().getThreatTable().shouldAttack(name)
+                    || mod.getDamageTracker().getThreatTable().shouldAvoid(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public boolean isActive() {
+        // We're always checking for food.
+        return true;
+    }
+
+    @Override
+    public String getName() {
+        return "Food";
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        stopEat();
+    }
+
+    public boolean needsToEat() {
+        if (!hasFood() || shouldStop) {
+            return false;
+        }
+
+
+        LocalPlayer player = Minecraft.getInstance().player;
+        assert player != null;
+        int foodLevel = player.getFoodData().getFoodLevel();
+        float health = player.getHealth();
+
+        if (foodLevel >= 20) {
+            // We can't eat.
+            return false;
+        }
+
+        if (health <= 10) {
+            return true;
+        }
+
+        // ⛔ KEEP REGENERATION RUNNING. Natural regeneration needs a food level of 18 or more; below
+        // that, health lost stays lost. The thresholds below let the bot walk around at 16 health and
+        // 15 food indefinitely, and it met every nether fight that way: two endermen took it from 12
+        // to 0 in twenty seconds, twice in three runs (2026-09-25, rung-ender resumes), in full armour
+        // and with a diamond sword. Hurt and under 18 food means eat now -- FoodChain only acts when
+        // no enemy is near (areEnemiesNearby), so this is the lull between fights, which is exactly
+        // when a player eats.
+        if (health < player.getMaxHealth() && foodLevel < 18) {
+            return true;
+        }
+        //Debug.logMessage("FOOD: " + foodLevel + " -- HEALTH: " + health);
+
+        // Eat if we're desperate/need to heal ASAP
+        if (player.isOnFire() || player.hasEffect(MobEffects.WITHER) || health < config.alwaysEatWhenWitherOrFireAndHealthBelow) {
+            return true;
+        } else if (foodLevel > config.alwaysEatWhenBelowHunger) {
+            if (health < config.alwaysEatWhenBelowHealth) {
+                return true;
+            }
+        } else {
+            // We have half hunger
+            return true;
+        }
+
+
+        // Eat if we're  units hungry and we have a perfect fit.
+        if (foodLevel < config.alwaysEatWhenBelowHungerAndPerfectFit && cachedPerfectFood.isPresent()) {
+            int need = 20 - foodLevel;
+            Item best = cachedPerfectFood.get();
+
+            int fills = (ItemVer.getFoodComponent(best) != null) ? ItemVer.getFoodComponent(best).getHunger() : -1;
+            return fills == need;
+        }
+
+        return false;
+    }
+
+    private Pair<Integer, Optional<Item>> calculateFood(AltoClef mod) {
+        Item bestFood = null;
+        double bestFoodScore = Double.NEGATIVE_INFINITY;
+        int foodTotal = 0;
+        LocalPlayer player = mod.getPlayer();
+        float health = player != null ? player.getHealth() : 20;
+        //float toHeal = player != null? 20 - player.getHealth() : 0;
+        float hunger = player != null ? player.getFoodData().getFoodLevel() : 20;
+        float saturation = player != null ? player.getFoodData().getSaturationLevel() : 20;
+        // Get best food item + calculate food total
+        for (ItemStack stack : mod.getItemStorage().getItemStacksPlayerInventory(true)) {
+            if (ItemVer.isFood(stack)) {
+                // Respect consumption reservations, not inventory discard protection.
+                if (!ItemHelper.canConsumeFood(mod, stack)) continue;
+
+                // Ignore spider eyes
+                if (stack.getItem() == Items.SPIDER_EYE) {
+                    continue;
+                }
+
+                FoodComponentWrapper food = ItemVer.getFoodComponent(stack.getItem());
+
+                assert food != null;
+                float hungerIfEaten = Math.min(hunger + food.getHunger(), 20);
+                float saturationIfEaten = Math.min(hungerIfEaten, saturation + food.getSaturationModifier());
+                float gainedSaturation = (saturationIfEaten - saturation);
+                float gainedHunger = (hungerIfEaten - hunger);
+                float hungerNotFilled = 20 - hungerIfEaten;
+
+                float saturationWasted = food.getSaturationModifier() - gainedSaturation;
+                float hungerWasted = food.getHunger() - gainedHunger;
+
+                boolean prioritizeSaturation = health < config.prioritizeSaturationWhenBelowHealth;
+                float saturationGoodScore = prioritizeSaturation ? gainedSaturation * config.foodPickPrioritizeSaturationSaturationMultiplier : gainedSaturation;
+                float saturationLossPenalty = prioritizeSaturation ? 0 : saturationWasted * config.foodPickSaturationWastePenaltyMultiplier;
+                float hungerLossPenalty = hungerWasted * config.foodPickHungerWastePenaltyMultiplier;
+                float hungerNotFilledPenalty = hungerNotFilled * config.foodPickHungerNotFilledPenaltyMultiplier;
+
+                float score = saturationGoodScore - saturationLossPenalty - hungerLossPenalty - hungerNotFilledPenalty;
+
+                if (stack.getItem() == Items.ROTTEN_FLESH) {
+                    score -= config.foodPickRottenFleshPenalty;
+                }
+                if (score > bestFoodScore) {
+                    bestFoodScore = score;
+                    bestFood = stack.getItem();
+                }
+
+                foodTotal += Objects.requireNonNull(ItemVer.getFoodComponent(stack.getItem())).getHunger() * stack.getCount();
+            }
+        }
+
+        return new Pair<>(foodTotal, Optional.ofNullable(bestFood));
+    }
+
+    // If we need to eat like, NOW.
+    public boolean needsToEatCritical() {
+        return false;
+    }
+
+    public boolean hasFood() {
+        return hasFood;
+    }
+
+    public void shouldStop(boolean shouldStopInput) {
+        shouldStop = shouldStopInput;
+    }
+
+    public boolean isShouldStop() {
+        return shouldStop;
+    }
+
+    static class FoodChainConfig {
+        public int alwaysEatWhenWitherOrFireAndHealthBelow = 6;
+        public int alwaysEatWhenBelowHunger = 10;
+        public int alwaysEatWhenBelowHealth = 14;
+        public int alwaysEatWhenBelowHungerAndPerfectFit = 20 - 5;
+        public int prioritizeSaturationWhenBelowHealth = 8;
+        public float foodPickPrioritizeSaturationSaturationMultiplier = 8;
+        public float foodPickSaturationWastePenaltyMultiplier = 1;
+        public float foodPickHungerWastePenaltyMultiplier = 2;
+        public float foodPickHungerNotFilledPenaltyMultiplier = 1;
+        public float foodPickRottenFleshPenalty = 100;
+        public float runDontEatMaxHealth = 3;
+        public int runDontEatMaxHunger = 3;
+        public int canTankHitsAndEatArmor = 15;
+        public int canTankHitsAndEatMaxHunger = 3;
+    }
+}

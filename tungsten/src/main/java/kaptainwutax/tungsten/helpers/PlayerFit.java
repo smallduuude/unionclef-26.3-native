@@ -1,0 +1,291 @@
+package kaptainwutax.tungsten.helpers;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.LevelReader;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.shapes.BooleanOp;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+
+/**
+ * The single source of truth for "can a player BE here", computed from real
+ * collision shapes for the real body (0.6 wide, 1.8 tall).
+ *
+ * WHY THIS EXISTS. The block-space search used to answer that question with
+ * {@code BlockShapeChecker.getShapeVolume}, which is the XZ AREA of a collision
+ * shape with the Y extent thrown away, plus a list of block-class exceptions.
+ * Height was therefore never checked, so a gap capped by a slab — 1.5 blocks of
+ * real clearance — was planned straight through; the physics engine (which DOES
+ * model 0.6x1.8 against real shapes) then could not execute the plan and the bot
+ * stalled in front of it. The disabled line in MovementHelper.isObscured even
+ * carried a TODO admitting the bot "thinks it can go through a wall made of
+ * slabs". Block-space and physics now answer from the same geometry.
+ *
+ * Everything here is pure world queries: no state, safe to call from the search
+ * threads exactly like the old helpers were.
+ */
+public final class PlayerFit {
+
+    public static final double WIDTH = 0.6;
+    public static final double HEIGHT = 1.8;
+    private static final double HALF = WIDTH / 2.0;
+    private static final double EPS = 1.0E-7;
+    /** Vanilla step-up without jumping. */
+    public static final double STEP_HEIGHT = 0.6;
+    /** A sprint-jump apex clears about this much; above it a plain jump fails. */
+    public static final double JUMP_HEIGHT = 1.25;
+
+    private PlayerFit() {}
+
+    /** Collision shape of one block, moved into world coordinates. */
+    private static VoxelShape shapeAt(LevelReader world, BlockPos pos) {
+        return world.getBlockState(pos).getCollisionShape(world, pos)
+                .move(pos.getX(), pos.getY(), pos.getZ());
+    }
+
+    /**
+     * FAST CLASSIFICATION — the reason this class is affordable inside a search.
+     * The exact test builds shapes and runs a boolean shape operation; doing that
+     * for every candidate cell of every expansion drove the client to ~1 fps on
+     * generated terrain. The overwhelming majority of cells are either empty air
+     * or a plain full cube, and both answers are exact without touching a
+     * VoxelShape operation. Only genuinely partial blocks (slabs, stairs, fences,
+     * trapdoors, carpets, snow) fall through to the precise path.
+     * 0 = empty, 1 = full cube, 2 = partial (must be measured),
+     * 3 = no collision yet blocks the body and is no floor (powder snow; baritone
+     *     canWalkThroughBlockState NO and canWalkOn false).
+     */
+    // ── PER-SEARCH MEMO ────────────────────────────────────────────────────────────
+    // EVERY world read the block-space search makes funnels through classify(), and there
+    // are a lot of them: bodyFits classifies up to a dozen cells, and a single node expansion
+    // calls bodyFits once per direction per move generator. Measured on the stand: 164 nodes
+    // in 204 ms, i.e. over a MILLISECOND per node, so a 250 ms budget bought ~160 nodes and
+    // every course that needed real searching got a truncated plan back — "PLAN n=14
+    // complete=false" on a course whose answer is six blocks in a straight line.
+    //
+    // The memo is OPT-IN and scoped to one search (see beginCachedRead). It must never be on
+    // while the bot is breaking or placing: those change the world under it, and a stale
+    // "that cell is air" is exactly the kind of lie that walks a bot into a wall. The search
+    // already assumes a still world for its duration — that is what makes a plan a plan.
+    private static final class ClassifyCache {
+        // Open addressing: no boxing, no allocation per lookup. Sized well past the cells one
+        // search touches; if it ever fills up it is emptied rather than grown, which costs a
+        // few re-reads and keeps the memory flat.
+        private static final int CAP = 1 << 15, MASK = CAP - 1;
+        private final long[] keys = new long[CAP];
+        private final byte[] vals = new byte[CAP];   // 0 = empty slot, else classify + 1
+        private int used;
+
+        int get(long key) {
+            int i = (int) (key ^ (key >>> 32)) & MASK;
+            while (vals[i] != 0) {
+                if (keys[i] == key) return vals[i] - 1;
+                i = (i + 1) & MASK;
+            }
+            return -1;
+        }
+        void put(long key, int value) {
+            if (used > (CAP >> 1) + (CAP >> 2)) clear();   // 0.75 load: empty it, do not grow
+            int i = (int) (key ^ (key >>> 32)) & MASK;
+            while (vals[i] != 0) {
+                if (keys[i] == key) { vals[i] = (byte) (value + 1); return; }
+                i = (i + 1) & MASK;
+            }
+            keys[i] = key; vals[i] = (byte) (value + 1); used++;
+        }
+        void clear() { java.util.Arrays.fill(vals, (byte) 0); used = 0; }
+    }
+
+    private static final ThreadLocal<ClassifyCache> CACHE = new ThreadLocal<>();
+
+    /** Start memoising world reads on THIS thread. Pair with {@link #endCachedRead()}. */
+    public static void beginCachedRead() {
+        ClassifyCache c = CACHE.get();
+        if (c == null) { c = new ClassifyCache(); CACHE.set(c); }
+        else c.clear();
+    }
+
+    /** Stop memoising — the world is allowed to change again. */
+    public static void endCachedRead() { CACHE.remove(); }
+
+    private static long cellKey(BlockPos pos) {
+        return (((long) pos.getX() & 0x3FFFFFFL) << 38)
+                | (((long) pos.getZ() & 0x3FFFFFFL) << 12)
+                | ((long) (pos.getY() + 2048) & 0xFFFL);
+    }
+
+    private static int classify(LevelReader world, BlockPos pos) {
+        ClassifyCache cache = CACHE.get();
+        if (cache == null) return classifyUncached(world, pos);
+        long key = cellKey(pos);
+        int hit = cache.get(key);
+        if (hit >= 0) return hit;
+        int value = classifyUncached(world, pos);
+        cache.put(key, value);
+        return value;
+    }
+
+    private static int classifyUncached(LevelReader world, BlockPos pos) {
+        net.minecraft.world.level.block.state.BlockState state = world.getBlockState(pos);
+        if (state.isAir()) return 0;
+        // baritone canWalkThroughBlockState: POWDER_SNOW -> NO (MovementHelper.java:193). No collision
+        // box, so the shape test below would call it air; the body sinks in and freezes. A full block
+        // to the body (routes break it -- RouteHazards.blocksBody -- or go round), but NOT a floor:
+        // standing on it sinks you into it, so supportTop must not see a full cube here.
+        if (state.getBlock() == net.minecraft.world.level.block.Blocks.POWDER_SNOW) return 3;
+        VoxelShape shape = state.getCollisionShape(world, pos);
+        if (shape.isEmpty()) return 0;
+        if (shape == net.minecraft.world.phys.shapes.Shapes.block()) return 1;
+        net.minecraft.world.phys.AABB bb = shape.bounds();
+        if (bb.minX <= 0.0001 && bb.minY <= 0.0001 && bb.minZ <= 0.0001
+                && bb.maxX >= 0.9999 && bb.maxY >= 0.9999 && bb.maxZ >= 0.9999) return 1;
+        return 2;
+    }
+
+    /**
+     * Does the player body fit with its feet at (x, feetY, z)?
+     * Tests the real 0.6x1.8 box against the real shapes of every block it
+     * overlaps — this is what makes slabs, stairs, trapdoors, fences, carpets
+     * and snow layers count for exactly as much as they physically are.
+     */
+    public static boolean bodyFits(LevelReader world, double x, double feetY, double z) {
+        return boxFits(world, new AABB(x - HALF, feetY, z - HALF,
+                x + HALF, feetY + HEIGHT, z + HALF));
+    }
+
+    private static boolean boxFits(LevelReader world, AABB volume) {
+        AABB box = volume.deflate(EPS);
+        VoxelShape boxShape = Shapes.create(box);
+        int minX = Mth.floor(box.minX), maxX = Mth.floor(box.maxX);
+        int minY = Mth.floor(box.minY), maxY = Mth.floor(box.maxY);
+        int minZ = Mth.floor(box.minZ), maxZ = Mth.floor(box.maxZ);
+        BlockPos.MutableBlockPos p = new BlockPos.MutableBlockPos();
+        for (int bx = minX; bx <= maxX; bx++) {
+            for (int by = minY; by <= maxY; by++) {
+                for (int bz = minZ; bz <= maxZ; bz++) {
+                    p.set(bx, by, bz);
+                    int kind = classify(world, p);
+                    if (kind == 0) continue;             // air: cheap, exact
+                    if (kind == 1 || kind == 3) return false; // full cube / powder snow in the body
+                    // partial block: measure it properly
+                    if (Shapes.joinIsNotEmpty(shapeAt(world, p), boxShape,
+                            BooleanOp.AND)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Clearance for an ascent at the landing height, including the take-off column.
+     * The swept envelope is exact for cardinal moves. For diagonals it conservatively
+     * includes both corner columns, matching the planner's no-corner-cutting policy.
+     * Testing only the landing or raising the origin by STEP_HEIGHT misses ceilings
+     * which admit a step but prevent the body from rising onto a full block.
+     */
+    public static boolean ascentClear(LevelReader world, BlockPos from, BlockPos to, double landingY) {
+        return boxFits(world, new AABB(
+                Math.min(from.getX(), to.getX()) + 0.5 - HALF, landingY,
+                Math.min(from.getZ(), to.getZ()) + 0.5 - HALF,
+                Math.max(from.getX(), to.getX()) + 0.5 + HALF, landingY + HEIGHT,
+                Math.max(from.getZ(), to.getZ()) + 0.5 + HALF));
+    }
+
+    /** A supported bank exit, including the head sweep above the water column. */
+    public static boolean waterExitClear(LevelReader world, BlockPos from, BlockPos to) {
+        double landing = supportTop(world, to);
+        if (Double.isNaN(landing) || landing < from.getY() - STEP_HEIGHT
+                || landing - from.getY() > JUMP_HEIGHT
+                || !bodyFits(world, to.getX() + 0.5, landing, to.getZ() + 0.5)) return false;
+        return landing <= from.getY() || ascentClear(world, from, to, landing);
+    }
+
+    /** The destination column swept while leaving a ledge and falling to its floor. */
+    public static boolean descentClear(LevelReader world, int x, int z,
+                                       double departureY, double landingY) {
+        return boxFits(world, new AABB(x + 0.5 - HALF, landingY, z + 0.5 - HALF,
+                x + 0.5 + HALF, departureY + HEIGHT, z + 0.5 + HALF));
+    }
+
+    /**
+     * Surface height the player would stand on inside this cell, or NaN when
+     * there is nothing to stand on. A bottom slab / snow layer / carpet INSIDE
+     * the cell is a floor at its own top; otherwise the floor is the top of the
+     * block below (y of the cell for a full block).
+     */
+    public static double supportTop(LevelReader world, BlockPos cell) {
+        int self = classify(world, cell);
+        if (self == 2) {   // partial block IN the cell (slab/snow/carpet) = the floor
+            double top = world.getBlockState(cell).getCollisionShape(world, cell)
+                    .max(Direction.Axis.Y);
+            if (top < 1.0) return cell.getY() + top;
+        }
+        BlockPos below = cell.below();
+        int under = classify(world, below);
+        if (under == 0 || under == 3) return Double.NaN;   // air, or powder snow: nothing holds you
+        if (under == 1) return below.getY() + 1.0;          // full cube: exact, no shape math
+        return below.getY() + world.getBlockState(below).getCollisionShape(world, below)
+                .max(Direction.Axis.Y);
+    }
+
+    /**
+     * Can the player STAND in this cell: something to stand on, and the body
+     * fits above that surface. This is the test that rejects the slab-capped
+     * 1.5-block passage.
+     */
+    public static boolean standable(LevelReader world, BlockPos cell) {
+        double top = supportTop(world, cell);
+        if (Double.isNaN(top)) return false;
+        return bodyFits(world, cell.getX() + 0.5, top, cell.getZ() + 0.5);
+    }
+
+    /** Can the player pass THROUGH this cell with feet at the given height. */
+    public static boolean passableAt(LevelReader world, BlockPos cell, double feetY) {
+        return bodyFits(world, cell.getX() + 0.5, feetY, cell.getZ() + 0.5);
+    }
+
+    /**
+     * Can the player move from a surface at {@code fromTop} into {@code to}
+     * without jumping (step-up) — and does the body fit there.
+     */
+    public static boolean canStepTo(LevelReader world, double fromTop, BlockPos to) {
+        double top = supportTop(world, to);
+        if (Double.isNaN(top)) return false;
+        if (top - fromTop > STEP_HEIGHT) return false;
+        return bodyFits(world, to.getX() + 0.5, top, to.getZ() + 0.5);
+    }
+
+    /** Same, but allowing a jump (used by the ascend/parkour move generators). */
+    public static boolean canJumpTo(LevelReader world, double fromTop, BlockPos to) {
+        double top = supportTop(world, to);
+        if (Double.isNaN(top)) return false;
+        if (top - fromTop > JUMP_HEIGHT) return false;
+        return bodyFits(world, to.getX() + 0.5, top, to.getZ() + 0.5);
+    }
+
+    /**
+     * Head-room along a straight move between two cells: every cell the body
+     * sweeps through must accept it at the walking height. Cheap sampling at
+     * half-block steps — enough to catch a slab/fence cap mid-corridor, which
+     * the class-based predicate it replaces could not.
+     */
+    public static boolean corridorClear(LevelReader world, BlockPos from, BlockPos to) {
+        double fromTop = supportTop(world, from);
+        double toTop = supportTop(world, to);
+        if (Double.isNaN(fromTop) || Double.isNaN(toTop)) return false;
+        double x0 = from.getX() + 0.5, z0 = from.getZ() + 0.5;
+        double x1 = to.getX() + 0.5, z1 = to.getZ() + 0.5;
+        double dist = Math.sqrt((x1 - x0) * (x1 - x0) + (z1 - z0) * (z1 - z0));
+        int steps = Math.max(1, (int) Math.ceil(dist / 0.5));
+        for (int i = 1; i <= steps; i++) {
+            double t = (double) i / steps;
+            double feet = Math.max(fromTop, toTop);   // the higher surface is the constraint
+            if (!bodyFits(world, x0 + (x1 - x0) * t, feet, z0 + (z1 - z0) * t)) return false;
+        }
+        return true;
+    }
+}

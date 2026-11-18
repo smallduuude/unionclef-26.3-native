@@ -1,0 +1,948 @@
+package adris.altoclef;
+
+import adris.altoclef.control.KillAura;
+import adris.altoclef.multiversion.versionedfields.Items;
+import adris.altoclef.tasks.movement.DefaultGoToDimensionTask;
+import adris.altoclef.util.BlockRange;
+import adris.altoclef.util.helpers.ConfigHelper;
+import adris.altoclef.util.helpers.ItemHelper;
+import adris.altoclef.util.serialization.IFailableConfigFile;
+import adris.altoclef.util.serialization.ItemDeserializer;
+import adris.altoclef.util.serialization.ItemSerializer;
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.google.common.collect.Streams;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.item.Item;
+
+/**
+ * The settings file, loaded and used across the codebase.
+ * <p>
+ * Each setting is documented.
+ */
+@SuppressWarnings("ALL")
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonAutoDetect(fieldVisibility = JsonAutoDetect.Visibility.ANY)
+public class Settings implements IFailableConfigFile {
+
+    public static final String SETTINGS_PATH = "altoclef_settings.json";
+
+    // Internal only.
+    // If settings failed to load, this will be set to warn the user.
+    @JsonIgnore
+    private transient boolean failedToLoad = false;
+
+    //////////////////////////////////////////////////////////////////////////////////////////
+    ////////** BEGIN SETTINGS w/ COMMENTS **//////////////////////////////////////////////////
+    //////////////////////////////////////////////////////////////////////////////////////////
+
+    /**
+     * If true, F5 third-person view uses EpicCamera (smooth orbit + shoulder offset).
+     * If false, vanilla third-person camera.
+     */
+    private boolean epicCameraEnabled = true;
+
+    /**
+     * If true, shows a debug bar displaying how much milliseconds is spend on altoclefs tick function
+     */
+    private boolean showDebugTickMs = false;
+
+    /**
+     * If true, text will appear on the top left showing the current
+     * task chain.
+     */
+    private boolean showTaskChains = true;
+
+    /**
+     * If true, all warning logs will be disabled.
+     * <p>
+     * NOT RECOMMENDED, as it will make debugging more difficult.
+     * But if you know what you're doing, go nuts.
+     */
+    private boolean hideAllWarningLogs = false;
+
+    /**
+     * The prefix for commands (ex. @gamer )
+     */
+    private String commandPrefix = "@";
+
+
+    /**
+     * Sets the log level of the mod; allowed values:
+     * ALL - all messages will be logged
+     * NORMAL - warnings and errors will be logged
+     * WARN - only warnings will be logged
+     * ERROR - only errors will be logged
+     * NONE - nothing will be logged
+     *
+     * dev note: NONE might not work completely for errors since some parts of the codebase bypass 'Debug.logError' calls and call 'System.err' directly instead
+     */
+    private String logLevel = "NORMAL";
+
+    /**
+     * When logging to chat, will prepend this to each log.
+     */
+    private String chatLogPrefix = "[Alto Clef] ";
+
+    /**
+     * How much the mod prints to the in-game chat: "All", "Important only", or "Off".
+     * Console/file logging is unaffected. "Important only" keeps warnings and errors
+     * without the routine status spam.
+     */
+    private String chatVerbosity = "Important only";
+
+    /**
+     * Scale for the mod's on-screen overlay text (task chain / tick chart). 1.0 = default size.
+     */
+    private float overlayTextScale = 1.0f;
+
+    /**
+     * When true, non-combat aim (mining/using) is limited to
+     * {@link #maxTurnSpeedDegPerTick} degrees per tick instead of snapping, which reads as more
+     * natural to server anti-cheat. Combat already aims through the WindMouse pipeline.
+     * <p>
+     * Default: true — the anti-cheat-safe option; turn off for snappier singleplayer aiming.
+     */
+    private boolean smoothAim = true;
+
+    /** Max yaw/pitch change per tick when {@link #smoothAim} is on. */
+    private float maxTurnSpeedDegPerTick = 20.0f;
+
+    /**
+     * If true, will show a timer.
+     */
+    private boolean showTimer = true;
+
+    /**
+     * The delay between moving items for crafting/furnace/any kind of inventory movement.
+     */
+    private float containerItemMoveDelay = 0.2f;
+
+    /**
+     * If true, use Minecraft's crafting recipe book to place items into
+     * the crafting table (should be much faster as it's almost instant)
+     * <p>
+     * If false, will place items in each slot manually (the original way)
+     */
+    /**
+     * NEITHER PATH CRAFTS ON 1.21.11, so this default is left where upstream put it.
+     *
+     * <p>The book route was measured healthy in every part and still produced nothing: the call
+     * is ported and fires, the recipe sent is the right one, the book holds 36-40 craftable
+     * collections, the packet goes through the real interaction manager, the screen is genuinely
+     * open, the recipes are unlocked server-side -- and the output slot stayed empty every run.
+     * Switching this to false takes {@code CraftGenericManuallyTask} instead, and that measured
+     * the same: wood gathered, crafting rung never reached, three runs.
+     *
+     * <p>So the fault is upstream of BOTH routes and this switch is not the lever. Flipped back
+     * rather than left changed, because there is no evidence either setting is better.
+     */
+    /**
+     * Craft by PLACING ITEMS IN THE GRID, not by clicking the recipe book.
+     *
+     * <p>Off by default at the user's instruction (2026-08-05): the recipe book is DISABLED on a
+     * good number of servers, and a bot that depends on it simply stops there. Manual placement
+     * works everywhere the grid does.
+     *
+     * <p>It is also what the stand caught: a stall capture had the bot ninety seconds inside
+     * "Doing stuff in crafting_table container" with cgScreen=class_1723 -- the 2x2 player grid --
+     * and cgBookNone=655, the book correctly answering "no such recipe" over and over while
+     * nothing listened.
+     *
+     * <p>Still a setting rather than a deletion: on a server that does have the book, clicking one
+     * recipe is fewer packets than placing nine items, so it stays available to anyone who wants
+     * it.
+     */
+    private boolean useCraftingBookToCraft = false;
+
+    /**
+     * If a dropped resource item is further than this from the player, don't pick it up.
+     * <p>
+     * -1 (or less than 0) to disable.
+     */
+    private float resourcePickupDropRange = -1;
+
+
+    /**
+     * minimum amount of food to have in the inventory.
+     * if we have less food than this value the bot will go pickup some more.
+     * <p>
+     * Default: 40 — the bot tops up its own food instead of letting itself starve.
+     */
+    private int minimumFoodAllowed = 40;
+
+
+    /**
+     * amount of food to collect when the food in inventory
+     * is lower than the value of minimumFoodAllowed
+     * <p>
+     * Default: 220 — a full run's worth, so it is rarely caught hungry mid-task.
+     */
+    private int foodUnitsToCollect = 220;
+
+
+    /**
+     * Chests are cached for their contents.
+     * <p>
+     * If the bot is collecting a resource and finds a chest within this range,
+     * it will grab the resource from the chest.
+     * <p>
+     * Set this to 0 to disable chest pickups.
+     * <p>
+     * Don't set this too high, as the bot will prioritize chests even if the resource
+     * is easily accessible now.
+     */
+    private float resourceChestLocateRange = 500;
+
+    /**
+     * Some block resources are by default obtained through non-mining means.
+     * Crafting tables for example, are normally crafted using planks.
+     * <p>
+     * However, if the block resource is found within this range it may be mined first.
+     * <p>
+     * Set this to 0 to disable this feature
+     * (keep in mind, this will not affect blocks like "dirt" and "cobblestone"
+     * that can only be obtained through mining)
+     * <p>
+     * Set this to -1 to ALWAYS mine a block if it's catalogued.
+     * This is not recommended. For example, if the bot happens to track a
+     * crafting table 10000 blocks away, and it then tries obtaining one
+     * it will travel 10000 blocks to mine that table, even if it finds
+     * itself in a forest where the wood is abundant.
+     */
+    private float resourceMineRange = 100;
+
+    /**
+     * When going to the nearest chest to store items, the bot may normally
+     * dig up dungeons constantly. If this is set to true, the bot will
+     * search around each chest to make sure it's not in a dungeon.
+     */
+    private boolean avoidSearchingDungeonChests = true;
+
+    /**
+     * Will ignore mining/interacting with blocks that are BELOW an ocean (in an ocean biome and below y = 64)
+     * <p>
+     * This is mainly here because alto-clef does NOT know how to deal with oceans
+     * <p>
+     * Default: true — the bot has no reliable ocean traversal, so it does not waste a task on
+     * submerged blocks it cannot reach.
+     */
+    private boolean avoidOceanBlocks = true;
+
+    /**
+     * How close we must be to attack/interact with an entity.
+     * 6 works well for singleplayer
+     * 4 works better on more restrictive multiplayer servers
+     */
+    private float entityReachRange = 4;
+
+    /**
+     * Before grabbing ANYTHING, get a pickaxe.
+     * <p>
+     * Will help with navigation as sometimes dropped items will be underground,
+     * but this behaviour only makes sense in regular minecraft worlds.
+     */
+    private boolean collectPickaxeFirst = true;
+
+    /**
+     * If set to true, crops broken when collecting food will be replanted.
+     */
+    private boolean replantCrops = true;
+
+    /**
+     * Uses killaura to move mobs away and performs survival moves including:
+     * - Running away from hostile mobs when your health is low
+     * - Run away from creepers about to blow up
+     * - Avoid wither skeletons and other really dangerous mobs
+     * - Attempting to dodge arrows and other projectiles
+     */
+    private boolean mobDefense = true;
+
+    /**
+     * Defines how force field behaves when "mobDefense" is set to true.
+     * Note that the force field is not here to KILL mobs, but PUSH THEM AWAY.
+     * <p>
+     * <p>
+     * Strategies:
+     * <p>
+     * FASTEST: All hostiles are attacked at every possible moment, every frame.
+     * DELAY: Closest hostile is attacked with a sword when your attack is charged up
+     * SMART: Closest hostile is attacked at max every 0.2 seconds.
+     * OFF: Off
+     */
+    private KillAura.Strategy forceFieldStrategy = KillAura.Strategy.SMART;
+
+    /**
+     * Only applies if mobDefense is on.
+     * <p>
+     * If enabled, will attempt to dodge all incoming projectiles
+     */
+    private boolean dodgeProjectiles = true;
+
+    /**
+     * If enabled, Tungsten A* pathfinder is used as the PRIMARY pathfinder
+     * when chasing entities (players, mobs). Baritone only activates as fallback
+     * when Tungsten fails. Requires Tungsten mod to be installed.
+     * Best for PvP and parkour-heavy servers where Baritone struggles.
+     */
+    private boolean superParkourMode = false;
+
+    /**
+     * Skeletons and large groups of mobs are a huge pain.
+     * <p>
+     * With this set to true, the bot may either
+     * kill or run away from mobs that stay too close for too long.
+     */
+    private boolean killOrAvoidAnnoyingHostiles = true;
+
+    /**
+     * If enabled, the bot will avoid going underwater if baritone
+     * isn't giving the bot movement instructions.
+     * <p>
+     * Baritone doesn't know how to move underwater so this should cause
+     * no problems, but disable it if you want the bot to be able to sink.
+     */
+    private boolean avoidDrowning = true;
+
+    /**
+     * If enabled, the bot will close the open screen (furnace/crafting/chest/whatever) when the bot detects
+     * that its look direction has changed OR that it is mining something.
+     * <p>
+     * This is here to stop the bot from getting stuck in a screen container.
+     */
+    private boolean autoCloseScreenWhenLookingOrMining = true;
+
+    /**
+     * If enabled, will attempt to extinguish ourselves when on fire (and not immune to fire)
+     */
+    private boolean extinguishSelfWithWater = true;
+
+    /**
+     * If true, eat when we're hungry or in danger.
+     */
+    private boolean autoEat = true;
+
+    /**
+     * If true, MLG/No Fall Bucket if we're knocked off course and falling.
+     */
+    private boolean autoMLGBucket = true;
+
+    /**
+     * Minimum fall distance (in blocks) before the bot will attempt
+     * an enderpearl clutch save. Set with @set minPearlDistance <value>
+     */
+    private double minPearlFallDistance = 4.0;
+
+    /**
+     * If true, will automatically reconnect to the last open server if you get disconnected.
+     * <p>
+     * If disabled, the bot will stop running when you disconnect from a server.
+     */
+    private boolean autoReconnect = true;
+
+    /**
+     * How many seconds to stay on the kick/disconnect screen before reconnecting.
+     * Gives you time to read the kick reason.
+     */
+    private double reconnectDelaySec = 7.0;
+
+    /**
+     * If true, will automatically respawn instantly if you die.
+     * <p>
+     * If disabled, the bot will stop running when you die.
+     */
+    private boolean autoRespawn = true;
+
+    /**
+     * This setting lets you configure what the bot should do if it needs to go to the nether
+     * but can't find a nether portal immediately.
+     * <p>
+     * Options:
+     * BUILD_PORTAL_VANILLA: Builds a nether portal, either with obsidian or with a water bucket and lava pool.
+     * GO_TO_HOME_BASE: Travel to the set home coordinates and assume there's a portal there.
+     */
+    private DefaultGoToDimensionTask.OVERWORLD_TO_NETHER_BEHAVIOUR overworldToNetherBehaviour = DefaultGoToDimensionTask.OVERWORLD_TO_NETHER_BEHAVIOUR.BUILD_PORTAL_VANILLA;
+
+    /**
+     * When fast traveling via the nether, walk to our destination if we somehow end up closer than this range in the overworld.
+     * We will normally travel well within this range (to within 100 blocks if not within a few), so keep this value ~decently~ large.
+     */
+    private int netherFastTravelWalkingRange = 600;
+
+    /**
+     * If set, will automatically connect to this server on game launch.
+     * Format: "mc.example.com" or "mc.example.com:25565"
+     */
+    private String autoConnectServer = "";
+
+    /**
+     * If set, will run this command by default when no other commands are running.
+     * <p>
+     * For example, try setting this to "idle" to make the bot continue surviving/eating/escaping mobs.
+     * Or "follow <Your Username>" to follow you when not doing anything.
+     * Or "goto <Home base coords>" to return to home base when the bot finishes its work.
+     */
+    private String idleCommand = "";
+
+
+    /**
+     * If set, will run this command after death.
+     * Also {deathmessage} will be replaced with the death message.
+     * <p>
+     * For example, try setting this to "@goto <Your base coords>" to make the bot go to the base before continuing the task it was given.
+     * Or setting it to "I died!" will send the i died message
+     * Or setting it to "/back" will execute /back on the server
+     * When running altoclef commands, if the prefix is not @, the set prefix should be used for the command and not @
+     * You may run multiple commands even commands of differet type by splitting them with " & ". Example: /home & i died with message: {deathmessage} & @get diamond
+     */
+    private String deathCommand = "";
+
+    /**
+     * If we need to throw away something, throw away these items first.
+     */
+    @JsonSerialize(using = ItemSerializer.class)
+    @JsonDeserialize(using = ItemDeserializer.class)
+    private List<Item> throwawayItems = Arrays.asList(
+            // Overworld junk
+            Items.DRIPSTONE_BLOCK,
+            Items.ROOTED_DIRT,
+            Items.GRAVEL,
+            Items.SAND,
+            Items.DIORITE,
+            Items.ANDESITE,
+            Items.GRANITE,
+            Items.TUFF,
+            Items.COBBLESTONE,
+            Items.DIRT,
+            Items.COBBLED_DEEPSLATE,
+            Items.ACACIA_LEAVES, Items.BIRCH_LEAVES, Items.DARK_OAK_LEAVES, Items.OAK_LEAVES, Items.JUNGLE_LEAVES, Items.SPRUCE_LEAVES,
+            // Nether junk, to be fair it's mostly tuned for the "beat game" task
+            Items.NETHERRACK,
+            Items.MAGMA_BLOCK,
+            Items.SOUL_SOIL,
+            Items.SOUL_SAND,
+            Items.NETHER_BRICKS,
+            Items.NETHER_BRICK,
+            Items.BASALT,
+            Items.BLACKSTONE,
+            Items.END_STONE,
+            Items.SANDSTONE,
+            Items.STONE_BRICKS
+    );
+
+    /**
+     * How many throwaway blocks to keep as building blocks.
+     */
+    private int reservedBuildingBlockCount = 64;
+
+    /**
+     * If true, items with custom names will be protected/marked as "important"
+     * so they won't be thrown away.
+     */
+    private boolean dontThrowAwayCustomNameItems = true;
+    private boolean dontThrowAwayEnchantedItems = true;
+
+    /**
+     * If we need to throw away something but we don't have any "throwaway Items",
+     * throw away any unimportant item that's not currently needed in our task chain.
+     * <p>
+     * Careful with this! If true, any item not in "importantItems" is liable to be thrown away.
+     */
+    private boolean throwAwayUnusedItems = true;
+
+    /**
+     * We will NEVER throw away these items.
+     * Even if "throwAwayUnusedItems" is true and one of these items is not used in a task.
+     */
+    @JsonSerialize(using = ItemSerializer.class)
+    @JsonDeserialize(using = ItemDeserializer.class)
+    private List<Item> importantItems = Streams.concat(
+            Stream.of(
+                    Items.TOTEM_OF_UNDYING,
+                    Items.ENCHANTED_GOLDEN_APPLE,
+                    Items.ENDER_EYE,
+                    Items.TRIDENT,
+                    Items.DIAMOND,
+                    Items.DIAMOND_BLOCK,
+                    Items.NETHERITE_SCRAP,
+                    Items.NETHERITE_INGOT,
+                    Items.NETHERITE_BLOCK
+            ),
+            Stream.of(ItemHelper.DIAMOND_ARMORS),
+            Stream.of(ItemHelper.NETHERITE_ARMORS),
+            Stream.of(ItemHelper.DIAMOND_TOOLS),
+            Stream.of(ItemHelper.NETHERITE_TOOLS),
+            // Don't throw away shulker boxes that would be pretty bad lol
+            Stream.of(ItemHelper.SHULKER_BOXES)
+    ).toList();
+
+
+
+    /**
+     * If true, will only accept items found in `supportedFuels` as fuel when smelting.
+     * <p>
+     * Be careful when setting this to false, as ALL burnable items are liable to be burned
+     * if they're not protected (blaze rods, beds, wooden tools, crafting tables etc.)
+     */
+    private boolean limitFuelsToSupportedFuels = true;
+
+    /**
+     * If `limitFuelsToSupportedFuels` is true, will use these items and ONLY these items as smelting fuel.
+     */
+    @JsonSerialize(using = ItemSerializer.class)
+    @JsonDeserialize(using = ItemDeserializer.class)
+    private List<Item> supportedFuels = Streams.concat(
+            Stream.of(
+                    Items.COAL,
+                    Items.CHARCOAL
+            )
+    ).toList();
+
+    /**
+     * Where "home base" is for the bot.
+     * Some tasks use this value if you tell them to,
+     * but don't worry about changing this unless you NEED it.
+     */
+    private BlockPos homeBasePosition = new BlockPos(0, 64, 0);
+
+    /**
+     * These areas will not be mined.
+     * Used to prevent griefing, or to define a "spawn protection" zone so
+     * the bot doesn't keep trying to break spawn protected blocks.
+     * <p>
+     * Example: protects two areas. A "spawn" area from (x=-10 z=-10) to (x=10 z=10) and a home base at around (x = 1100, y = 2050)
+     * <p>
+     * areasToProtect : [
+     * {
+     * start: "-10, 0, -10",
+     * end: "10, 255, 10"
+     * },
+     * {
+     * start: "1000, 50, 2000",
+     * end: "1200, 255, 2100"
+     * },
+     * ],
+     */
+    private List<BlockRange> areasToProtect = Collections.emptyList();
+
+
+    //////////////////////////////////////////////////////////////////////////////////////////
+    ////////** END SETTINGS w/ COMMENTS **////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////////////////////////////////////////
+
+    /**
+     * Which movement engine the mod drives.
+     *
+     * <p><b>Default {@code "Baritone"}</b>: the pathfinding in this project is tungsten's, which is
+     * a hand-port of Baritone's own algorithm — a private reimplementation of a mature, maintained
+     * pathfinder with no test suite, and every divergence from the original has been a bug found by
+     * playing (re-plan thrash, mining closed doors, "no progress" loops). Baritone is the original,
+     * and the whole mod now drives it: every task's movement, including the walks and pillars
+     * tungsten starts for itself, goes through
+     * {@code kaptainwutax.tungsten.api.MovementDelegates}.
+     *
+     * <p>Degrades safely: if the Baritone mod is not installed, {@code BaritoneBridge.selected()}
+     * is false everywhere and the bot runs on tungsten exactly as before, so this default can never
+     * leave anyone with a bot that does not move.
+     *
+     * <p>Tungsten stays installed regardless — it is what aims, shoots and fights, none of which
+     * Baritone has.
+     */
+    private String pathfinder = "Baritone";
+
+    public String getPathfinder() {
+        return pathfinder;
+    }
+
+    public void setPathfinder(String v) {
+        this.pathfinder = v;
+    }
+
+    public static void load(Consumer<Settings> onReload) {
+        ConfigHelper.loadConfig(SETTINGS_PATH, Settings::new, Settings.class, onReload);
+    }
+
+    public boolean isEpicCameraEnabled() {
+        return epicCameraEnabled;
+    }
+
+    public boolean shouldShowTaskChain() {
+        return showTaskChains;
+    }
+
+    public boolean shouldShowDebugTickMs() {
+        return showDebugTickMs;
+    }
+
+    public boolean shouldHideAllWarningLogs() {
+        return hideAllWarningLogs;
+    }
+
+    public String getLogLevel() {
+        return logLevel;
+    }
+
+    public String getCommandPrefix() {
+        return commandPrefix;
+    }
+
+    public String getChatLogPrefix() {
+        return chatLogPrefix;
+    }
+
+    public String getChatVerbosity() {
+        return chatVerbosity;
+    }
+
+    public void setChatVerbosity(String v) { this.chatVerbosity = v; }
+
+    public float getOverlayTextScale() {
+        return overlayTextScale;
+    }
+
+    public void setOverlayTextScale(float v) { this.overlayTextScale = v; }
+
+    public boolean isSmoothAim() {
+        return smoothAim;
+    }
+
+    public float getMaxTurnSpeedDegPerTick() {
+        return maxTurnSpeedDegPerTick;
+    }
+
+    public void setSmoothAim(boolean v) { this.smoothAim = v; }
+
+    public void setMaxTurnSpeedDegPerTick(float v) { this.maxTurnSpeedDegPerTick = v; }
+
+    public boolean shouldShowTimer() {
+        return showTimer;
+    }
+
+    public float getResourcePickupRange() {
+        return resourcePickupDropRange;
+    }
+
+    public float getResourceChestLocateRange() {
+        return resourceChestLocateRange;
+    }
+
+    public float getResourceMineRange() {
+        return resourceMineRange;
+    }
+
+    public float getContainerItemMoveDelay() {
+        return containerItemMoveDelay;
+    }
+
+    public boolean shouldUseCraftingBookToCraft() {
+        return useCraftingBookToCraft;
+    }
+
+    public int getFoodUnitsToCollect() {
+        return foodUnitsToCollect;
+    }
+
+    public int getMinimumFoodAllowed() {
+        return minimumFoodAllowed;
+    }
+
+    public boolean isMobDefense() {
+        return mobDefense;
+    }
+
+    public boolean isDodgeProjectiles() {
+        return dodgeProjectiles;
+    }
+
+    public boolean isSuperParkourMode() {
+        return superParkourMode;
+    }
+
+    public boolean isAutoEat() {
+        return autoEat;
+    }
+
+    public boolean isAutoReconnect() {
+        return autoReconnect;
+    }
+
+    public double getReconnectDelaySec() {
+        return reconnectDelaySec;
+    }
+
+    public boolean shouldReloadInfoSender() {
+        return false;
+    }
+
+    /**
+     * Port for the Py4j gateway server (Python bridge).
+     * Python callback server listens on port + 1.
+     */
+    private int pythonGatewayPort = 25333;
+
+    public int getPythonGatewayPort() {
+        return pythonGatewayPort;
+    }
+
+    public void setPythonGatewayPort(int port) {
+        this.pythonGatewayPort = port;
+    }
+
+    /**
+     * MCP server (Model Context Protocol over Streamable HTTP) hosted directly
+     * by the mod, bound to 0.0.0.0 so a cognitive agent (Claude) can drive the
+     * bot over the LAN — http://&lt;lan-ip&gt;:mcpPort/mcp. Wraps the same
+     * Py4jEntryPoint levers (single source).
+     * <p>
+     * Default: false. Opt-in, so a fresh install does not open a LAN port until the user asks
+     * for one; enable it (or set {@code mcpEnabled: true}) to close the port again.
+     */
+    private boolean mcpEnabled = false;
+    private int mcpPort = 25350;
+    /**
+     * TODOS.md C7.3: the MCP server binds 0.0.0.0 with no authentication and wildcard CORS —
+     * anyone on the LAN could send commands. Empty means "not generated yet"; AltoClef
+     * generates a random token on first MCP start and saves it here, then requires it as
+     * "Authorization: Bearer &lt;token&gt;" on every request. Read it from this settings file
+     * (or the startup log) to configure an MCP client. Clearing this field forces a fresh
+     * token to be generated on the next start.
+     */
+    private String mcpAuthToken = "";
+
+    public boolean isMcpEnabled() {
+        return mcpEnabled;
+    }
+
+    public int getMcpPort() {
+        return mcpPort;
+    }
+
+    public void setMcpPort(int port) {
+        this.mcpPort = port;
+    }
+
+    public String getMcpAuthToken() {
+        return mcpAuthToken;
+    }
+
+    public void setMcpAuthToken(String token) {
+        this.mcpAuthToken = token;
+    }
+
+    /**
+     * Last known good nickname. If we log in as PlayerNNN,
+     * this nick is restored automatically.
+     */
+    private String lastNickname = "";
+
+    public String getLastNickname() {
+        return lastNickname;
+    }
+
+    public void setLastNickname(String name) {
+        this.lastNickname = name;
+    }
+
+    public boolean isAutoRespawn() {
+        return autoRespawn;
+    }
+
+    public boolean shouldReplantCrops() {
+        return replantCrops;
+    }
+
+    public boolean shouldDealWithAnnoyingHostiles() {
+        return killOrAvoidAnnoyingHostiles;
+    }
+
+    public KillAura.Strategy getForceFieldStrategy() {
+        return forceFieldStrategy;
+    }
+
+    public String getAutoConnectServer() {
+        return autoConnectServer;
+    }
+
+    public boolean shouldAutoConnect() {
+        return autoConnectServer != null && !autoConnectServer.isBlank();
+    }
+
+    public String getIdleCommand() {
+        return idleCommand;
+    }
+
+    public String getDeathCommand() {
+        return deathCommand;
+    }
+
+    public boolean shouldRunIdleCommandWhenNotActive() {
+        return idleCommand != null && !idleCommand.isBlank();
+    }
+
+    public boolean shouldAutoMLGBucket() {
+        return autoMLGBucket;
+    }
+
+    public double getMinPearlFallDistance() {
+        return minPearlFallDistance;
+    }
+
+    public boolean shouldCollectPickaxeFirst() {
+        return collectPickaxeFirst;
+    }
+
+    public boolean shouldAvoidDrowning() {
+        return avoidDrowning;
+    }
+
+    public boolean shouldCloseScreenWhenLookingOrMining() {
+        return autoCloseScreenWhenLookingOrMining;
+    }
+
+    public boolean shouldExtinguishSelfWithWater() {
+        return extinguishSelfWithWater;
+    }
+
+    public boolean shouldAvoidSearchingForDungeonChests() {
+        return avoidSearchingDungeonChests;
+    }
+
+    public boolean shouldAvoidOcean() {
+        return avoidOceanBlocks;
+    }
+
+    public boolean isThrowaway(Item item) {
+        return throwawayItems.contains(item);
+    }
+
+    public boolean isImportant(Item item) {
+        return importantItems.contains(item);
+    }
+
+    public boolean shouldThrowawayUnusedItems() {
+        return this.throwAwayUnusedItems;
+    }
+
+    public int getReservedBuildingBlockCount() {
+        return this.reservedBuildingBlockCount;
+    }
+
+    public boolean getDontThrowAwayCustomNameItems() {
+        return this.dontThrowAwayCustomNameItems;
+    }
+
+    public boolean getDontThrowAwayEnchantedItems() {
+        return this.dontThrowAwayEnchantedItems;
+    }
+
+    public float getEntityReachRange() {
+        return entityReachRange;
+    }
+
+    public Item[] getThrowawayItems(boolean includeProtected) {
+        return throwawayItems.stream().filter(item -> includeProtected || !AltoClef.getInstance().getBehaviour().isProtected(item)).toArray(Item[]::new);
+    }
+
+    public Item[] getThrowawayItems(AltoClef mod) {
+        return getThrowawayItems(false);
+    }
+
+    public boolean shouldLimitFuelsToSupportedFuels() {
+        return limitFuelsToSupportedFuels;
+    }
+
+
+    public boolean isSupportedFuel(Item item) {
+        return !limitFuelsToSupportedFuels || supportedFuels.contains(item);
+    }
+
+    @JsonIgnore
+    public Item[] getSupportedFuelItems() {
+        return supportedFuels.toArray(Item[]::new);
+    }
+
+    public boolean isPositionExplicitlyProtected(BlockPos pos) {
+        if (!areasToProtect.isEmpty()) {
+            for (BlockRange protection : areasToProtect) {
+                if (protection.contains(pos)) return true;
+            }
+        }
+        return false;
+    }
+
+    public DefaultGoToDimensionTask.OVERWORLD_TO_NETHER_BEHAVIOUR getOverworldToNetherBehaviour() {
+        return overworldToNetherBehaviour;
+    }
+
+    public int getNetherFastTravelWalkingRange() {
+        return netherFastTravelWalkingRange;
+    }
+
+    public BlockPos getHomeBasePosition() {
+        return homeBasePosition;
+    }
+
+    // ── Setters (used by the in-game settings screen `adris.altoclef.ui.SettingsScreen`) ──
+
+    public void setEpicCameraEnabled(boolean v) { this.epicCameraEnabled = v; }
+    public void setShowDebugTickMs(boolean v) { this.showDebugTickMs = v; }
+    public void setShowTaskChains(boolean v) { this.showTaskChains = v; }
+    public void setHideAllWarningLogs(boolean v) { this.hideAllWarningLogs = v; }
+    public void setCommandPrefix(String v) { this.commandPrefix = v; }
+    public void setLogLevel(String v) { this.logLevel = v; }
+    public void setChatLogPrefix(String v) { this.chatLogPrefix = v; }
+    public void setShowTimer(boolean v) { this.showTimer = v; }
+    public void setContainerItemMoveDelay(float v) { this.containerItemMoveDelay = v; }
+    public void setUseCraftingBookToCraft(boolean v) { this.useCraftingBookToCraft = v; }
+    public void setResourcePickupDropRange(float v) { this.resourcePickupDropRange = v; }
+    public void setMinimumFoodAllowed(int v) { this.minimumFoodAllowed = v; }
+    public void setFoodUnitsToCollect(int v) { this.foodUnitsToCollect = v; }
+    public void setResourceChestLocateRange(float v) { this.resourceChestLocateRange = v; }
+    public void setResourceMineRange(float v) { this.resourceMineRange = v; }
+    public void setAvoidSearchingDungeonChests(boolean v) { this.avoidSearchingDungeonChests = v; }
+    public void setAvoidOceanBlocks(boolean v) { this.avoidOceanBlocks = v; }
+    public void setEntityReachRange(float v) { this.entityReachRange = v; }
+    public void setCollectPickaxeFirst(boolean v) { this.collectPickaxeFirst = v; }
+    public void setReplantCrops(boolean v) { this.replantCrops = v; }
+    public void setMobDefense(boolean v) { this.mobDefense = v; }
+    public void setDodgeProjectiles(boolean v) { this.dodgeProjectiles = v; }
+    public void setSuperParkourMode(boolean v) { this.superParkourMode = v; }
+    public void setKillOrAvoidAnnoyingHostiles(boolean v) { this.killOrAvoidAnnoyingHostiles = v; }
+    public void setAvoidDrowning(boolean v) { this.avoidDrowning = v; }
+    public void setAutoCloseScreenWhenLookingOrMining(boolean v) { this.autoCloseScreenWhenLookingOrMining = v; }
+    public void setExtinguishSelfWithWater(boolean v) { this.extinguishSelfWithWater = v; }
+    public void setAutoEat(boolean v) { this.autoEat = v; }
+    public void setAutoMLGBucket(boolean v) { this.autoMLGBucket = v; }
+    public void setMinPearlFallDistance(double v) { this.minPearlFallDistance = v; }
+    public void setAutoReconnect(boolean v) { this.autoReconnect = v; }
+    public void setReconnectDelaySec(double v) { this.reconnectDelaySec = v; }
+    public void setAutoRespawn(boolean v) { this.autoRespawn = v; }
+    public void setNetherFastTravelWalkingRange(int v) { this.netherFastTravelWalkingRange = v; }
+    public void setAutoConnectServer(String v) { this.autoConnectServer = v; }
+    public void setIdleCommand(String v) { this.idleCommand = v; }
+    public void setDeathCommand(String v) { this.deathCommand = v; }
+    public void setReservedBuildingBlockCount(int v) { this.reservedBuildingBlockCount = v; }
+    public void setDontThrowAwayCustomNameItems(boolean v) { this.dontThrowAwayCustomNameItems = v; }
+    public void setDontThrowAwayEnchantedItems(boolean v) { this.dontThrowAwayEnchantedItems = v; }
+    public void setThrowAwayUnusedItems(boolean v) { this.throwAwayUnusedItems = v; }
+    public void setLimitFuelsToSupportedFuels(boolean v) { this.limitFuelsToSupportedFuels = v; }
+    public void setMcpEnabled(boolean v) { this.mcpEnabled = v; }
+
+    @Override
+    public void onFailLoad() {
+        failedToLoad = true;
+    }
+
+    @Override
+    public boolean failedToLoad() {
+        return failedToLoad;
+    }
+}
